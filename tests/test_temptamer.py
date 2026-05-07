@@ -85,7 +85,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].applied_comfort_mode, "Day")
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "Night")
-        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Bedroom")
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Night")
 
     def test_zone_actions_respect_antiflap_but_allow_mode_change(self):
         snapshot = build_snapshot(
@@ -280,8 +280,9 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertTrue(demand.heat_requested)
-        self.assertEqual(demand.requested_by_zone, "office")
+        self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 19)
         self.assertEqual(plan.fan_mode, "low")
 
@@ -296,8 +297,8 @@ class TempTamerTests(unittest.TestCase):
                         TEST_INLET_SENSOR: "25.0",
                         "sensor.office_average_temperature": "24.5",
                         "sensor.average_dining_zone_temp": "20.0",
-                        "sensor.average_bed1_2_zone_temp": "20.0",
-                        "sensor.average_bed3_4_zone_temp": "20.0",
+                        "sensor.average_bed1_2_zone_temp": "17.0",
+                        "sensor.average_bed3_4_zone_temp": "17.0",
                     }
                 )
             )
@@ -325,9 +326,41 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual([(action.zone_key, action.turn_on) for action in actions], [("office", True)])
         self.assertEqual(predicted_open, ("office",))
         self.assertTrue(demand.cool_requested)
-        self.assertEqual(demand.requested_by_zone, "office")
+        self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "cool")
+        self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 23)
+
+    def test_equipment_demand_lists_all_requesting_zones(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Day",
+                        TEST_INLET_SENSOR: "16.4",
+                        "sensor.office_average_temperature": "17.0",
+                        "sensor.average_dining_zone_temp": "18.0",
+                        "sensor.average_bed1_2_zone_temp": "19.5",
+                        "sensor.average_bed3_4_zone_temp": "19.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                )
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office", "dining"), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office", "dining"),
+            current_hvac_mode="off",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.requested_by_zones, ("office", "dining"))
+        self.assertEqual(plan.requested_by_zones, ("office", "dining"))
+        self.assertEqual(plan.setpoint, 19)
 
     def test_heatcool_mode_holds_current_mode_during_antiflap_window(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)

@@ -321,12 +321,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zone=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
         plan.reason,
-        plan.requested_by_zone,
+        ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
         plan.fan_mode,
         plan.setpoint,

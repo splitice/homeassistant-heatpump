@@ -1,11 +1,11 @@
 # Claude instructions
 
-This repository contains a Home Assistant heatpump controller implemented as a PyScript app in `apps/temptamer`.
+This repository contains a Home Assistant heatpump controller implemented as a PyScript app in `pyscript/apps/temptamer`.
 
 ## Repository-specific expectations
 
-- Keep Home Assistant / PyScript runtime glue in `apps/temptamer/main.py`.
-- Keep decision logic in the pure-Python modules under `apps/temptamer/` so it remains unit-testable outside Home Assistant.
+- Keep Home Assistant / PyScript runtime glue in `pyscript/apps/temptamer/main.py`.
+- Keep decision logic in the pure-Python modules under `pyscript/apps/temptamer/` so it remains unit-testable outside Home Assistant.
 - Update `tests/test_temptamer.py` when runtime decision logic changes.
 - Validate changes with:
   - `python -m unittest discover -s tests -p 'test_*.py'`
@@ -39,4 +39,4 @@ From the upstream PyScript documentation:
 
 - Preserve the existing separation between configuration, state reading, demand resolution, zone control, dispatcher logic, and PyScript entrypoints.
 - Prefer deterministic, side-effect-free helpers in the core modules and keep Home Assistant state/service access behind a narrow runtime boundary.
-- Keep documentation and examples consistent with the concrete TempTamer entities described in `README.md` and `apps/temptamer/config.py`.
+- Keep documentation and examples consistent with the concrete TempTamer entities described in `README.md` and `pyscript/apps/temptamer/config.py`.

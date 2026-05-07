@@ -84,7 +84,7 @@ class EquipmentDemand:
     fan_only_requested: bool = False
     maintain_heat_mode: bool = False
     maintain_cool_mode: bool = False
-    requested_by_zone: str | None = None
+    requested_by_zones: tuple[str, ...] = field(default_factory=tuple)
     max_temperature_deficit: float = 0.0
     reason: str = ""
 
@@ -95,6 +95,6 @@ class DispatchPlan:
     hvac_mode: str | None = None
     fan_mode: str | None = None
     setpoint: int | None = None
-    requested_by_zone: str | None = None
+    requested_by_zones: tuple[str, ...] = field(default_factory=tuple)
     open_zones: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""
