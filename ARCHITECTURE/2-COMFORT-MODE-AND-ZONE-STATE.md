@@ -30,6 +30,8 @@ DemandSnapshot(
 )
 ```
 
+`at_ideal_zones` is the requested name for the list of zones whose temperature is at or above their `ideal_target`.
+
 ## Resolution rules
 1. Read `input_select.temptamer_comfort_mode`.
 2. If the comfort mode is `Off`, produce a snapshot with no heating demand.

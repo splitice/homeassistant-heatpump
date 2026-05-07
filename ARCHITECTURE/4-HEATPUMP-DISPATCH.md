@@ -30,10 +30,10 @@ When `heat_requested` is true:
    - `raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)`
 3. Set requested heatpump temperature to:
    - `ceil(raw_requested_setpoint)`
-   - Clamp the final request to the inclusive whole-number range `17..25`
+   - Clamp the final request to the inclusive whole-number range `17..25°C`
 
 When continuing in heating mode without requesting additional heat:
-- Set the requested temperature to the current inlet temperature, normalized to a whole integer and clamped to `17..25`.
+- Set the requested temperature to the current inlet temperature, normalized to a whole integer and clamped to `17..25°C`.
 
 When in fan-only mode:
 - Do not request extra heating; maintain the setpoint at the normalized current inlet temperature unless the climate integration requires a retained value.

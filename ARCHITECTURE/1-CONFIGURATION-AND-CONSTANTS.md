@@ -28,7 +28,7 @@ Create a small configuration layer that defines all entities, zone metadata, com
   - Maximum requested setpoint increase above inlet temperature: 2°C
   - Minimum requested heat setpoint: 17°C
   - Maximum requested heat setpoint: 25°C
-  - Requested heat setpoints must be whole integers rounded up to the nearest whole degree
+  - Requested heat setpoints must be whole integers, rounded up if necessary
 
 ## Proposed module layout
 - `apps/temptamer/constants.py`
