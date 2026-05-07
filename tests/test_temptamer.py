@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -147,6 +147,93 @@ class TempTamerTests(unittest.TestCase):
             [("dining", False), ("office", True)],
         )
         self.assertEqual(predicted_open, ("office",))
+
+    def test_zone_actions_handle_equal_ranks_without_comparing_zone_objects(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Night",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp": "19.0",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "17.0",
+                    "sensor.bedroom_1_2_temperature": "21.0",
+                    "sensor.bedroom_3_4_temperature": "21.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={
+                "office": datetime(2026, 1, 1, 12, 0, 0),
+                "dining": datetime(2026, 1, 1, 12, 0, 0),
+            },
+        )
+
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            datetime(2026, 1, 1, 12, 20, 0),
+            comfort_mode_changed=False,
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertIn(actions[0].zone_key, {"office", "dining"})
+        self.assertEqual(predicted_open, (actions[0].zone_key,))
+
+    def test_zone_actions_handle_naive_last_change_with_aware_now(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Day",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp": "19.0",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "22.0",
+                    "sensor.bedroom_1_2_temperature": "20.0",
+                    "sensor.bedroom_3_4_temperature": "20.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "on",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={
+                "office": datetime(2026, 1, 1, 12, 0, 0),
+                "dining": datetime(2026, 1, 1, 12, 0, 0),
+            },
+        )
+
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            datetime(2026, 1, 1, 12, 2, 0, tzinfo=timezone.utc),
+            comfort_mode_changed=False,
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(predicted_open, ("dining",))
+
+    def test_build_snapshot_normalizes_naive_last_switch_change(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Night",
+                    "sensor.home_temperature": "18.5",
+                    "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp": "23.4",
+                    "sensor.office_temperature": "18.1",
+                    "sensor.dining_temperature": "17.0",
+                    "sensor.bedroom_1_2_temperature": "16.5",
+                    "sensor.bedroom_3_4_temperature": "18.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "on",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "on",
+                }
+            ),
+            last_switch_changes={"office": datetime(2026, 1, 1, 12, 0, 0)},
+        )
+
+        self.assertEqual(snapshot.zones["office"].last_switch_change, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
     def test_equipment_demand_and_dispatch_plan_choose_heat_setpoint(self):
         snapshot = build_snapshot(

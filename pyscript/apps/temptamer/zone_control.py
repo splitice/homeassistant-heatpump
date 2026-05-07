@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .constants import (
     MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS,
@@ -10,20 +10,39 @@ from .constants import (
 from .models import DemandSnapshot, ZoneAction, ZoneRuntimeState
 
 
+def _normalize_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _last_change_key(zone: ZoneRuntimeState) -> datetime:
-    return zone.last_switch_change or datetime.min
+    if zone.last_switch_change is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return _normalize_datetime(zone.last_switch_change)
 
 
 def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: bool) -> bool:
     if comfort_mode_changed or zone.last_switch_change is None:
         return True
-    return now - zone.last_switch_change >= timedelta(seconds=MIN_ZONE_CHANGE_DELAY_SECONDS)
+    normalized_now = _normalize_datetime(now)
+    normalized_last_change = _normalize_datetime(zone.last_switch_change)
+    return normalized_now - normalized_last_change >= timedelta(seconds=MIN_ZONE_CHANGE_DELAY_SECONDS)
 
 
 def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list[ZoneRuntimeState]:
-    ranked_zones.sort()
+    ordered: list[tuple[object, ZoneRuntimeState]] = []
+    for ranked_zone in ranked_zones:
+        insert_at = len(ordered)
+        ranked_value = ranked_zone[0]
+        for index, existing_ranked_zone in enumerate(ordered):
+            if ranked_value < existing_ranked_zone[0]:
+                insert_at = index
+                break
+        ordered.insert(insert_at, ranked_zone)
+
     result: list[ZoneRuntimeState] = []
-    for _, zone in ranked_zones:
+    for _, zone in ordered:
         result.append(zone)
     return result
 

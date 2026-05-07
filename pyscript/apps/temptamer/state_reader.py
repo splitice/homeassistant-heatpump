@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Protocol
 
 from .config import DEFAULT_SYSTEM_CONFIG
@@ -10,6 +11,14 @@ from .models import DemandSnapshot, SystemConfig, ZoneRuntimeState
 
 class StateReader(Protocol):
     def get_state(self, entity_id: str) -> object | None: ...
+
+
+def _normalize_timestamp(value: object | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def parse_float(value: object | None) -> float | None:
@@ -101,7 +110,7 @@ def build_snapshot(
             scheme=scheme,
             is_enabled_by_mode=scheme.name != SCHEME_OFF,
             switch_is_on=is_switch_on(reader.get_state(zone.switch_entity_id)),
-            last_switch_change=last_switch_changes.get(zone_key),  # type: ignore[arg-type]
+            last_switch_change=_normalize_timestamp(last_switch_changes.get(zone_key)),
         )
 
     enabled_zones: dict[str, ZoneRuntimeState] = {}
