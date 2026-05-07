@@ -5,12 +5,34 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .config import DEFAULT_SYSTEM_CONFIG
-from .constants import COMFORT_MODE_OFF, SCHEME_OFF, SWITCH_ON_STATES, SWITCH_STATE_SETTLE_SECONDS, UNKNOWN_STATES
+from .constants import (
+    COMFORT_MODE_OFF,
+    CONTROL_HVAC_MODE_COOL,
+    CONTROL_HVAC_MODE_HEAT,
+    CONTROL_HVAC_MODE_HEATCOOL,
+    CONTROL_HVAC_MODE_MANUAL,
+    CONTROL_HVAC_MODE_OFF,
+    SCHEME_OFF,
+    SWITCH_ON_STATES,
+    SWITCH_STATE_SETTLE_SECONDS,
+    UNKNOWN_STATES,
+)
 from .models import DemandSnapshot, SystemConfig, ZoneRuntimeState
 
 
 class StateReader(Protocol):
     def get_state(self, entity_id: str) -> object | None: ...
+
+
+VALID_HVAC_MODES = frozenset(
+    {
+        CONTROL_HVAC_MODE_HEAT,
+        CONTROL_HVAC_MODE_COOL,
+        CONTROL_HVAC_MODE_HEATCOOL,
+        CONTROL_HVAC_MODE_OFF,
+        CONTROL_HVAC_MODE_MANUAL,
+    }
+)
 
 
 def _normalize_timestamp(value: object | None) -> datetime | None:
@@ -119,14 +141,19 @@ def build_snapshot(
     pending_switch_states = pending_switch_states or {}
     raw_mode = reader.get_state(config.comfort_mode_entity)
     comfort_mode = str(raw_mode) if raw_mode in config.comfort_modes else COMFORT_MODE_OFF
+    raw_hvac_mode = reader.get_state(config.hvac_mode_entity)
+    selected_hvac_mode = str(raw_hvac_mode) if raw_hvac_mode in VALID_HVAC_MODES else CONTROL_HVAC_MODE_HEAT
 
     house_temp = _resolve_house_temperature(reader, config)
 
     inlet_temp = _resolve_temperature(reader, config.inlet_temperature_sensor, house_temp)
-    comfort_mapping = config.comfort_modes[comfort_mode]
 
     zones: dict[str, ZoneRuntimeState] = {}
     for zone_key, zone in config.zones.items():
+        override_entity_id = config.zone_comfort_mode_entities.get(zone_key)
+        raw_override_mode = reader.get_state(override_entity_id) if override_entity_id else None
+        applied_comfort_mode = str(raw_override_mode) if raw_override_mode in config.comfort_modes else comfort_mode
+        comfort_mapping = config.comfort_modes[applied_comfort_mode]
         scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
         scheme = config.control_schemes[scheme_name]
         current_temp = _resolve_temperature(reader, zone.sensor_entity_id, house_temp)
@@ -134,6 +161,7 @@ def build_snapshot(
             key=zone_key,
             current_temp=current_temp,
             scheme=scheme,
+            applied_comfort_mode=applied_comfort_mode,
             is_enabled_by_mode=scheme.name != SCHEME_OFF,
             switch_is_on=_resolve_switch_state(
                 reader,
@@ -150,6 +178,10 @@ def build_snapshot(
     continue_heating_list: list[str] = []
     below_ideal_list: list[str] = []
     at_ideal_list: list[str] = []
+    cool_calling_list: list[str] = []
+    continue_cooling_list: list[str] = []
+    above_ideal_list: list[str] = []
+    at_or_below_ideal_list: list[str] = []
 
     for key, zone in zones.items():
         if not zone.is_enabled_by_mode:
@@ -164,19 +196,35 @@ def build_snapshot(
             below_ideal_list.append(key)
         else:
             at_ideal_list.append(key)
+        if zone.current_temp > zone.scheme.cool_enable_above():
+            cool_calling_list.append(key)
+        if zone.current_temp > zone.scheme.cool_continue_until():
+            continue_cooling_list.append(key)
+        if zone.current_temp > zone.scheme.ideal_target:
+            above_ideal_list.append(key)
+        else:
+            at_or_below_ideal_list.append(key)
 
     heat_calling = tuple(heat_calling_list)
     continue_heating = tuple(continue_heating_list)
     below_ideal = tuple(below_ideal_list)
     at_ideal = tuple(at_ideal_list)
+    cool_calling = tuple(cool_calling_list)
+    continue_cooling = tuple(continue_cooling_list)
+    above_ideal = tuple(above_ideal_list)
+    at_or_below_ideal = tuple(at_or_below_ideal_list)
 
     return DemandSnapshot(
         comfort_mode=comfort_mode,
+        selected_hvac_mode=selected_hvac_mode,
         inlet_temp=inlet_temp,
         zones=zones,
         heat_calling_zones=heat_calling,
         continue_heating_zones=continue_heating,
         below_ideal_zones=below_ideal,
         at_ideal_zones=at_ideal,
+        cool_calling_zones=cool_calling,
+        continue_cooling_zones=continue_cooling,
+        above_ideal_zones=above_ideal,
+        at_or_below_ideal_zones=at_or_below_ideal,
     )
-

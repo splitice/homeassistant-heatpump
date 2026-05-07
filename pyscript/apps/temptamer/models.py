@@ -11,6 +11,12 @@ class ControlScheme:
     continue_until: float
     ideal_target: float
 
+    def cool_enable_above(self) -> float:
+        return self.ideal_target + (self.ideal_target - self.enable_below)
+
+    def cool_continue_until(self) -> float:
+        return self.ideal_target + (self.ideal_target - self.continue_until)
+
 
 @dataclass(frozen=True)
 class ZoneConfig:
@@ -25,8 +31,10 @@ class SystemConfig:
     house_temperature_sensor: str
     inlet_temperature_sensor: str
     comfort_mode_entity: str
+    hvac_mode_entity: str
     climate_entity: str
     zones: dict[str, ZoneConfig]
+    zone_comfort_mode_entities: dict[str, str]
     comfort_modes: dict[str, dict[str, str]]
     control_schemes: dict[str, ControlScheme]
 
@@ -36,6 +44,7 @@ class ZoneRuntimeState:
     key: str
     current_temp: float
     scheme: ControlScheme
+    applied_comfort_mode: str
     is_enabled_by_mode: bool
     switch_is_on: bool
     last_switch_change: datetime | None
@@ -44,12 +53,17 @@ class ZoneRuntimeState:
 @dataclass(frozen=True)
 class DemandSnapshot:
     comfort_mode: str
+    selected_hvac_mode: str
     inlet_temp: float
     zones: dict[str, ZoneRuntimeState]
     heat_calling_zones: tuple[str, ...]
     continue_heating_zones: tuple[str, ...]
     below_ideal_zones: tuple[str, ...]
     at_ideal_zones: tuple[str, ...]
+    cool_calling_zones: tuple[str, ...]
+    continue_cooling_zones: tuple[str, ...]
+    above_ideal_zones: tuple[str, ...]
+    at_or_below_ideal_zones: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -67,6 +81,7 @@ class EquipmentDemand:
     cool_requested: bool = False
     fan_only_requested: bool = False
     maintain_heat_mode: bool = False
+    maintain_cool_mode: bool = False
     requested_by_zone: str | None = None
     max_temperature_deficit: float = 0.0
     reason: str = ""
@@ -81,4 +96,3 @@ class DispatchPlan:
     requested_by_zone: str | None = None
     open_zones: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""
-

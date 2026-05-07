@@ -6,6 +6,8 @@ from typing import Protocol
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_OFF,
+    CONTROL_HVAC_MODE_OFF,
+    HVAC_COOL,
     FAN_LOW,
     FAN_MEDIUM,
     HEAT_START_MEDIUM_FAN_DIFFERENTIAL,
@@ -30,6 +32,12 @@ def normalize_setpoint(value: float) -> int:
 
 
 def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
+    if demand.cool_requested or demand.maintain_cool_mode:
+        if demand.requested_by_zone:
+            zone = snapshot.zones[demand.requested_by_zone]
+            return normalize_setpoint(zone.scheme.cool_enable_above())
+        return normalize_setpoint(snapshot.inlet_temp)
+
     if demand.heat_requested and demand.requested_by_zone:
         zone = snapshot.zones[demand.requested_by_zone]
         minimum_room_target = zone.scheme.enable_below
@@ -45,12 +53,22 @@ def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None
     if demand.fan_only_requested:
         return FAN_LOW
 
-    if not (demand.heat_requested or demand.maintain_heat_mode):
+    if not (demand.heat_requested or demand.maintain_heat_mode or demand.cool_requested or demand.maintain_cool_mode):
         return None
 
     current_fan = (current_fan_mode or "").lower()
     differential = demand.max_temperature_deficit
     currently_heating = (current_hvac_mode or "").lower() == HVAC_HEAT
+    currently_cooling = (current_hvac_mode or "").lower() == HVAC_COOL
+
+    if demand.cool_requested or demand.maintain_cool_mode:
+        if not currently_cooling:
+            return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        if current_fan == FAN_MEDIUM:
+            return FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+        if current_fan == FAN_LOW:
+            return FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
 
     if not currently_heating:
         return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
@@ -70,10 +88,16 @@ def build_dispatch_plan(
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
 ) -> DispatchPlan:
-    if snapshot.comfort_mode == COMFORT_MODE_OFF:
+    if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="comfort mode is Off")
 
-    if not predicted_open_zones and (demand.heat_requested or demand.maintain_heat_mode or demand.fan_only_requested):
+    if not predicted_open_zones and (
+        demand.heat_requested
+        or demand.maintain_heat_mode
+        or demand.fan_only_requested
+        or demand.cool_requested
+        or demand.maintain_cool_mode
+    ):
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="no zones open for safe dispatch")
 
     if demand.fan_only_requested:
@@ -90,6 +114,17 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_HEAT,
+            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            setpoint=_requested_setpoint(snapshot, demand),
+            requested_by_zone=demand.requested_by_zone,
+            open_zones=predicted_open_zones,
+            reason=demand.reason,
+        )
+
+    if demand.cool_requested or demand.maintain_cool_mode:
+        return DispatchPlan(
+            turn_off=False,
+            hvac_mode=HVAC_COOL,
             fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
             setpoint=_requested_setpoint(snapshot, demand),
             requested_by_zone=demand.requested_by_zone,

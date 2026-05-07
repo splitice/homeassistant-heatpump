@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-from .constants import COMFORT_MODE_OFF
-from .models import DemandSnapshot, EquipmentDemand
+from datetime import datetime, timedelta, timezone
+
+from .constants import (
+    COMFORT_MODE_OFF,
+    CONTROL_HVAC_MODE_COOL,
+    CONTROL_HVAC_MODE_HEAT,
+    CONTROL_HVAC_MODE_HEATCOOL,
+    CONTROL_HVAC_MODE_MANUAL,
+    CONTROL_HVAC_MODE_OFF,
+    HVAC_COOL,
+    HVAC_HEAT,
+    MIN_HEAT_COOL_TRANSITION_SECONDS,
+)
+from .models import DemandSnapshot, EquipmentDemand, ZoneRuntimeState
 
 
 def _max_deficit(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], threshold_name: str) -> tuple[str | None, float]:
@@ -22,12 +34,145 @@ def _max_deficit(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], threshold
     return selected_zone_key, selected_deficit
 
 
-def resolve_equipment_demand(snapshot: DemandSnapshot, predicted_open_zones: tuple[str, ...]) -> EquipmentDemand:
+def _max_excess(
+    snapshot: DemandSnapshot,
+    zone_keys: tuple[str, ...],
+    threshold_resolver,
+) -> tuple[str | None, float]:
+    if not zone_keys:
+        return None, 0.0
+
+    selected_zone_key: str | None = None
+    selected_excess = 0.0
+
+    for zone_key in zone_keys:
+        zone = snapshot.zones[zone_key]
+        threshold = threshold_resolver(zone)
+        excess = max(0.0, zone.current_temp - threshold)
+        if selected_zone_key is None or excess > selected_excess:
+            selected_zone_key = zone_key
+            selected_excess = excess
+
+    return selected_zone_key, selected_excess
+
+
+def _normalize_timestamp(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def resolve_operating_mode(
+    snapshot: DemandSnapshot,
+    *,
+    current_hvac_mode: str | None,
+    last_active_hvac_mode: str | None,
+    last_heatcool_transition: datetime | None,
+    now: datetime,
+) -> tuple[str | None, str]:
+    selected_hvac_mode = snapshot.selected_hvac_mode
+
+    if selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
+        return None, "hvac mode is Off"
+    if selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        return None, "hvac mode is Manual"
+    if selected_hvac_mode == CONTROL_HVAC_MODE_HEAT:
+        return HVAC_HEAT, "hvac mode is Heat"
+    if selected_hvac_mode == CONTROL_HVAC_MODE_COOL:
+        return HVAC_COOL, "hvac mode is Cool"
+
+    current_active_mode = (current_hvac_mode or "").lower()
+    if current_active_mode not in {HVAC_HEAT, HVAC_COOL}:
+        current_active_mode = None
+
+    last_active_mode = (last_active_hvac_mode or "").lower()
+    if last_active_mode not in {HVAC_HEAT, HVAC_COOL}:
+        last_active_mode = None
+
+    active_mode = current_active_mode or last_active_mode
+    heat_zone, heat_deficit = _max_deficit(snapshot, snapshot.heat_calling_zones, "enable_below")
+    cool_zone, cool_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.scheme.cool_enable_above())
+
+    preferred_mode: str | None = None
+    if heat_zone and cool_zone:
+        if active_mode == HVAC_HEAT and heat_deficit >= cool_excess:
+            preferred_mode = HVAC_HEAT
+        elif active_mode == HVAC_COOL and cool_excess >= heat_deficit:
+            preferred_mode = HVAC_COOL
+        else:
+            preferred_mode = HVAC_HEAT if heat_deficit >= cool_excess else HVAC_COOL
+    elif heat_zone:
+        preferred_mode = HVAC_HEAT
+    elif cool_zone:
+        preferred_mode = HVAC_COOL
+    elif active_mode == HVAC_HEAT and snapshot.continue_heating_zones:
+        preferred_mode = HVAC_HEAT
+    elif active_mode == HVAC_COOL and snapshot.continue_cooling_zones:
+        preferred_mode = HVAC_COOL
+    else:
+        return None, "HeatCool mode has no active heating or cooling demand"
+
+    normalized_last_transition = _normalize_timestamp(last_heatcool_transition)
+    normalized_now = _normalize_timestamp(now)
+    transition_window_active = (
+        active_mode in {HVAC_HEAT, HVAC_COOL}
+        and preferred_mode != active_mode
+        and normalized_last_transition is not None
+        and normalized_now is not None
+        and normalized_now - normalized_last_transition < timedelta(seconds=MIN_HEAT_COOL_TRANSITION_SECONDS)
+    )
+    if transition_window_active:
+        if current_active_mode in {HVAC_HEAT, HVAC_COOL}:
+            return current_active_mode, f"holding {current_active_mode} during HeatCool anti-flap window"
+        return None, f"waiting for HeatCool anti-flap window before switching to {preferred_mode}"
+
+    return preferred_mode, f"HeatCool selected {preferred_mode}"
+
+
+def resolve_equipment_demand(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    *,
+    operation_mode: str | None,
+) -> EquipmentDemand:
     if snapshot.comfort_mode == COMFORT_MODE_OFF:
         return EquipmentDemand(reason="comfort mode is Off")
+    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
+        return EquipmentDemand(reason="hvac mode is Off")
+    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        return EquipmentDemand(reason="hvac mode is Manual")
+    if operation_mode is None:
+        return EquipmentDemand(reason="no active heating or cooling mode selected")
 
     if not predicted_open_zones:
-        return EquipmentDemand(reason="no zones are predicted to be open")
+        return EquipmentDemand(reason=f"no zones are predicted to be open for {operation_mode}")
+
+    if operation_mode == HVAC_COOL:
+        requested_by_zone, max_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.scheme.cool_enable_above())
+        if requested_by_zone is not None:
+            return EquipmentDemand(
+                cool_requested=True,
+                requested_by_zone=requested_by_zone,
+                max_temperature_deficit=max_excess,
+                reason=f"{requested_by_zone} is above enable threshold",
+            )
+
+        continue_zone, continue_excess = _max_excess(
+            snapshot,
+            snapshot.continue_cooling_zones,
+            lambda zone: zone.scheme.cool_continue_until(),
+        )
+        if continue_zone is not None:
+            return EquipmentDemand(
+                maintain_cool_mode=True,
+                requested_by_zone=continue_zone,
+                max_temperature_deficit=continue_excess,
+                reason=f"{continue_zone} is above continue-until threshold",
+            )
+
+        return EquipmentDemand(reason="no active cooling demand")
 
     requested_by_zone, max_deficit = _max_deficit(snapshot, snapshot.heat_calling_zones, "enable_below")
     if requested_by_zone is not None:
@@ -68,4 +213,3 @@ def resolve_equipment_demand(snapshot: DemandSnapshot, predicted_open_zones: tup
         )
 
     return EquipmentDemand(reason="no active heating demand")
-

@@ -4,9 +4,17 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .config import DEFAULT_SYSTEM_CONFIG
-from .constants import APP_NAME, CONTROL_INTERVAL_SECONDS, LOGGER_NAME, SWITCH_STATE_SETTLE_SECONDS
-from .demand_resolver import resolve_equipment_demand
+from .config import DEFAULT_SYSTEM_CONFIG, MODE_TRIGGER_ENTITIES
+from .constants import (
+    APP_NAME,
+    CONTROL_HVAC_MODE_MANUAL,
+    CONTROL_INTERVAL_SECONDS,
+    HVAC_COOL,
+    HVAC_HEAT,
+    LOGGER_NAME,
+    SWITCH_STATE_SETTLE_SECONDS,
+)
+from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
 from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan
 from .state_reader import build_snapshot, is_switch_on
 from .zone_control import describe_zone_predictions, resolve_zone_actions
@@ -126,6 +134,8 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_zone_change": {},
     "pending_zone_state": {},
     "last_error": None,
+    "last_heatcool_transition": None,
+    "last_active_hvac_mode": None,
     "last_trigger": None,
 }
 
@@ -188,6 +198,8 @@ def _publish_runtime_state(status: str) -> None:
             "enabled": _control_is_enabled(),
             "last_trigger": RUNTIME_STATE["last_trigger"],
             "last_successful_control_pass": _isoformat(RUNTIME_STATE["last_successful_control_pass"]),
+            "last_heatcool_transition": _isoformat(RUNTIME_STATE["last_heatcool_transition"]),
+            "last_active_hvac_mode": RUNTIME_STATE["last_active_hvac_mode"],
             "last_error": RUNTIME_STATE["last_error"],
         },
     )
@@ -228,23 +240,45 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         pending_switch_states=RUNTIME_STATE["pending_zone_state"],
         now=now,
     )
+
+    climate_entity = DEFAULT_SYSTEM_CONFIG.climate_entity
+    current_hvac_mode = controller.get_state(climate_entity)
+    current_fan_mode = controller.get_attr(climate_entity, "fan_mode")
+    current_setpoint = controller.get_attr(climate_entity, "temperature")
+    current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
+
+    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        LOGGER.info("DISPATCH: manual mode selected; leaving zones and heatpump unchanged")
+        RUNTIME_STATE["last_error"] = None
+        RUNTIME_STATE["last_successful_control_pass"] = now
+        _publish_runtime_state("manual")
+        return
+
+    operating_mode, operating_mode_reason = resolve_operating_mode(
+        snapshot,
+        current_hvac_mode=current_hvac_mode_str,
+        last_active_hvac_mode=RUNTIME_STATE["last_active_hvac_mode"],
+        last_heatcool_transition=RUNTIME_STATE["last_heatcool_transition"],
+        now=now,
+    )
     zone_actions, predicted_open_zones = resolve_zone_actions(
         snapshot,
         now,
+        operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
     )
     zone_diagnostics = describe_zone_predictions(
         snapshot,
         now,
         predicted_open_zones,
+        operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
     )
-    demand = resolve_equipment_demand(snapshot, predicted_open_zones)
-
-    climate_entity = DEFAULT_SYSTEM_CONFIG.climate_entity
-    current_hvac_mode = controller.get_state(climate_entity)
-    current_fan_mode = controller.get_attr(climate_entity, "fan_mode")
-    current_setpoint = controller.get_attr(climate_entity, "temperature")
+    demand = resolve_equipment_demand(
+        snapshot,
+        predicted_open_zones,
+        operation_mode=operating_mode,
+    )
 
     if zone_actions:
         apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
@@ -265,7 +299,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         snapshot,
         demand,
         predicted_open_zones,
-        current_hvac_mode=str(current_hvac_mode) if current_hvac_mode is not None else None,
+        current_hvac_mode=current_hvac_mode_str,
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
     )
 
@@ -273,13 +307,24 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         controller,
         plan,
         config=DEFAULT_SYSTEM_CONFIG,
-        current_hvac_mode=str(current_hvac_mode) if current_hvac_mode is not None else None,
+        current_hvac_mode=current_hvac_mode_str,
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
         current_setpoint=current_setpoint,
     )
 
+    previous_active_mode = (current_hvac_mode_str or "").lower()
+    if previous_active_mode not in {HVAC_HEAT, HVAC_COOL}:
+        previous_active_mode = None
+    if previous_active_mode and plan.hvac_mode in {HVAC_HEAT, HVAC_COOL} and previous_active_mode != plan.hvac_mode:
+        RUNTIME_STATE["last_heatcool_transition"] = now
+    if plan.hvac_mode in {HVAC_HEAT, HVAC_COOL}:
+        RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode
+
     LOGGER.info(
-        "DISPATCH: reason=%s requested_by_zone=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zone=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        snapshot.selected_hvac_mode,
+        operating_mode or "none",
+        operating_mode_reason,
         plan.reason,
         plan.requested_by_zone,
         plan.hvac_mode or "off",
@@ -373,7 +418,6 @@ def temptamer_periodic_control_pass() -> None:
     _run_enabled_control_pass(reason="periodic trigger")
 
 
-@state_trigger(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
-def temptamer_comfort_mode_changed(*_args, **_kwargs) -> None:
-    _run_enabled_control_pass(reason="comfort mode changed", comfort_mode_changed=True)
-
+@state_trigger(*MODE_TRIGGER_ENTITIES)
+def temptamer_mode_changed(*_args, **_kwargs) -> None:
+    _run_enabled_control_pass(reason="mode selection changed", comfort_mode_changed=True)

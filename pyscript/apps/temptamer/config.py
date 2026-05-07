@@ -84,12 +84,21 @@ DEFAULT_COMFORT_MODES = {
     },
 }
 
+DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
+    "office": "input_select.temptamer_comfort_mode_office",
+    "dining": "input_select.temptamer_comfort_mode_dining",
+    "bedroom_1_2": "input_select.temptamer_comfort_mode_bed12",
+    "bedroom_3_4": "input_select.temptamer_comfort_mode_bed34",
+}
+
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
     inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
+    hvac_mode_entity="input_select.temptamer_hvac_mode",
     climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
     zones=DEFAULT_ZONES,
+    zone_comfort_mode_entities=DEFAULT_ZONE_COMFORT_MODE_ENTITIES,
     comfort_modes=DEFAULT_COMFORT_MODES,
     control_schemes=DEFAULT_CONTROL_SCHEMES,
 )
@@ -109,3 +118,10 @@ for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
 
 TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 
+_mode_trigger_entities = [
+    DEFAULT_SYSTEM_CONFIG.comfort_mode_entity,
+    DEFAULT_SYSTEM_CONFIG.hvac_mode_entity,
+    *DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values(),
+]
+
+MODE_TRIGGER_ENTITIES = tuple(_mode_trigger_entities)
