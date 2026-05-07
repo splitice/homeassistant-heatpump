@@ -4,7 +4,7 @@ PyScript heatpump control loop for Home Assistant.
 
 ## TempTamer
 
-This repository now includes a PyScript app in `/home/runner/work/homeassistant-heatpump/homeassistant-heatpump/apps/temptamer` that implements the TempTamer control loop described in the `ARCHITECTURE` documents:
+This repository now includes a PyScript app in `apps/temptamer` that implements the TempTamer control loop described in the `ARCHITECTURE` documents:
 
 - configuration and constants
 - comfort mode and zone state resolution

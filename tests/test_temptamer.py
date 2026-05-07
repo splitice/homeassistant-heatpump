@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import unittest
 
+from apps.temptamer.models import EquipmentDemand
 from apps.temptamer.demand_resolver import resolve_equipment_demand
 from apps.temptamer.heatpump_dispatcher import build_dispatch_plan, normalize_setpoint, resolve_fan_mode
 from apps.temptamer.state_reader import build_snapshot
@@ -15,6 +16,10 @@ class FakeReader:
 
     def get_state(self, entity_id):
         return self.state_map.get(entity_id)
+
+
+def make_demand(**overrides):
+    return EquipmentDemand(**overrides)
 
 
 class TempTamerTests(unittest.TestCase):
@@ -114,8 +119,22 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.fan_mode, "low")
 
     def test_fan_hysteresis_uses_medium_thresholds(self):
-        self.assertEqual(resolve_fan_mode("low", "heat", type("Demand", (), {"fan_only_requested": False, "heat_requested": True, "maintain_heat_mode": False, "max_temperature_deficit": 5.1})()), "medium")
-        self.assertEqual(resolve_fan_mode("medium", "heat", type("Demand", (), {"fan_only_requested": False, "heat_requested": True, "maintain_heat_mode": False, "max_temperature_deficit": 2.9})()), "low")
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                make_demand(heat_requested=True, max_temperature_deficit=5.1),
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "medium",
+                "heat",
+                make_demand(heat_requested=True, max_temperature_deficit=2.9),
+            ),
+            "low",
+        )
         self.assertEqual(normalize_setpoint(25.1), 25)
 
 
