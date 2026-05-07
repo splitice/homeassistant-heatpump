@@ -26,7 +26,7 @@ When `heat_requested` is true:
 1. Choose the zone with the maximum deficit from its `enable_below` threshold.
 2. Calculate:
    - `minimum_room_target = zone.scheme.enable_below`
-   - `inlet_cap_target = inlet_temperature + 2`
+   - `inlet_cap_target = inlet_temperature + MAX_SETPOINT_DELTA_FROM_INLET`
 3. Set requested heatpump temperature to:
    - `max(minimum_room_target, inlet_cap_target)`
 

@@ -63,6 +63,9 @@ DemandSnapshot(
   2. Otherwise the enabled zone with the lowest temperature
   3. Otherwise the currently open zone with the oldest last-change timestamp
 
+## Pending design decision
+- Comfort mode changes should trigger an immediate control pass, but whether that pass may override the normal 5-minute anti-flap restriction is intentionally left open until `ARCHITECTURE/QUESTIONS.md` question 3 is answered.
+
 ## Pyscript responsibilities
 - Use state-triggered handlers for comfort mode changes to request an immediate control pass.
 - Use a time-triggered loop every minute to recompute the snapshot because inlet temperature affects the required setpoint over time.

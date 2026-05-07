@@ -43,7 +43,8 @@ Balancing outcome:
    - Their minimum-on time has elapsed, and
    - Another zone will remain open after the change.
 4. If heat is required and no zone is currently open, open the highest-priority eligible zone before any heatpump command.
-5. Execute at most one zone state change per loop pass to avoid rapid oscillation and to simplify logging/diagnostics.
+5. Execute at most one discretionary zone state change per loop pass to avoid rapid oscillation and to simplify logging/diagnostics.
+6. A safety-required zone open is exempt from the discretionary limit when it is needed to satisfy the "at least one zone open" rule before equipment dispatch.
 
 ## Suggested priority order for zone actions
 - Highest opening priority: lowest temperature relative to `enable_below`

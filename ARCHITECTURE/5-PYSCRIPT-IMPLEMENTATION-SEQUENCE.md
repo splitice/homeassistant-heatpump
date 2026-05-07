@@ -52,7 +52,7 @@ apps/temptamer/
 
 ## State to persist in pyscript
 - Last successful control pass timestamp
-- Last zone on/off change timestamp per zone
+- Last zone on/off change timestamp per zone, with restoration behavior deferred pending `ARCHITECTURE/QUESTIONS.md` question 5
 - Last requested HVAC mode
 - Last requested fan mode
 - Last requested setpoint
