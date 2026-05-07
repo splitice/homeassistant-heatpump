@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+
+
+@dataclass(frozen=True)
+class ControlScheme:
+    name: str
+    enable_below: float
+    continue_until: float
+    ideal_target: float
+
+
+@dataclass(frozen=True)
+class ZoneConfig:
+    key: str
+    label: str
+    sensor_entity_id: str | None
+    switch_entity_id: str
+
+
+@dataclass(frozen=True)
+class SystemConfig:
+    house_temperature_sensor: str
+    inlet_temperature_sensor: str
+    comfort_mode_entity: str
+    climate_entity: str
+    zones: dict[str, ZoneConfig]
+    comfort_modes: dict[str, dict[str, str]]
+    control_schemes: dict[str, ControlScheme]
+
+
+@dataclass(frozen=True)
+class ZoneRuntimeState:
+    key: str
+    current_temp: float
+    scheme: ControlScheme
+    is_enabled_by_mode: bool
+    switch_is_on: bool
+    last_switch_change: datetime | None
+
+
+@dataclass(frozen=True)
+class DemandSnapshot:
+    comfort_mode: str
+    inlet_temp: float
+    zones: dict[str, ZoneRuntimeState]
+    heat_calling_zones: tuple[str, ...]
+    continue_heating_zones: tuple[str, ...]
+    below_ideal_zones: tuple[str, ...]
+    at_ideal_zones: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ZoneAction:
+    zone_key: str
+    turn_on: bool
+    reason: str
+    safety_required: bool = False
+    discretionary: bool = True
+
+
+@dataclass(frozen=True)
+class EquipmentDemand:
+    heat_requested: bool = False
+    cool_requested: bool = False
+    fan_only_requested: bool = False
+    maintain_heat_mode: bool = False
+    requested_by_zone: str | None = None
+    max_temperature_deficit: float = 0.0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class DispatchPlan:
+    turn_off: bool
+    hvac_mode: str | None = None
+    fan_mode: str | None = None
+    setpoint: int | None = None
+    requested_by_zone: str | None = None
+    open_zones: tuple[str, ...] = field(default_factory=tuple)
+    reason: str = ""
+

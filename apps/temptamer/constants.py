@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+from math import inf
+
+APP_NAME = "temptamer"
+LOGGER_NAME = "pyscript.temptamer"
+
+COMFORT_MODE_OFF = "Off"
+COMFORT_MODE_NIGHT = "Night"
+COMFORT_MODE_DAY = "Day"
+COMFORT_MODE_OFFICE = "Office"
+
+SCHEME_OFF = "Off"
+SCHEME_NIGHT = "Night"
+SCHEME_DAY_LIVING = "DayLiving"
+SCHEME_DINING_BASIC = "DiningBasic"
+SCHEME_BEDROOM = "Bedroom"
+
+UNKNOWN_STATES = frozenset({"", "none", "unknown", "unavailable"})
+SWITCH_ON_STATES = frozenset({"on", "open", "true", "1"})
+FAN_LOW = "low"
+FAN_MEDIUM = "medium"
+HVAC_HEAT = "heat"
+HVAC_FAN_ONLY = "fan_only"
+HVAC_OFF = "off"
+
+CONTROL_INTERVAL_SECONDS = 60
+MIN_ZONE_HOLD_SECONDS = 5 * 60
+MIN_ZONE_CHANGE_DELAY_SECONDS = 5 * 60
+MIN_OPEN_ZONES = 1
+MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS = 1
+
+HEAT_START_MEDIUM_FAN_DIFFERENTIAL = 4.0
+LOW_TO_MEDIUM_FAN_DIFFERENTIAL = 5.0
+MEDIUM_TO_LOW_FAN_DIFFERENTIAL = 3.0
+
+SETPOINT_DELTA_FROM_INLET = 2.0
+MIN_HEAT_SETPOINT = 17
+MAX_HEAT_SETPOINT = 25
+
+OFF_TEMPERATURE = -inf

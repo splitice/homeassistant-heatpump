@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+from .constants import (
+    COMFORT_MODE_DAY,
+    COMFORT_MODE_OFF,
+    COMFORT_MODE_NIGHT,
+    COMFORT_MODE_OFFICE,
+    SCHEME_BEDROOM,
+    SCHEME_DAY_LIVING,
+    SCHEME_DINING_BASIC,
+    SCHEME_NIGHT,
+    SCHEME_OFF,
+)
+from .models import ControlScheme, SystemConfig, ZoneConfig
+
+DEFAULT_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_below=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=17.0, continue_until=18.0, ideal_target=19.0),
+    SCHEME_DAY_LIVING: ControlScheme(
+        name=SCHEME_DAY_LIVING,
+        enable_below=19.0,
+        continue_until=20.0,
+        ideal_target=21.0,
+    ),
+    SCHEME_DINING_BASIC: ControlScheme(
+        name=SCHEME_DINING_BASIC,
+        enable_below=18.0,
+        continue_until=19.0,
+        ideal_target=20.0,
+    ),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=17.0, continue_until=18.0, ideal_target=19.0),
+}
+
+DEFAULT_ZONES = {
+    "office": ZoneConfig(
+        key="office",
+        label="Office",
+        sensor_entity_id="sensor.office_temperature",
+        switch_entity_id="switch.office_zone",
+    ),
+    "dining": ZoneConfig(
+        key="dining",
+        label="Dining",
+        sensor_entity_id="sensor.dining_temperature",
+        switch_entity_id="switch.dining_zone",
+    ),
+    "bedroom_1_2": ZoneConfig(
+        key="bedroom_1_2",
+        label="Bedroom 1&2",
+        sensor_entity_id="sensor.bedroom_1_2_temperature",
+        switch_entity_id="switch.bedroom_1_2_zone",
+    ),
+    "bedroom_3_4": ZoneConfig(
+        key="bedroom_3_4",
+        label="Bedroom 3&4",
+        sensor_entity_id="sensor.bedroom_3_4_temperature",
+        switch_entity_id="switch.bedroom_3_4_zone",
+    ),
+}
+
+DEFAULT_COMFORT_MODES = {
+    COMFORT_MODE_OFF: {zone_key: SCHEME_OFF for zone_key in DEFAULT_ZONES},
+    COMFORT_MODE_NIGHT: {
+        "office": SCHEME_NIGHT,
+        "dining": SCHEME_NIGHT,
+        "bedroom_1_2": SCHEME_BEDROOM,
+        "bedroom_3_4": SCHEME_BEDROOM,
+    },
+    COMFORT_MODE_DAY: {
+        "office": SCHEME_DAY_LIVING,
+        "dining": SCHEME_DAY_LIVING,
+        "bedroom_1_2": SCHEME_BEDROOM,
+        "bedroom_3_4": SCHEME_BEDROOM,
+    },
+    COMFORT_MODE_OFFICE: {
+        "office": SCHEME_DAY_LIVING,
+        "dining": SCHEME_DINING_BASIC,
+        "bedroom_1_2": SCHEME_BEDROOM,
+        "bedroom_3_4": SCHEME_BEDROOM,
+    },
+}
+
+DEFAULT_SYSTEM_CONFIG = SystemConfig(
+    house_temperature_sensor="sensor.home_temperature",
+    inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inlet_temperature",
+    comfort_mode_entity="input_select.temptamer_comfort_mode",
+    climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
+    zones=DEFAULT_ZONES,
+    comfort_modes=DEFAULT_COMFORT_MODES,
+    control_schemes=DEFAULT_CONTROL_SCHEMES,
+)
+
+TEMPERATURE_TRIGGER_ENTITIES = tuple(
+    entity_id
+    for entity_id in {
+        DEFAULT_SYSTEM_CONFIG.house_temperature_sensor,
+        DEFAULT_SYSTEM_CONFIG.inlet_temperature_sensor,
+        *(zone.sensor_entity_id for zone in DEFAULT_SYSTEM_CONFIG.zones.values() if zone.sensor_entity_id),
+    }
+)
+
