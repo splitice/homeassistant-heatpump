@@ -1,25 +1,32 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import DEFAULT_SYSTEM_CONFIG
-from .constants import APP_NAME, CONTROL_INTERVAL_SECONDS, LOGGER_NAME
+from .constants import APP_NAME, CONTROL_INTERVAL_SECONDS, LOGGER_NAME, SWITCH_STATE_SETTLE_SECONDS
 from .demand_resolver import resolve_equipment_demand
 from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan
-from .state_reader import build_snapshot
+from .state_reader import build_snapshot, is_switch_on
 from .zone_control import resolve_zone_actions
 
 USING_PYTHON_IMPORTS = __name__.startswith("pyscript.") or __name__ == "__main__"
 
 
 if USING_PYTHON_IMPORTS and "service" not in globals():  # pragma: no cover - used only outside PyScript runtime
-    def service(*_args, **_kwargs):
-        def decorator(func):
-            return func
+    class _ServiceRuntime:
+        def __call__(self, *_args, **_kwargs):
+            def decorator(func):
+                return func
 
-        return decorator
+            return decorator
+
+        @staticmethod
+        def call(_domain, _service_name, **_kwargs):
+            return None
+
+    service = _ServiceRuntime()
 
 
 if USING_PYTHON_IMPORTS and "time_trigger" not in globals():  # pragma: no cover - used only outside PyScript runtime
@@ -117,6 +124,7 @@ state.persist(  # type: ignore[name-defined]
 RUNTIME_STATE: dict[str, Any] = {
     "last_successful_control_pass": None,
     "last_zone_change": {},
+    "pending_zone_state": {},
     "last_error": None,
     "last_trigger": None,
 }
@@ -136,20 +144,7 @@ class PyscriptController:
         return attrs.get(attr_name)
 
     def call_service(self, domain: str, service_name: str, **kwargs: object) -> None:
-        entity_id = kwargs.get("entity_id")
-        if isinstance(entity_id, str):
-            try:
-                entity_service = state.get(f"{entity_id}.{service_name}")  # type: ignore[name-defined]
-            except (NameError, AttributeError):
-                entity_service = None
-            if callable(entity_service):
-                service_kwargs: dict[str, object] = {}
-                for key, value in kwargs.items():
-                    if key != "entity_id":
-                        service_kwargs[key] = value
-                entity_service(**service_kwargs)
-                return
-        service.call(domain, service_name, **kwargs)  # type: ignore[name-defined]
+        service.call(domain, service_name, blocking=True, **kwargs)  # type: ignore[name-defined]
 
 
 def _describe_open_zones(open_zones: tuple[str, ...]) -> str:
@@ -198,17 +193,40 @@ def _publish_runtime_state(status: str) -> None:
     )
 
 
+def _reconcile_pending_zone_state(controller: PyscriptController, now: datetime) -> None:
+    pending_zone_state = RUNTIME_STATE["pending_zone_state"]
+    last_zone_change = RUNTIME_STATE["last_zone_change"]
+    for zone_key in list(pending_zone_state.keys()):
+        desired_state = pending_zone_state[zone_key]
+        actual_state = is_switch_on(controller.get_state(DEFAULT_SYSTEM_CONFIG.zones[zone_key].switch_entity_id))
+        if actual_state == desired_state:
+            del pending_zone_state[zone_key]
+            continue
+
+        changed_at = last_zone_change.get(zone_key)
+        if not isinstance(changed_at, datetime):
+            del pending_zone_state[zone_key]
+            continue
+
+        normalized_changed_at = changed_at.astimezone(timezone.utc) if changed_at.tzinfo else changed_at.replace(tzinfo=timezone.utc)
+        if now - normalized_changed_at > timedelta(seconds=SWITCH_STATE_SETTLE_SECONDS):
+            del pending_zone_state[zone_key]
+
+
 def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None:
     task.unique(CONTROL_PASS_TASK_NAME)
 
     controller = PyscriptController()
     now = datetime.now(timezone.utc)
     RUNTIME_STATE["last_trigger"] = reason
+    _reconcile_pending_zone_state(controller, now)
 
     snapshot = build_snapshot(
         controller,
         config=DEFAULT_SYSTEM_CONFIG,
         last_switch_changes=RUNTIME_STATE["last_zone_change"],
+        pending_switch_states=RUNTIME_STATE["pending_zone_state"],
+        now=now,
     )
     zone_actions, predicted_open_zones = resolve_zone_actions(
         snapshot,
@@ -226,6 +244,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
         for action in zone_actions:
             RUNTIME_STATE["last_zone_change"][action.zone_key] = now
+            RUNTIME_STATE["pending_zone_state"][action.zone_key] = action.turn_on
             LOGGER.info(
                 "ZONES: %s %s because %s",
                 "Opening" if action.turn_on else "Closing",

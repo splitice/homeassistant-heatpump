@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 from pyscript.apps.temptamer.models import EquipmentDemand
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand
-from pyscript.apps.temptamer.heatpump_dispatcher import build_dispatch_plan, normalize_setpoint, resolve_fan_mode
+from pyscript.apps.temptamer.heatpump_dispatcher import apply_zone_actions, build_dispatch_plan, normalize_setpoint, resolve_fan_mode
 from pyscript.apps.temptamer.main import PyscriptController
 from pyscript.apps.temptamer.state_reader import build_snapshot, parse_float
 from pyscript.apps.temptamer.zone_control import resolve_zone_actions
@@ -235,6 +235,54 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(snapshot.zones["office"].last_switch_change, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
+    def test_build_snapshot_uses_pending_switch_state_during_settle_window(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp": "19.0",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "21.0",
+                    "sensor.bedroom_1_2_temperature": "20.0",
+                    "sensor.bedroom_3_4_temperature": "20.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={"office": datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)},
+            pending_switch_states={"office": True},
+            now=datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(snapshot.zones["office"].switch_is_on)
+
+    def test_build_snapshot_ignores_stale_pending_switch_state(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp": "19.0",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "21.0",
+                    "sensor.bedroom_1_2_temperature": "20.0",
+                    "sensor.bedroom_3_4_temperature": "20.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={"office": datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)},
+            pending_switch_states={"office": True},
+            now=datetime(2026, 1, 1, 12, 2, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(snapshot.zones["office"].switch_is_on)
+
     def test_equipment_demand_and_dispatch_plan_choose_heat_setpoint(self):
         snapshot = build_snapshot(
             FakeReader(
@@ -288,10 +336,9 @@ class TempTamerTests(unittest.TestCase):
         )
         self.assertEqual(normalize_setpoint(25.1), 25)
 
-    def test_pyscript_controller_uses_entity_bound_service_when_available(self):
-        entity_service = Mock()
+    def test_pyscript_controller_uses_documented_service_call(self):
         temptamer_main.state = SimpleNamespace(
-            get=lambda name: entity_service if name == "climate.hp.set_hvac_mode" else None,
+            get=lambda _name: None,
             getattr=lambda _name: {},
             set=lambda *_args, **_kwargs: None,
         )
@@ -305,8 +352,13 @@ class TempTamerTests(unittest.TestCase):
             hvac_mode="heat",
         )
 
-        entity_service.assert_called_once_with(hvac_mode="heat")
-        temptamer_main.service.call.assert_not_called()
+        temptamer_main.service.call.assert_called_once_with(
+            "climate",
+            "set_hvac_mode",
+            blocking=True,
+            entity_id="climate.hp",
+            hvac_mode="heat",
+        )
 
     def test_pyscript_controller_falls_back_to_service_call(self):
         temptamer_main.state = SimpleNamespace(
@@ -326,8 +378,22 @@ class TempTamerTests(unittest.TestCase):
         temptamer_main.service.call.assert_called_once_with(
             "switch",
             "turn_on",
+            blocking=True,
             entity_id="switch.office_zone",
         )
+
+    def test_apply_zone_actions_turns_on_and_off_switches(self):
+        controller = Mock()
+        zone_actions = [
+            SimpleNamespace(zone_key="office", turn_on=True),
+            SimpleNamespace(zone_key="dining", turn_on=False),
+        ]
+
+        apply_zone_actions(controller, zone_actions)
+
+        controller.call_service.assert_any_call("switch", "turn_on", entity_id="switch.office_zone")
+        controller.call_service.assert_any_call("switch", "turn_off", entity_id="switch.dining_zone")
+        self.assertEqual(controller.call_service.call_count, 2)
 
     def test_pyscript_controller_missing_entity_returns_none(self):
         def raise_name_error(_name):

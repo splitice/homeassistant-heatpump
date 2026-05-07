@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .config import DEFAULT_SYSTEM_CONFIG
-from .constants import COMFORT_MODE_OFF, SCHEME_OFF, SWITCH_ON_STATES, UNKNOWN_STATES
+from .constants import COMFORT_MODE_OFF, SCHEME_OFF, SWITCH_ON_STATES, SWITCH_STATE_SETTLE_SECONDS, UNKNOWN_STATES
 from .models import DemandSnapshot, SystemConfig, ZoneRuntimeState
 
 
@@ -49,6 +49,29 @@ def is_switch_on(value: object | None) -> bool:
     return str(value).strip().lower() in SWITCH_ON_STATES
 
 
+def _resolve_switch_state(
+    reader: StateReader,
+    entity_id: str,
+    *,
+    pending_switch_state: object | None,
+    last_switch_change: object | None,
+    now: datetime | None,
+) -> bool:
+    actual_switch_state = is_switch_on(reader.get_state(entity_id))
+    if not isinstance(pending_switch_state, bool) or pending_switch_state == actual_switch_state:
+        return actual_switch_state
+
+    normalized_last_change = _normalize_timestamp(last_switch_change)
+    normalized_now = _normalize_timestamp(now)
+    if normalized_last_change is None or normalized_now is None:
+        return actual_switch_state
+
+    if normalized_now - normalized_last_change <= timedelta(seconds=SWITCH_STATE_SETTLE_SECONDS):
+        return pending_switch_state
+
+    return actual_switch_state
+
+
 def _resolve_temperature(reader: StateReader, entity_id: str | None, fallback: float) -> float:
     if entity_id:
         value = parse_float(reader.get_state(entity_id))
@@ -89,8 +112,11 @@ def build_snapshot(
     *,
     config: SystemConfig = DEFAULT_SYSTEM_CONFIG,
     last_switch_changes: Mapping[str, object] | None = None,
+    pending_switch_states: Mapping[str, object] | None = None,
+    now: datetime | None = None,
 ) -> DemandSnapshot:
     last_switch_changes = last_switch_changes or {}
+    pending_switch_states = pending_switch_states or {}
     raw_mode = reader.get_state(config.comfort_mode_entity)
     comfort_mode = str(raw_mode) if raw_mode in config.comfort_modes else COMFORT_MODE_OFF
 
@@ -109,7 +135,13 @@ def build_snapshot(
             current_temp=current_temp,
             scheme=scheme,
             is_enabled_by_mode=scheme.name != SCHEME_OFF,
-            switch_is_on=is_switch_on(reader.get_state(zone.switch_entity_id)),
+            switch_is_on=_resolve_switch_state(
+                reader,
+                zone.switch_entity_id,
+                pending_switch_state=pending_switch_states.get(zone_key),
+                last_switch_change=last_switch_changes.get(zone_key),
+                now=now,
+            ),
             last_switch_change=_normalize_timestamp(last_switch_changes.get(zone_key)),
         )
 
