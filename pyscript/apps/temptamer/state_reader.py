@@ -15,6 +15,17 @@ class StateReader(Protocol):
 def parse_float(value: object | None) -> float | None:
     if value is None:
         return None
+
+    as_float = getattr(value, "as_float", None)
+    if callable(as_float):
+        try:
+            return as_float(default=None)
+        except TypeError:
+            try:
+                return as_float()
+            except (TypeError, ValueError):
+                return None
+
     if isinstance(value, str) and value.strip().lower() in UNKNOWN_STATES:
         return None
     try:
@@ -37,6 +48,33 @@ def _resolve_temperature(reader: StateReader, entity_id: str | None, fallback: f
     return fallback
 
 
+def _resolve_house_temperature(reader: StateReader, config: SystemConfig) -> float:
+    raw_house_temp = reader.get_state(config.house_temperature_sensor)
+    house_temp = parse_float(raw_house_temp)
+    if house_temp is not None:
+        return house_temp
+
+    raw_inlet_temp = reader.get_state(config.inlet_temperature_sensor)
+    inlet_temp = parse_float(raw_inlet_temp)
+    if inlet_temp is not None:
+        return inlet_temp
+
+    attempted_zone_values: dict[str, object | None] = {}
+    for zone in config.zones.values():
+        raw_zone_temp = reader.get_state(zone.sensor_entity_id)
+        attempted_zone_values[zone.key] = raw_zone_temp
+        zone_temp = parse_float(raw_zone_temp)
+        if zone_temp is not None:
+            return zone_temp
+
+    raise ValueError(
+        "No usable temperature source is available; "
+        f"house={config.house_temperature_sensor}:{raw_house_temp!r}, "
+        f"inlet={config.inlet_temperature_sensor}:{raw_inlet_temp!r}, "
+        f"zones={attempted_zone_values!r}"
+    )
+
+
 def build_snapshot(
     reader: StateReader,
     *,
@@ -47,9 +85,7 @@ def build_snapshot(
     raw_mode = reader.get_state(config.comfort_mode_entity)
     comfort_mode = str(raw_mode) if raw_mode in config.comfort_modes else COMFORT_MODE_OFF
 
-    house_temp = parse_float(reader.get_state(config.house_temperature_sensor))
-    if house_temp is None:
-        raise ValueError(f"House temperature sensor {config.house_temperature_sensor} is unavailable")
+    house_temp = _resolve_house_temperature(reader, config)
 
     inlet_temp = _resolve_temperature(reader, config.inlet_temperature_sensor, house_temp)
     comfort_mapping = config.comfort_modes[comfort_mode]
@@ -68,15 +104,30 @@ def build_snapshot(
             last_switch_change=last_switch_changes.get(zone_key),  # type: ignore[arg-type]
         )
 
-    enabled_zones = {key: zone for key, zone in zones.items() if zone.is_enabled_by_mode}
-    heat_calling = tuple(
-        key for key, zone in enabled_zones.items() if zone.current_temp < zone.scheme.enable_below
-    )
-    continue_heating = tuple(
-        key for key, zone in enabled_zones.items() if zone.current_temp < zone.scheme.continue_until
-    )
-    below_ideal = tuple(key for key, zone in enabled_zones.items() if zone.current_temp < zone.scheme.ideal_target)
-    at_ideal = tuple(key for key, zone in enabled_zones.items() if zone.current_temp >= zone.scheme.ideal_target)
+    enabled_zones: dict[str, ZoneRuntimeState] = {}
+    heat_calling_list: list[str] = []
+    continue_heating_list: list[str] = []
+    below_ideal_list: list[str] = []
+    at_ideal_list: list[str] = []
+
+    for key, zone in zones.items():
+        if not zone.is_enabled_by_mode:
+            continue
+
+        enabled_zones[key] = zone
+        if zone.current_temp < zone.scheme.enable_below:
+            heat_calling_list.append(key)
+        if zone.current_temp < zone.scheme.continue_until:
+            continue_heating_list.append(key)
+        if zone.current_temp < zone.scheme.ideal_target:
+            below_ideal_list.append(key)
+        else:
+            at_ideal_list.append(key)
+
+    heat_calling = tuple(heat_calling_list)
+    continue_heating = tuple(continue_heating_list)
+    below_ideal = tuple(below_ideal_list)
+    at_ideal = tuple(at_ideal_list)
 
     return DemandSnapshot(
         comfort_mode=comfort_mode,

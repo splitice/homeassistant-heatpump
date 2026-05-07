@@ -20,21 +20,49 @@ def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: boo
     return now - zone.last_switch_change >= timedelta(seconds=MIN_ZONE_CHANGE_DELAY_SECONDS)
 
 
+def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list[ZoneRuntimeState]:
+    ranked_zones.sort()
+    result: list[ZoneRuntimeState] = []
+    for _, zone in ranked_zones:
+        result.append(zone)
+    return result
+
+
 def _select_safety_open_zone(snapshot: DemandSnapshot) -> str | None:
-    enabled_zones = [zone for zone in snapshot.zones.values() if zone.is_enabled_by_mode]
+    enabled_zones: list[ZoneRuntimeState] = []
+    for zone in snapshot.zones.values():
+        if zone.is_enabled_by_mode:
+            enabled_zones.append(zone)
+
     if not enabled_zones:
-        open_zones = [zone for zone in snapshot.zones.values() if zone.switch_is_on]
+        open_zones: list[ZoneRuntimeState] = []
+        for zone in snapshot.zones.values():
+            if zone.switch_is_on:
+                open_zones.append(zone)
         if not open_zones:
             return None
-        open_zones.sort(key=lambda zone: _last_change_key(zone))
+        ranked_open_zones: list[tuple[datetime, ZoneRuntimeState]] = []
+        for zone in open_zones:
+            ranked_open_zones.append((_last_change_key(zone), zone))
+        open_zones = _sorted_by_rank(ranked_open_zones)
         return open_zones[0].key
 
-    continue_zones = [zone for zone in enabled_zones if zone.current_temp < zone.scheme.continue_until]
+    continue_zones: list[ZoneRuntimeState] = []
+    for zone in enabled_zones:
+        if zone.current_temp < zone.scheme.continue_until:
+            continue_zones.append(zone)
+
     if continue_zones:
-        continue_zones.sort(key=lambda zone: (zone.current_temp, _last_change_key(zone)))
+        ranked_continue_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+        for zone in continue_zones:
+            ranked_continue_zones.append(((zone.current_temp, _last_change_key(zone)), zone))
+        continue_zones = _sorted_by_rank(ranked_continue_zones)
         return continue_zones[0].key
 
-    enabled_zones.sort(key=lambda zone: (zone.current_temp, _last_change_key(zone)))
+    ranked_enabled_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+    for zone in enabled_zones:
+        ranked_enabled_zones.append(((zone.current_temp, _last_change_key(zone)), zone))
+    enabled_zones = _sorted_by_rank(ranked_enabled_zones)
     return enabled_zones[0].key
 
 
@@ -45,32 +73,34 @@ def resolve_zone_actions(
     comfort_mode_changed: bool = False,
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
-    predicted_open = {key for key, zone in snapshot.zones.items() if zone.switch_is_on}
+    predicted_open: set[str] = set()
+    for key, zone in snapshot.zones.items():
+        if zone.switch_is_on:
+            predicted_open.add(key)
+
     discretionary_used = 0
 
-    opening_candidates = sorted(
-        (
-            zone
-            for zone in snapshot.zones.values()
-            if zone.is_enabled_by_mode and not zone.switch_is_on and zone.current_temp < zone.scheme.continue_until
-        ),
-        key=lambda zone: (
-            zone.current_temp - zone.scheme.enable_below,
-            _last_change_key(zone),
-        ),
-    )
+    opening_candidates: list[ZoneRuntimeState] = []
+    for zone in snapshot.zones.values():
+        if zone.is_enabled_by_mode and not zone.switch_is_on and zone.current_temp < zone.scheme.continue_until:
+            opening_candidates.append(zone)
+    ranked_opening_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+    for zone in opening_candidates:
+        ranked_opening_candidates.append(
+            ((zone.current_temp - zone.scheme.enable_below, _last_change_key(zone)), zone)
+        )
+    opening_candidates = _sorted_by_rank(ranked_opening_candidates)
 
-    closing_candidates = sorted(
-        (
-            zone
-            for zone in snapshot.zones.values()
-            if zone.switch_is_on and zone.is_enabled_by_mode and zone.current_temp >= zone.scheme.ideal_target
-        ),
-        key=lambda zone: (
-            -(zone.current_temp - zone.scheme.ideal_target),
-            _last_change_key(zone),
-        ),
-    )
+    closing_candidates: list[ZoneRuntimeState] = []
+    for zone in snapshot.zones.values():
+        if zone.switch_is_on and zone.is_enabled_by_mode and zone.current_temp >= zone.scheme.ideal_target:
+            closing_candidates.append(zone)
+    ranked_closing_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+    for zone in closing_candidates:
+        ranked_closing_candidates.append(
+            ((-(zone.current_temp - zone.scheme.ideal_target), _last_change_key(zone)), zone)
+        )
+    closing_candidates = _sorted_by_rank(ranked_closing_candidates)
 
     if comfort_mode_changed:
         for zone in opening_candidates:

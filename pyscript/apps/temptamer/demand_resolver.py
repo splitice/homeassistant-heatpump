@@ -8,13 +8,18 @@ def _max_deficit(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], threshold
     if not zone_keys:
         return None, 0.0
 
-    def deficit(zone_key: str) -> float:
+    selected_zone_key: str | None = None
+    selected_deficit = 0.0
+
+    for zone_key in zone_keys:
         zone = snapshot.zones[zone_key]
         threshold = getattr(zone.scheme, threshold_name)
-        return max(0.0, threshold - zone.current_temp)
+        deficit = max(0.0, threshold - zone.current_temp)
+        if selected_zone_key is None or deficit > selected_deficit:
+            selected_zone_key = zone_key
+            selected_deficit = deficit
 
-    selected = max(zone_keys, key=deficit)
-    return selected, deficit(selected)
+    return selected_zone_key, selected_deficit
 
 
 def resolve_equipment_demand(snapshot: DemandSnapshot, predicted_open_zones: tuple[str, ...]) -> EquipmentDemand:
@@ -43,9 +48,16 @@ def resolve_equipment_demand(snapshot: DemandSnapshot, predicted_open_zones: tup
         )
 
     open_zones = set(predicted_open_zones)
-    open_at_ideal = [zone_key for zone_key in predicted_open_zones if zone_key in snapshot.at_ideal_zones]
+    open_at_ideal: list[str] = []
+    all_open_zones_at_ideal = True
+    for zone_key in predicted_open_zones:
+        if zone_key in snapshot.at_ideal_zones:
+            open_at_ideal.append(zone_key)
+        else:
+            all_open_zones_at_ideal = False
+
     if open_zones and open_at_ideal and snapshot.below_ideal_zones:
-        if all(zone_key in snapshot.at_ideal_zones for zone_key in predicted_open_zones):
+        if all_open_zones_at_ideal:
             return EquipmentDemand(
                 fan_only_requested=True,
                 reason="all open zones are at ideal while another enabled zone is still below ideal",

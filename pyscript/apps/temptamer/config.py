@@ -58,8 +58,12 @@ DEFAULT_ZONES = {
     ),
 }
 
+_comfort_mode_off_mapping: dict[str, str] = {}
+for zone_key in DEFAULT_ZONES:
+    _comfort_mode_off_mapping[zone_key] = SCHEME_OFF
+
 DEFAULT_COMFORT_MODES = {
-    COMFORT_MODE_OFF: {zone_key: SCHEME_OFF for zone_key in DEFAULT_ZONES},
+    COMFORT_MODE_OFF: _comfort_mode_off_mapping,
     COMFORT_MODE_NIGHT: {
         "office": SCHEME_NIGHT,
         "dining": SCHEME_NIGHT,
@@ -82,7 +86,7 @@ DEFAULT_COMFORT_MODES = {
 
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
-    inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inlet_temperature",
+    inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
     climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
     zones=DEFAULT_ZONES,
@@ -90,12 +94,18 @@ DEFAULT_SYSTEM_CONFIG = SystemConfig(
     control_schemes=DEFAULT_CONTROL_SCHEMES,
 )
 
-TEMPERATURE_TRIGGER_ENTITIES = tuple(
-    entity_id
-    for entity_id in {
-        DEFAULT_SYSTEM_CONFIG.house_temperature_sensor,
-        DEFAULT_SYSTEM_CONFIG.inlet_temperature_sensor,
-        *(zone.sensor_entity_id for zone in DEFAULT_SYSTEM_CONFIG.zones.values() if zone.sensor_entity_id),
-    }
-)
+_temperature_trigger_entities: list[str] = []
+
+
+def _add_temperature_trigger_entity(entity_id: str | None) -> None:
+    if entity_id and entity_id not in _temperature_trigger_entities:
+        _temperature_trigger_entities.append(entity_id)
+
+
+_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.house_temperature_sensor)
+_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.inlet_temperature_sensor)
+for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
+    _add_temperature_trigger_entity(zone.sensor_entity_id)
+
+TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 

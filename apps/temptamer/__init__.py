@@ -1,2 +1,0 @@
-"""TempTamer PyScript package."""
-
