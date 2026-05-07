@@ -26,6 +26,22 @@ def _last_change_key(zone: ZoneRuntimeState) -> datetime:
     return _normalize_datetime(zone.last_switch_change)
 
 
+def _recent_change_rank(zone: ZoneRuntimeState) -> timedelta:
+    if zone.last_switch_change is None:
+        return timedelta.max
+    normalized_last_change = _normalize_datetime(zone.last_switch_change)
+    max_datetime = datetime.max.replace(tzinfo=timezone.utc)
+    return max_datetime - normalized_last_change
+
+
+def _temperature_deficit(zone: ZoneRuntimeState, threshold_name: str) -> float:
+    return max(0.0, getattr(zone.scheme, threshold_name) - zone.current_temp)
+
+
+def _temperature_excess(zone: ZoneRuntimeState, threshold: float) -> float:
+    return max(0.0, zone.current_temp - threshold)
+
+
 def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: bool) -> bool:
     if comfort_mode_changed or zone.last_switch_change is None:
         return True
@@ -76,6 +92,15 @@ def _closing_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, d
     return (-(zone.current_temp - zone.scheme.ideal_target), _last_change_key(zone))
 
 
+def _safety_open_rank(zone: ZoneRuntimeState, operation_mode: str, *, continue_threshold: bool) -> tuple[float, timedelta]:
+    if operation_mode == HVAC_COOL:
+        threshold = zone.scheme.cool_continue_until() if continue_threshold else zone.scheme.ideal_target
+        return (-_temperature_excess(zone, threshold), _recent_change_rank(zone))
+
+    threshold_name = "continue_until" if continue_threshold else "ideal_target"
+    return (-_temperature_deficit(zone, threshold_name), _recent_change_rank(zone))
+
+
 def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> str | None:
     enabled_zones: list[ZoneRuntimeState] = []
     for zone in snapshot.zones.values():
@@ -89,9 +114,9 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
                 open_zones.append(zone)
         if not open_zones:
             return None
-        ranked_open_zones: list[tuple[datetime, ZoneRuntimeState]] = []
+        ranked_open_zones: list[tuple[timedelta, ZoneRuntimeState]] = []
         for zone in open_zones:
-            ranked_open_zones.append((_last_change_key(zone), zone))
+            ranked_open_zones.append((_recent_change_rank(zone), zone))
         open_zones = _sorted_by_rank(ranked_open_zones)
         return open_zones[0].key
 
@@ -101,15 +126,15 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
             continue_zones.append(zone)
 
     if continue_zones:
-        ranked_continue_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+        ranked_continue_zones: list[tuple[tuple[float, timedelta], ZoneRuntimeState]] = []
         for zone in continue_zones:
-            ranked_continue_zones.append((_opening_rank(zone, operation_mode), zone))
+            ranked_continue_zones.append((_safety_open_rank(zone, operation_mode, continue_threshold=True), zone))
         continue_zones = _sorted_by_rank(ranked_continue_zones)
         return continue_zones[0].key
 
-    ranked_enabled_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+    ranked_enabled_zones: list[tuple[tuple[float, timedelta], ZoneRuntimeState]] = []
     for zone in enabled_zones:
-        ranked_enabled_zones.append((_opening_rank(zone, operation_mode), zone))
+        ranked_enabled_zones.append((_safety_open_rank(zone, operation_mode, continue_threshold=False), zone))
     enabled_zones = _sorted_by_rank(ranked_enabled_zones)
     return enabled_zones[0].key
 

@@ -35,26 +35,26 @@ DEFAULT_ZONES = {
     "office": ZoneConfig(
         key="office",
         label="Office",
-        sensor_entity_id="sensor.office_temperature",
-        switch_entity_id="switch.office_zone",
+        sensor_entity_id="sensor.office_average_temperature",
+        switch_entity_id="switch.wt32_hpctrl_e8dbd0_office",
     ),
     "dining": ZoneConfig(
         key="dining",
         label="Dining",
-        sensor_entity_id="sensor.dining_temperature",
-        switch_entity_id="switch.dining_zone",
+        sensor_entity_id="sensor.average_dining_zone_temp",
+        switch_entity_id="switch.wt32_hpctrl_e8dbd0_dining",
     ),
     "bedroom_1_2": ZoneConfig(
         key="bedroom_1_2",
         label="Bedroom 1&2",
-        sensor_entity_id="sensor.bedroom_1_2_temperature",
-        switch_entity_id="switch.bedroom_1_2_zone",
+        sensor_entity_id="sensor.average_bed1_2_zone_temp",
+        switch_entity_id="switch.wt32_hpctrl_e8dbd0_bed_12",
     ),
     "bedroom_3_4": ZoneConfig(
         key="bedroom_3_4",
         label="Bedroom 3&4",
-        sensor_entity_id="sensor.bedroom_3_4_temperature",
-        switch_entity_id="switch.bedroom_3_4_zone",
+        sensor_entity_id="sensor.average_bed3_4_zone_temp",
+        switch_entity_id="switch.wt32_hpctrl_e8dbd0_bed_34",
     ),
 }
 

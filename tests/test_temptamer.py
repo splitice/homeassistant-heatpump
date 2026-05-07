@@ -30,14 +30,14 @@ def base_state_map(**overrides):
         "input_select.temptamer_hvac_mode": "Heat",
         "sensor.home_temperature": "18.0",
         TEST_INLET_SENSOR: "19.0",
-        "sensor.office_temperature": "18.0",
-        "sensor.dining_temperature": "18.0",
-        "sensor.bedroom_1_2_temperature": "18.0",
-        "sensor.bedroom_3_4_temperature": "18.0",
-        "switch.office_zone": "off",
-        "switch.dining_zone": "off",
-        "switch.bedroom_1_2_zone": "off",
-        "switch.bedroom_3_4_zone": "off",
+        "sensor.office_average_temperature": "18.0",
+        "sensor.average_dining_zone_temp": "18.0",
+        "sensor.average_bed1_2_zone_temp": "18.0",
+        "sensor.average_bed3_4_zone_temp": "18.0",
+        "switch.wt32_hpctrl_e8dbd0_office": "off",
+        "switch.wt32_hpctrl_e8dbd0_dining": "off",
+        "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
+        "switch.wt32_hpctrl_e8dbd0_bed_34": "off",
     }
     state_map.update(overrides)
     return state_map
@@ -66,12 +66,12 @@ class TempTamerTests(unittest.TestCase):
                     "input_select.temptamer_comfort_mode_office": "Day",
                     "sensor.home_temperature": "18.5",
                     TEST_INLET_SENSOR: "23.4",
-                    "sensor.office_temperature": "unavailable",
-                    "sensor.dining_temperature": "17.0",
-                    "sensor.bedroom_1_2_temperature": "16.5",
-                    "sensor.bedroom_3_4_temperature": "unknown",
-                    "switch.dining_zone": "on",
-                    "switch.bedroom_3_4_zone": "on",
+                    "sensor.office_average_temperature": "unavailable",
+                    "sensor.average_dining_zone_temp": "17.0",
+                    "sensor.average_bed1_2_zone_temp": "16.5",
+                    "sensor.average_bed3_4_zone_temp": "unknown",
+                    "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    "switch.wt32_hpctrl_e8dbd0_bed_34": "on",
                 }
             )
         )
@@ -94,11 +94,11 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "sensor.home_temperature": "18.0",
                         TEST_INLET_SENSOR: "19.0",
-                        "sensor.office_temperature": "17.0",
-                        "sensor.dining_temperature": "22.0",
-                        "sensor.bedroom_1_2_temperature": "20.0",
-                        "sensor.bedroom_3_4_temperature": "20.0",
-                        "switch.dining_zone": "on",
+                        "sensor.office_average_temperature": "17.0",
+                        "sensor.average_dining_zone_temp": "22.0",
+                        "sensor.average_bed1_2_zone_temp": "20.0",
+                        "sensor.average_bed3_4_zone_temp": "20.0",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
                     }
                 )
             ),
@@ -130,8 +130,8 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "sensor.home_temperature": "18.0",
                         TEST_INLET_SENSOR: "18.5",
-                        "sensor.office_temperature": "17.5",
-                        "sensor.dining_temperature": "17.8",
+                        "sensor.office_average_temperature": "17.5",
+                        "sensor.average_dining_zone_temp": "17.8",
                     }
                 )
             ),
@@ -152,6 +152,73 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(actions[0].discretionary)
         self.assertIn("overriding anti-flap delay", actions[0].reason)
 
+    def test_zone_actions_keep_same_safety_zone_when_multiple_zones_need_heat(self):
+        first_now = datetime(2026, 5, 7, 12, 3, 0, tzinfo=timezone.utc)
+        first_snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        TEST_INLET_SENSOR: "18.5",
+                        "sensor.office_average_temperature": "18.5",
+                        "sensor.average_dining_zone_temp": "18.5",
+                        "sensor.average_bed1_2_zone_temp": "18.0",
+                        "sensor.average_bed3_4_zone_temp": "18.0",
+                    }
+                )
+            ),
+            last_switch_changes={
+                "office": datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc),
+                "dining": datetime(2026, 5, 7, 11, 59, 0, tzinfo=timezone.utc),
+            },
+            now=first_now,
+        )
+
+        first_actions, first_predicted_open = resolve_zone_actions(
+            first_snapshot,
+            first_now,
+            operation_mode=HVAC_HEAT,
+            comfort_mode_changed=False,
+        )
+
+        self.assertEqual(first_predicted_open, ("office",))
+        self.assertEqual(len(first_actions), 1)
+        self.assertEqual(first_actions[0].zone_key, "office")
+        self.assertTrue(first_actions[0].safety_required)
+
+        second_now = datetime(2026, 5, 7, 12, 3, 30, tzinfo=timezone.utc)
+        second_snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        TEST_INLET_SENSOR: "18.5",
+                        "sensor.office_average_temperature": "18.5",
+                        "sensor.average_dining_zone_temp": "18.5",
+                        "sensor.average_bed1_2_zone_temp": "18.0",
+                        "sensor.average_bed3_4_zone_temp": "18.0",
+                    }
+                )
+            ),
+            last_switch_changes={
+                "office": first_now,
+                "dining": datetime(2026, 5, 7, 11, 59, 0, tzinfo=timezone.utc),
+            },
+            now=second_now,
+        )
+
+        second_actions, second_predicted_open = resolve_zone_actions(
+            second_snapshot,
+            second_now,
+            operation_mode=HVAC_HEAT,
+            comfort_mode_changed=False,
+        )
+
+        self.assertEqual(second_predicted_open, ("office",))
+        self.assertEqual(len(second_actions), 1)
+        self.assertEqual(second_actions[0].zone_key, "office")
+        self.assertTrue(second_actions[0].safety_required)
+
     def test_zone_prediction_diagnostics_explain_anti_flap_decisions(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
         snapshot = build_snapshot(
@@ -160,8 +227,8 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "sensor.home_temperature": "18.0",
                         TEST_INLET_SENSOR: "18.5",
-                        "sensor.office_temperature": "17.5",
-                        "sensor.dining_temperature": "17.8",
+                        "sensor.office_average_temperature": "17.5",
+                        "sensor.average_dining_zone_temp": "17.8",
                     }
                 )
             ),
@@ -193,11 +260,11 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_comfort_mode": "Office",
                         "sensor.home_temperature": "18.0",
                         TEST_INLET_SENSOR: "16.4",
-                        "sensor.office_temperature": "17.0",
-                        "sensor.dining_temperature": "21.0",
-                        "sensor.bedroom_1_2_temperature": "19.5",
-                        "sensor.bedroom_3_4_temperature": "19.5",
-                        "switch.office_zone": "on",
+                        "sensor.office_average_temperature": "17.0",
+                        "sensor.average_dining_zone_temp": "21.0",
+                        "sensor.average_bed1_2_zone_temp": "19.5",
+                        "sensor.average_bed3_4_zone_temp": "19.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
                     }
                 )
             )
@@ -227,10 +294,10 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_hvac_mode": "Cool",
                         "sensor.home_temperature": "22.0",
                         TEST_INLET_SENSOR: "25.0",
-                        "sensor.office_temperature": "24.5",
-                        "sensor.dining_temperature": "20.0",
-                        "sensor.bedroom_1_2_temperature": "20.0",
-                        "sensor.bedroom_3_4_temperature": "20.0",
+                        "sensor.office_average_temperature": "24.5",
+                        "sensor.average_dining_zone_temp": "20.0",
+                        "sensor.average_bed1_2_zone_temp": "20.0",
+                        "sensor.average_bed3_4_zone_temp": "20.0",
                     }
                 )
             )
@@ -271,10 +338,10 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_hvac_mode": "HeatCool",
                         "sensor.home_temperature": "22.0",
                         TEST_INLET_SENSOR: "24.0",
-                        "sensor.office_temperature": "24.5",
-                        "sensor.dining_temperature": "20.0",
-                        "sensor.bedroom_1_2_temperature": "20.0",
-                        "sensor.bedroom_3_4_temperature": "20.0",
+                        "sensor.office_average_temperature": "24.5",
+                        "sensor.average_dining_zone_temp": "20.0",
+                        "sensor.average_bed1_2_zone_temp": "20.0",
+                        "sensor.average_bed3_4_zone_temp": "20.0",
                     }
                 )
             )
@@ -300,10 +367,10 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_hvac_mode": "HeatCool",
                         "sensor.home_temperature": "22.0",
                         TEST_INLET_SENSOR: "24.0",
-                        "sensor.office_temperature": "24.5",
-                        "sensor.dining_temperature": "20.0",
-                        "sensor.bedroom_1_2_temperature": "20.0",
-                        "sensor.bedroom_3_4_temperature": "20.0",
+                        "sensor.office_average_temperature": "24.5",
+                        "sensor.average_dining_zone_temp": "20.0",
+                        "sensor.average_bed1_2_zone_temp": "20.0",
+                        "sensor.average_bed3_4_zone_temp": "20.0",
                     }
                 )
             )
@@ -339,7 +406,7 @@ class TempTamerTests(unittest.TestCase):
             base_state_map(
                 **{
                     "input_select.temptamer_hvac_mode": "Manual",
-                    "switch.office_zone": "on",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
                     "climate.wt32_hpctrl_e8dbd0_heatpump": "heat",
                 }
             )
@@ -361,7 +428,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "low",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=5.1),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=4.1),
             ),
             "medium",
         )
@@ -369,7 +436,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=2.9),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.9),
             ),
             "low",
         )
