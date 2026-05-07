@@ -25,7 +25,7 @@ Create a small configuration layer that defines all entities, zone metadata, com
   - Low-to-medium threshold: differential greater than 5°C
   - Medium-to-low threshold: differential less than 3°C
 - Define setpoint constants:
-  - Maximum requested setpoint increase above inlet temperature: 2°C
+  - Heat request setpoint increase above inlet temperature: 2°C (SETPOINT_DELTA_FROM_INLET)
   - Minimum requested heat setpoint: 17°C
   - Maximum requested heat setpoint: 25°C
   - Requested heat setpoints must be whole integers, rounded up if necessary
