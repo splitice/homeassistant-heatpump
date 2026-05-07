@@ -312,10 +312,10 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         current_setpoint=current_setpoint,
     )
 
-    previous_active_mode = (current_hvac_mode_str or "").lower()
-    if previous_active_mode not in {HVAC_HEAT, HVAC_COOL}:
-        previous_active_mode = None
-    if previous_active_mode and plan.hvac_mode in {HVAC_HEAT, HVAC_COOL} and previous_active_mode != plan.hvac_mode:
+    previous_valid_mode = (current_hvac_mode_str or "").lower()
+    if previous_valid_mode not in {HVAC_HEAT, HVAC_COOL}:
+        previous_valid_mode = None
+    if previous_valid_mode and plan.hvac_mode in {HVAC_HEAT, HVAC_COOL} and previous_valid_mode != plan.hvac_mode:
         RUNTIME_STATE["last_heatcool_transition"] = now
     if plan.hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode

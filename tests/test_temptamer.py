@@ -13,7 +13,7 @@ from pyscript.apps.temptamer.state_reader import build_snapshot
 from pyscript.apps.temptamer.zone_control import describe_zone_predictions, resolve_zone_actions
 
 
-INLET_SENSOR = "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp"
+TEST_INLET_SENSOR = "sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp"
 
 
 class FakeReader:
@@ -29,7 +29,7 @@ def base_state_map(**overrides):
         "input_select.temptamer_comfort_mode": "Day",
         "input_select.temptamer_hvac_mode": "Heat",
         "sensor.home_temperature": "18.0",
-        INLET_SENSOR: "19.0",
+        TEST_INLET_SENSOR: "19.0",
         "sensor.office_temperature": "18.0",
         "sensor.dining_temperature": "18.0",
         "sensor.bedroom_1_2_temperature": "18.0",
@@ -65,7 +65,7 @@ class TempTamerTests(unittest.TestCase):
                     "input_select.temptamer_hvac_mode": "Cool",
                     "input_select.temptamer_comfort_mode_office": "Day",
                     "sensor.home_temperature": "18.5",
-                    INLET_SENSOR: "23.4",
+                    TEST_INLET_SENSOR: "23.4",
                     "sensor.office_temperature": "unavailable",
                     "sensor.dining_temperature": "17.0",
                     "sensor.bedroom_1_2_temperature": "16.5",
@@ -93,7 +93,7 @@ class TempTamerTests(unittest.TestCase):
                 base_state_map(
                     **{
                         "sensor.home_temperature": "18.0",
-                        INLET_SENSOR: "19.0",
+                        TEST_INLET_SENSOR: "19.0",
                         "sensor.office_temperature": "17.0",
                         "sensor.dining_temperature": "22.0",
                         "sensor.bedroom_1_2_temperature": "20.0",
@@ -129,7 +129,7 @@ class TempTamerTests(unittest.TestCase):
                 base_state_map(
                     **{
                         "sensor.home_temperature": "18.0",
-                        INLET_SENSOR: "18.5",
+                        TEST_INLET_SENSOR: "18.5",
                         "sensor.office_temperature": "17.5",
                         "sensor.dining_temperature": "17.8",
                     }
@@ -159,7 +159,7 @@ class TempTamerTests(unittest.TestCase):
                 base_state_map(
                     **{
                         "sensor.home_temperature": "18.0",
-                        INLET_SENSOR: "18.5",
+                        TEST_INLET_SENSOR: "18.5",
                         "sensor.office_temperature": "17.5",
                         "sensor.dining_temperature": "17.8",
                     }
@@ -192,7 +192,7 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "input_select.temptamer_comfort_mode": "Office",
                         "sensor.home_temperature": "18.0",
-                        INLET_SENSOR: "16.4",
+                        TEST_INLET_SENSOR: "16.4",
                         "sensor.office_temperature": "17.0",
                         "sensor.dining_temperature": "21.0",
                         "sensor.bedroom_1_2_temperature": "19.5",
@@ -226,7 +226,7 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "input_select.temptamer_hvac_mode": "Cool",
                         "sensor.home_temperature": "22.0",
-                        INLET_SENSOR: "25.0",
+                        TEST_INLET_SENSOR: "25.0",
                         "sensor.office_temperature": "24.5",
                         "sensor.dining_temperature": "20.0",
                         "sensor.bedroom_1_2_temperature": "20.0",
@@ -270,7 +270,7 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "input_select.temptamer_hvac_mode": "HeatCool",
                         "sensor.home_temperature": "22.0",
-                        INLET_SENSOR: "24.0",
+                        TEST_INLET_SENSOR: "24.0",
                         "sensor.office_temperature": "24.5",
                         "sensor.dining_temperature": "20.0",
                         "sensor.bedroom_1_2_temperature": "20.0",

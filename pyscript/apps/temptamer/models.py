@@ -12,9 +12,11 @@ class ControlScheme:
     ideal_target: float
 
     def cool_enable_above(self) -> float:
+        """Mirror the heating enable delta above the ideal target for cooling."""
         return self.ideal_target + (self.ideal_target - self.enable_below)
 
     def cool_continue_until(self) -> float:
+        """Mirror the heating continue delta above the ideal target for cooling."""
         return self.ideal_target + (self.ideal_target - self.continue_until)
 
 

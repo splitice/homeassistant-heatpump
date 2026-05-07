@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from .constants import (
     COMFORT_MODE_OFF,
@@ -37,7 +38,7 @@ def _max_deficit(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], threshold
 def _max_excess(
     snapshot: DemandSnapshot,
     zone_keys: tuple[str, ...],
-    threshold_resolver,
+    threshold_resolver: Callable[[ZoneRuntimeState], float],
 ) -> tuple[str | None, float]:
     if not zone_keys:
         return None, 0.0
