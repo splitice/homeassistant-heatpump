@@ -6,9 +6,6 @@ This repository contains a Home Assistant heatpump controller implemented as a P
 
 - Keep Home Assistant / PyScript runtime glue in `apps/temptamer/main.py`.
 - Keep decision logic in the pure-Python modules under `apps/temptamer/` so it remains unit-testable outside Home Assistant.
-- Keep changes aligned with the architecture notes in `ARCHITECTURE/`, especially:
-  - `ARCHITECTURE/2-COMFORT-MODE-AND-ZONE-STATE.md`
-  - `ARCHITECTURE/5-PYSCRIPT-IMPLEMENTATION-SEQUENCE.md`
 - Update `tests/test_temptamer.py` when runtime decision logic changes.
 - Validate changes with:
   - `python -m unittest discover -s tests -p 'test_*.py'`
