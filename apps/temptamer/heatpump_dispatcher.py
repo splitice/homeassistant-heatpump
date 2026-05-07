@@ -33,7 +33,9 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
     if demand.heat_requested and demand.requested_by_zone:
         zone = snapshot.zones[demand.requested_by_zone]
         minimum_room_target = zone.scheme.enable_below
-        inlet_cap_target = snapshot.inlet_temp + min(minimum_room_target - snapshot.inlet_temp, SETPOINT_DELTA_FROM_INLET)
+        temp_gap = minimum_room_target - snapshot.inlet_temp
+        allowed_increase = min(temp_gap, SETPOINT_DELTA_FROM_INLET)
+        inlet_cap_target = snapshot.inlet_temp + allowed_increase
         raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)
         return normalize_setpoint(raw_requested_setpoint)
     return normalize_setpoint(snapshot.inlet_temp)
@@ -134,4 +136,3 @@ def apply_dispatch_plan(
 
     if plan.setpoint is not None and normalized_setpoint != float(plan.setpoint):
         controller.call_service("climate", "set_temperature", entity_id=entity_id, temperature=plan.setpoint)
-

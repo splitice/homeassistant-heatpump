@@ -99,22 +99,20 @@ def resolve_zone_actions(
         if not comfort_mode_changed:
             discretionary_used += 1
 
-    for zone in opening_candidates:
-        if comfort_mode_changed:
-            continue
-        if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
-            continue
-        if not comfort_mode_changed and discretionary_used >= 1:
-            break
-        predicted_open.add(zone.key)
-        actions.append(
-            ZoneAction(
-                zone_key=zone.key,
-                turn_on=True,
-                reason=f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}",
+    if not comfort_mode_changed:
+        for zone in opening_candidates:
+            if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
+                continue
+            if discretionary_used >= 1:
+                break
+            predicted_open.add(zone.key)
+            actions.append(
+                ZoneAction(
+                    zone_key=zone.key,
+                    turn_on=True,
+                    reason=f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}",
+                )
             )
-        )
-        if not comfort_mode_changed:
             discretionary_used += 1
 
     if not predicted_open:
