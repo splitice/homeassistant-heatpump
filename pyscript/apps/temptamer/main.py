@@ -9,7 +9,7 @@ from .constants import APP_NAME, CONTROL_INTERVAL_SECONDS, LOGGER_NAME, SWITCH_S
 from .demand_resolver import resolve_equipment_demand
 from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan
 from .state_reader import build_snapshot, is_switch_on
-from .zone_control import resolve_zone_actions
+from .zone_control import describe_zone_predictions, resolve_zone_actions
 
 USING_PYTHON_IMPORTS = __name__.startswith("pyscript.") or __name__ == "__main__"
 
@@ -233,6 +233,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         now,
         comfort_mode_changed=comfort_mode_changed,
     )
+    zone_diagnostics = describe_zone_predictions(
+        snapshot,
+        now,
+        predicted_open_zones,
+        comfort_mode_changed=comfort_mode_changed,
+    )
     demand = resolve_equipment_demand(snapshot, predicted_open_zones)
 
     climate_entity = DEFAULT_SYSTEM_CONFIG.climate_entity
@@ -251,6 +257,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
                 DEFAULT_SYSTEM_CONFIG.zones[action.zone_key].label,
                 action.reason,
             )
+
+    if not predicted_open_zones:
+        LOGGER.warning("ZONES: predicted_open=none details=%s", " | ".join(zone_diagnostics))
 
     plan = build_dispatch_plan(
         snapshot,

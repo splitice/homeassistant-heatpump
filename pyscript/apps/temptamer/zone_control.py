@@ -85,6 +85,63 @@ def _select_safety_open_zone(snapshot: DemandSnapshot) -> str | None:
     return enabled_zones[0].key
 
 
+def _zone_temperature_reason(zone: ZoneRuntimeState) -> str:
+    if not zone.is_enabled_by_mode:
+        return f"mode disabled by scheme {zone.scheme.name}"
+    if zone.current_temp < zone.scheme.enable_below:
+        return f"below enable threshold {zone.current_temp:.1f}<{zone.scheme.enable_below:.1f}"
+    if zone.current_temp < zone.scheme.continue_until:
+        return f"below continue-until threshold {zone.current_temp:.1f}<{zone.scheme.continue_until:.1f}"
+    if zone.current_temp < zone.scheme.ideal_target:
+        return f"below ideal target {zone.current_temp:.1f}<{zone.scheme.ideal_target:.1f}"
+    return f"at or above ideal target {zone.current_temp:.1f}>={zone.scheme.ideal_target:.1f}"
+
+
+def describe_zone_predictions(
+    snapshot: DemandSnapshot,
+    now: datetime,
+    predicted_open_zones: tuple[str, ...],
+    *,
+    comfort_mode_changed: bool = False,
+) -> tuple[str, ...]:
+    predicted_open = set(predicted_open_zones)
+    descriptions: list[str] = []
+
+    for zone_key, zone in snapshot.zones.items():
+        status_parts: list[str] = []
+        status_parts.append(_zone_temperature_reason(zone))
+        if zone.switch_is_on:
+            status_parts.append("switch currently on")
+        else:
+            status_parts.append("switch currently off")
+
+        if zone.key in predicted_open:
+            if zone.switch_is_on:
+                status_parts.append("kept open")
+            else:
+                status_parts.append("predicted to open")
+        else:
+            if zone.is_enabled_by_mode and zone.current_temp < zone.scheme.continue_until:
+                if _can_toggle(zone, now, comfort_mode_changed):
+                    status_parts.append("eligible to open but another zone ranked ahead")
+                else:
+                    status_parts.append("held closed by anti-flap delay")
+            elif zone.switch_is_on and zone.is_enabled_by_mode and zone.current_temp >= zone.scheme.ideal_target:
+                if _can_toggle(zone, now, comfort_mode_changed):
+                    status_parts.append("eligible to close")
+                else:
+                    status_parts.append("held open by anti-flap delay")
+            else:
+                status_parts.append("not selected to open")
+
+        descriptions.append(
+            f"{zone_key}: scheme={zone.scheme.name} temp={zone.current_temp:.1f} switch={'on' if zone.switch_is_on else 'off'} predicted={'open' if zone_key in predicted_open else 'closed'} because "
+            + "; ".join(status_parts)
+        )
+
+    return tuple(descriptions)
+
+
 def resolve_zone_actions(
     snapshot: DemandSnapshot,
     now: datetime,
@@ -172,13 +229,17 @@ def resolve_zone_actions(
         safety_zone_key = _select_safety_open_zone(snapshot)
         if safety_zone_key:
             zone = snapshot.zones[safety_zone_key]
-            if (not zone.switch_is_on) and _can_toggle(zone, now, comfort_mode_changed):
+            safety_override_required = not _can_toggle(zone, now, comfort_mode_changed)
+            if not zone.switch_is_on:
                 predicted_open.add(zone.key)
+                reason = "keeping at least one zone open for safety"
+                if safety_override_required:
+                    reason += "; overriding anti-flap delay because every zone would otherwise be closed"
                 actions.append(
                     ZoneAction(
                         zone_key=zone.key,
                         turn_on=True,
-                        reason="keeping at least one zone open for safety",
+                        reason=reason,
                         safety_required=True,
                         discretionary=False,
                     )
