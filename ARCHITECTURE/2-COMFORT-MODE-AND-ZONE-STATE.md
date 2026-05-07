@@ -5,7 +5,7 @@ Convert Home Assistant entity state into a normalized runtime model that can ans
 - Which comfort mode is active
 - Which scheme applies to each zone
 - Which zones are calling for heat
-- Which zones are above ideal target
+- Which zones are at or above ideal target
 - Which zones are allowed to change state right now
 
 ## Runtime state objects
@@ -26,7 +26,7 @@ DemandSnapshot(
     heat_calling_zones: list[str],
     continue_heating_zones: list[str],
     below_ideal_zones: list[str],
-    above_ideal_zones: list[str],
+    at_ideal_zones: list[str],
 )
 ```
 
@@ -42,7 +42,7 @@ DemandSnapshot(
    - `heat_calling_zones`: zones with `current_temp < enable_below`
    - `continue_heating_zones`: zones with `current_temp < continue_until`
    - `below_ideal_zones`: zones with `current_temp < ideal_target`
-   - `above_ideal_zones`: zones with `current_temp > ideal_target`
+   - `at_ideal_zones`: zones with `current_temp >= ideal_target`
 5. Track the current zone switch state and the timestamp of the last change for anti-flap enforcement.
 
 ## Zone state policy
@@ -50,10 +50,11 @@ DemandSnapshot(
   - Its scheme is not `Off`, and
   - It is below `continue_until`, or it is needed as the safety-open zone
 - A zone may be closed when:
-  - It is above `ideal_target`, and
+  - It is in `at_ideal_zones`, and
   - It has been on for at least 5 minutes, and
   - Closing it still leaves at least one zone open
 - A zone must not be toggled more than once in a 5-minute period.
+- A comfort mode change is the single exception to the anti-flap rule; the resulting zone-state changes should be applied immediately.
 
 ## Safety rules
 - Never issue a heat or cool request unless at least one zone is open first.
@@ -63,9 +64,8 @@ DemandSnapshot(
   2. Otherwise the enabled zone with the lowest temperature
   3. Otherwise the currently open zone with the oldest last-change timestamp
 
-## Pending design decision
-- Comfort mode changes should trigger an immediate control pass, but whether that pass may override the normal 5-minute anti-flap restriction is intentionally left open until `ARCHITECTURE/QUESTIONS.md` question 3 is answered.
-
 ## Pyscript responsibilities
 - Use state-triggered handlers for comfort mode changes to request an immediate control pass.
 - Use a time-triggered loop every minute to recompute the snapshot because inlet temperature affects the required setpoint over time.
+- On startup, read the current zone switch and climate state first, then calculate the desired state from there. Anti-flap timers reset on startup.
+- Manual user changes to zone switches or climate settings are not treated as supported overrides; the next control pass should reconcile them back to the desired TempTamer state within the anti-flap limits.

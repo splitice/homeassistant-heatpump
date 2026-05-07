@@ -27,14 +27,16 @@ When `heat_requested` is true:
 2. Calculate:
    - `minimum_room_target = zone.scheme.enable_below`
    - `inlet_cap_target = inlet_temperature + MAX_SETPOINT_DELTA_FROM_INLET`
+   - `raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)`
 3. Set requested heatpump temperature to:
-   - `max(minimum_room_target, inlet_cap_target)`
+   - `ceil(raw_requested_setpoint)`
+   - Clamp the final request to the inclusive whole-number range `17..25`
 
 When continuing in heating mode without requesting additional heat:
-- Set the requested temperature to the current inlet temperature.
+- Set the requested temperature to the current inlet temperature, normalized to a whole integer and clamped to `17..25`.
 
 When in fan-only mode:
-- Do not request extra heating; maintain the setpoint at the current inlet temperature unless the climate integration requires a retained value.
+- Do not request extra heating; maintain the setpoint at the normalized current inlet temperature unless the climate integration requires a retained value.
 
 ## Fan-speed logic
 At heat start:
@@ -60,7 +62,7 @@ While already heating:
    - Reason for action
 
 ## Example log messages
-- `HEATING: Setting setpoint to 20.0 due to request for heat from Office. Zones open: Office, Dining`
+- `HEATING: Setting setpoint to 20 due to request for heat from Office. Zones open: Office, Dining`
 - `ZONES: Opening Dining because 12.8 is below continue-until target 18.0`
 - `FAN: Switching from low to medium because Office deficit is 5.4`
 - `SAFETY: Prevented all zones from closing; keeping Office open`

@@ -24,8 +24,11 @@ Create a small configuration layer that defines all entities, zone metadata, com
   - Heat-start threshold for medium fan: differential greater than 4°C
   - Low-to-medium threshold: differential greater than 5°C
   - Medium-to-low threshold: differential less than 3°C
-- Define setpoint cap constant:
+- Define setpoint constants:
   - Maximum requested setpoint increase above inlet temperature: 2°C
+  - Minimum requested heat setpoint: 17°C
+  - Maximum requested heat setpoint: 25°C
+  - Requested heat setpoints must be whole integers rounded up to the nearest whole degree
 
 ## Proposed module layout
 - `apps/temptamer/constants.py`
@@ -53,7 +56,7 @@ ZoneConfig(
 )
 
 SystemConfig(
-    house_temperature_sensor: str | None,
+    house_temperature_sensor: str,
     inlet_temperature_sensor: str,
     comfort_mode_entity: str,
     climate_entity: str,
@@ -68,19 +71,20 @@ SystemConfig(
 - `Night`
   - `Office` => `Night`
   - `Dining` => `Night`
-  - `Bedroom 1&2` => `Off`
-  - `Bedroom 3&4` => `Off`
+  - `Bedroom 1&2` => `Bedroom`
+  - `Bedroom 3&4` => `Bedroom`
 - `Day`
   - `Office` => `DayLiving`
   - `Dining` => `DayLiving`
-  - `Bedroom 1&2` => `Off`
-  - `Bedroom 3&4` => `Off`
+  - `Bedroom 1&2` => `Bedroom`
+  - `Bedroom 3&4` => `Bedroom`
 - `Office`
   - `Office` => `DayLiving`
   - `Dining` => `DiningBasic`
-  - `Bedroom 1&2` => `Off`
-  - `Bedroom 3&4` => `Off`
+  - `Bedroom 1&2` => `Bedroom`
+  - `Bedroom 3&4` => `Bedroom`
 
 ## Notes
-- Bedroom zones are intentionally modeled now even if the current comfort modes leave them off. This keeps the architecture ready for later comfort-mode expansion.
-- If a zone sensor is unavailable, the runtime state resolver must substitute the house temperature sensor before control decisions are made.
+- `sensor.home_temperature` is the house temperature sensor used for any zone whose dedicated sensor is missing, unknown, or unavailable.
+- `Bedroom` is a dedicated bedroom control scheme that is currently a direct copy of `Night`.
+- The heatpump dispatcher should use the Home Assistant HVAC mode values `heat`, `cool`, `fan_only`, and `dry`.

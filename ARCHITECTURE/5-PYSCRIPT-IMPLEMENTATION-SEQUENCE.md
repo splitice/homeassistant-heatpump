@@ -8,6 +8,7 @@ Implement TempTamer incrementally so each stage can be manually verified in Home
    - Add all entity ids
    - Add named control thresholds
    - Add comfort-mode mappings
+   - Add whole-number heat setpoint bounds and rounding constants
 2. **Build runtime state readers**
    - Read comfort mode, inlet temperature, zone temperatures, switch state
    - Add house-sensor fallback handling
@@ -18,6 +19,7 @@ Implement TempTamer incrementally so each stage can be manually verified in Home
 4. **Implement zone action resolution**
    - Enforce minimum open zone rule
    - Enforce 5-minute anti-flap window
+   - Allow immediate zone reconciliation on comfort mode changes
    - Store per-zone last-change timestamps in pyscript state
 5. **Implement heatpump dispatcher**
    - Apply HVAC mode, fan mode, and setpoint logic
@@ -31,8 +33,9 @@ Implement TempTamer incrementally so each stage can be manually verified in Home
    - Log safety interventions and suppressed actions
 8. **Manual validation in Home Assistant**
    - Comfort mode `Off` turns the unit off
-   - `Night`, `Day`, and `Office` open the expected zones
+   - `Night`, `Day`, and `Office` apply the expected Office/Dining scheme while both bedroom zones remain on the `Bedroom` scheme
    - Heating starts when a zone drops below the scheme minimum
+   - Requested heating setpoints are rounded up to a whole number and clamped to `17..25`
    - Setpoint updates every minute with inlet temperature drift
    - Fan hysteresis behaves as specified
 
@@ -52,7 +55,7 @@ apps/temptamer/
 
 ## State to persist in pyscript
 - Last successful control pass timestamp
-- Last zone on/off change timestamp per zone, with restoration behavior deferred pending `ARCHITECTURE/QUESTIONS.md` question 5
+- Last zone on/off change timestamp per zone for the current runtime only; restart should read live entity state and recalculate while anti-flap timers reset
 - Last requested HVAC mode
 - Last requested fan mode
 - Last requested setpoint
