@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .constants import MIN_OPEN_ZONES, MIN_ZONE_CHANGE_DELAY_SECONDS
+from .constants import (
+    MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS,
+    MIN_OPEN_ZONES,
+    MIN_ZONE_CHANGE_DELAY_SECONDS,
+)
 from .models import DemandSnapshot, ZoneAction, ZoneRuntimeState
 
 
@@ -86,7 +90,7 @@ def resolve_zone_actions(
             continue
         if not _can_toggle(zone, now, comfort_mode_changed):
             continue
-        if not comfort_mode_changed and discretionary_used >= 1:
+        if not comfort_mode_changed and discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
             break
         predicted_open.remove(zone.key)
         actions.append(
@@ -103,7 +107,7 @@ def resolve_zone_actions(
         for zone in opening_candidates:
             if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
                 continue
-            if discretionary_used >= 1:
+            if discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
                 break
             predicted_open.add(zone.key)
             actions.append(
