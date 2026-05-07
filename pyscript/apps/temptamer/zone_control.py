@@ -22,6 +22,18 @@ def _last_change_key(zone: ZoneRuntimeState) -> datetime:
     return _normalize_datetime(zone.last_switch_change)
 
 
+def _recent_change_rank(zone: ZoneRuntimeState) -> timedelta:
+    if zone.last_switch_change is None:
+        return timedelta.max
+    normalized_last_change = _normalize_datetime(zone.last_switch_change)
+    max_datetime = datetime.max.replace(tzinfo=timezone.utc)
+    return max_datetime - normalized_last_change
+
+
+def _temperature_deficit(zone: ZoneRuntimeState, threshold_name: str) -> float:
+    return max(0.0, getattr(zone.scheme, threshold_name) - zone.current_temp)
+
+
 def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: bool) -> bool:
     if comfort_mode_changed or zone.last_switch_change is None:
         return True
@@ -60,9 +72,9 @@ def _select_safety_open_zone(snapshot: DemandSnapshot) -> str | None:
                 open_zones.append(zone)
         if not open_zones:
             return None
-        ranked_open_zones: list[tuple[datetime, ZoneRuntimeState]] = []
+        ranked_open_zones: list[tuple[timedelta, ZoneRuntimeState]] = []
         for zone in open_zones:
-            ranked_open_zones.append((_last_change_key(zone), zone))
+            ranked_open_zones.append((_recent_change_rank(zone), zone))
         open_zones = _sorted_by_rank(ranked_open_zones)
         return open_zones[0].key
 
@@ -72,15 +84,15 @@ def _select_safety_open_zone(snapshot: DemandSnapshot) -> str | None:
             continue_zones.append(zone)
 
     if continue_zones:
-        ranked_continue_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+        ranked_continue_zones: list[tuple[tuple[float, timedelta], ZoneRuntimeState]] = []
         for zone in continue_zones:
-            ranked_continue_zones.append(((zone.current_temp, _last_change_key(zone)), zone))
+            ranked_continue_zones.append(((-_temperature_deficit(zone, "continue_until"), _recent_change_rank(zone)), zone))
         continue_zones = _sorted_by_rank(ranked_continue_zones)
         return continue_zones[0].key
 
-    ranked_enabled_zones: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
+    ranked_enabled_zones: list[tuple[tuple[float, timedelta], ZoneRuntimeState]] = []
     for zone in enabled_zones:
-        ranked_enabled_zones.append(((zone.current_temp, _last_change_key(zone)), zone))
+        ranked_enabled_zones.append(((-_temperature_deficit(zone, "ideal_target"), _recent_change_rank(zone)), zone))
     enabled_zones = _sorted_by_rank(ranked_enabled_zones)
     return enabled_zones[0].key
 

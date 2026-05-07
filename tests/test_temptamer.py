@@ -119,6 +119,69 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(actions[0].discretionary)
         self.assertIn("overriding anti-flap delay", actions[0].reason)
 
+    def test_zone_actions_keep_same_safety_zone_when_multiple_zones_need_heat(self):
+        first_now = datetime(2026, 5, 7, 12, 3, 0, tzinfo=timezone.utc)
+        first_snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inlet_temperature": "18.5",
+                    "sensor.office_temperature": "18.5",
+                    "sensor.dining_temperature": "18.5",
+                    "sensor.bedroom_1_2_temperature": "18.0",
+                    "sensor.bedroom_3_4_temperature": "18.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={
+                "office": datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc),
+                "dining": datetime(2026, 5, 7, 11, 59, 0, tzinfo=timezone.utc),
+            },
+            now=first_now,
+        )
+
+        first_actions, first_predicted_open = resolve_zone_actions(first_snapshot, first_now, comfort_mode_changed=False)
+
+        self.assertEqual(first_predicted_open, ("office",))
+        self.assertEqual(len(first_actions), 1)
+        self.assertEqual(first_actions[0].zone_key, "office")
+        self.assertTrue(first_actions[0].safety_required)
+
+        second_now = datetime(2026, 5, 7, 12, 3, 30, tzinfo=timezone.utc)
+        second_snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inlet_temperature": "18.5",
+                    "sensor.office_temperature": "18.5",
+                    "sensor.dining_temperature": "18.5",
+                    "sensor.bedroom_1_2_temperature": "18.0",
+                    "sensor.bedroom_3_4_temperature": "18.0",
+                    "switch.office_zone": "off",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            ),
+            last_switch_changes={
+                "office": first_now,
+                "dining": datetime(2026, 5, 7, 11, 59, 0, tzinfo=timezone.utc),
+            },
+            now=second_now,
+        )
+
+        second_actions, second_predicted_open = resolve_zone_actions(second_snapshot, second_now, comfort_mode_changed=False)
+
+        self.assertEqual(second_predicted_open, ("office",))
+        self.assertEqual(len(second_actions), 1)
+        self.assertEqual(second_actions[0].zone_key, "office")
+        self.assertTrue(second_actions[0].safety_required)
+
     def test_zone_prediction_diagnostics_explain_anti_flap_decisions(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
         snapshot = build_snapshot(
