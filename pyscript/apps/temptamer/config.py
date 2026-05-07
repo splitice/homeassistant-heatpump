@@ -15,7 +15,7 @@ from .models import ControlScheme, SystemConfig, ZoneConfig
 
 DEFAULT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_below=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=17.0, continue_until=18.0, ideal_target=19.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=9.0, continue_until=14.0, ideal_target=12.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
         enable_below=19.0,
@@ -24,11 +24,11 @@ DEFAULT_CONTROL_SCHEMES = {
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
-        enable_below=18.0,
-        continue_until=19.0,
-        ideal_target=20.0,
+        enable_below=14.0,
+        continue_until=17.0,
+        ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=17.0, continue_until=18.0, ideal_target=19.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=10.0, continue_until=15.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {
@@ -67,8 +67,8 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_NIGHT: {
         "office": SCHEME_NIGHT,
         "dining": SCHEME_NIGHT,
-        "bedroom_1_2": SCHEME_BEDROOM,
-        "bedroom_3_4": SCHEME_BEDROOM,
+        "bedroom_1_2": SCHEME_NIGHT,
+        "bedroom_3_4": SCHEME_NIGHT,
     },
     COMFORT_MODE_DAY: {
         "office": SCHEME_DAY_LIVING,
