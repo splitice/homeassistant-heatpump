@@ -279,9 +279,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
 
     LOGGER.info(
-        "DISPATCH: reason=%s requested_by_zone=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        "DISPATCH: reason=%s requested_by_zones=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
         plan.reason,
-        plan.requested_by_zone,
+        ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
         plan.fan_mode,
         plan.setpoint,

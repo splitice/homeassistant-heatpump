@@ -30,8 +30,8 @@ def normalize_setpoint(value: float) -> int:
 
 
 def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
-    if demand.heat_requested and demand.requested_by_zone:
-        zone = snapshot.zones[demand.requested_by_zone]
+    if demand.heat_requested and demand.requested_by_zones:
+        zone = snapshot.zones[demand.requested_by_zones[0]]
         minimum_room_target = zone.scheme.enable_below
         temp_gap = minimum_room_target - snapshot.inlet_temp
         allowed_increase = min(temp_gap, SETPOINT_DELTA_FROM_INLET)
@@ -92,7 +92,7 @@ def build_dispatch_plan(
             hvac_mode=HVAC_HEAT,
             fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
             setpoint=_requested_setpoint(snapshot, demand),
-            requested_by_zone=demand.requested_by_zone,
+            requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
             reason=demand.reason,
         )

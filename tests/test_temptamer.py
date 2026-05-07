@@ -243,10 +243,43 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertTrue(demand.heat_requested)
-        self.assertEqual(demand.requested_by_zone, "office")
+        self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 19)
         self.assertEqual(plan.fan_mode, "low")
+
+    def test_equipment_demand_lists_all_requesting_zones(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Day",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.wt32_hpctrl_e8dbd0_inlet_temperature": "16.4",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "18.0",
+                    "sensor.bedroom_1_2_temperature": "19.5",
+                    "sensor.bedroom_3_4_temperature": "19.5",
+                    "switch.office_zone": "on",
+                    "switch.dining_zone": "on",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                }
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office", "dining"))
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office", "dining"),
+            current_hvac_mode="off",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.requested_by_zones, ("office", "dining"))
+        self.assertEqual(plan.requested_by_zones, ("office", "dining"))
+        self.assertEqual(plan.setpoint, 19)
 
     def test_fan_hysteresis_uses_medium_thresholds(self):
         self.assertEqual(
