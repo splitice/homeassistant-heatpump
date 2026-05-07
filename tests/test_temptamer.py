@@ -291,6 +291,35 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(operating_mode, HVAC_HEAT)
         self.assertIn("anti-flap", reason)
 
+    def test_heatcool_mode_ignores_backward_time_skew_for_antiflap(self):
+        now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "HeatCool",
+                        "sensor.home_temperature": "22.0",
+                        TEST_INLET_SENSOR: "24.0",
+                        "sensor.office_temperature": "24.5",
+                        "sensor.dining_temperature": "20.0",
+                        "sensor.bedroom_1_2_temperature": "20.0",
+                        "sensor.bedroom_3_4_temperature": "20.0",
+                    }
+                )
+            )
+        )
+
+        operating_mode, reason = resolve_operating_mode(
+            snapshot,
+            current_hvac_mode="heat",
+            last_active_hvac_mode="heat",
+            last_heatcool_transition=now + timedelta(minutes=5),
+            now=now,
+        )
+
+        self.assertEqual(operating_mode, HVAC_HEAT)
+        self.assertIn("anti-flap", reason)
+
     def test_manual_mode_skips_zone_and_heatpump_changes(self):
         temptamer_main.state._values.clear()
         temptamer_main.state._attrs.clear()

@@ -65,6 +65,7 @@ def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
 
 def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
     if operation_mode == HVAC_COOL:
+        # More overheated zones should sort first, so invert the distance from the cooling threshold.
         return (zone.scheme.cool_enable_above() - zone.current_temp, _last_change_key(zone))
     return (zone.current_temp - zone.scheme.enable_below, _last_change_key(zone))
 
