@@ -17,7 +17,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - `pyscript/apps/temptamer/__init__.py` – the Home Assistant app package entrypoint that is autoloaded by `pyscript`
 - `pyscript/apps/temptamer/main.py` – the TempTamer runtime with trigger-driven periodic control, status entities, and immediate comfort-mode reconciliation
 - `pyscript/apps/temptamer/config.py` – entity IDs, zone definitions, comfort-mode mapping, and default thresholds
-- `pyscript/apps/temptamer/state_reader.py` – Home Assistant state normalization with fallback to `sensor.home_temperature`
+- `pyscript/apps/temptamer/state_reader.py` – Home Assistant state normalization with fallback to `sensor.home_temperature` and `climate.current_temperature`
 - `pyscript/apps/temptamer/zone_control.py` – zone opening/closing decisions
 - `pyscript/apps/temptamer/demand_resolver.py` – abstract heating demand resolution
 - `pyscript/apps/temptamer/heatpump_dispatcher.py` – HVAC mode, fan mode, and setpoint planning

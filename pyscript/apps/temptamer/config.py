@@ -86,7 +86,6 @@ DEFAULT_COMFORT_MODES = {
 
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
-    inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
     climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
     zones=DEFAULT_ZONES,
@@ -103,7 +102,7 @@ def _add_temperature_trigger_entity(entity_id: str | None) -> None:
 
 
 _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.house_temperature_sensor)
-_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.inlet_temperature_sensor)
+_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.climate_entity)
 for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
     _add_temperature_trigger_entity(zone.sensor_entity_id)
 
