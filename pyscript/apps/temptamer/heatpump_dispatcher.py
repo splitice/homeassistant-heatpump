@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import Protocol
 
@@ -12,6 +13,7 @@ from .constants import (
     HVAC_FAN_ONLY,
     HVAC_HEAT,
     LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
+    LOGGER_NAME,
     MAX_HEAT_SETPOINT,
     MEDIUM_TO_LOW_FAN_DIFFERENTIAL,
     MIN_HEAT_SETPOINT,
@@ -19,6 +21,9 @@ from .constants import (
 )
 from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig
 from .state_reader import parse_float
+
+
+LOGGER = logging.getLogger(LOGGER_NAME)
 
 
 class ServiceController(Protocol):
@@ -37,8 +42,27 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
         allowed_increase = min(temp_gap, SETPOINT_DELTA_FROM_INLET)
         inlet_cap_target = snapshot.inlet_temp + allowed_increase
         raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)
-        return normalize_setpoint(raw_requested_setpoint)
-    return normalize_setpoint(snapshot.inlet_temp)
+        normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
+        LOGGER.info(
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_below=%.1f temp_gap=%.1f capped_delta=%.1f raw=%.1f normalized=%s",
+            snapshot.inlet_temp,
+            zone.key,
+            minimum_room_target,
+            temp_gap,
+            allowed_increase,
+            raw_requested_setpoint,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    normalized_setpoint = normalize_setpoint(snapshot.inlet_temp)
+    LOGGER.info(
+        "SETPOINT: inlet_temp=%.1f no heat-requested zones raw=%.1f normalized=%s",
+        snapshot.inlet_temp,
+        snapshot.inlet_temp,
+        normalized_setpoint,
+    )
+    return normalized_setpoint
 
 
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
