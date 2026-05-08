@@ -249,6 +249,48 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 19)
         self.assertEqual(plan.fan_mode, "low")
 
+    def test_dispatch_plan_logs_setpoint_calculation(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                {
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "sensor.home_temperature": "18.0",
+                    "climate.wt32_hpctrl_e8dbd0_heatpump": "off",
+                    "sensor.office_temperature": "17.0",
+                    "sensor.dining_temperature": "21.0",
+                    "sensor.bedroom_1_2_temperature": "19.5",
+                    "sensor.bedroom_3_4_temperature": "19.5",
+                    "switch.office_zone": "on",
+                    "switch.dining_zone": "off",
+                    "switch.bedroom_1_2_zone": "off",
+                    "switch.bedroom_3_4_zone": "off",
+                },
+                {
+                    "climate.wt32_hpctrl_e8dbd0_heatpump": {"current_temperature": "14.0"},
+                },
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",))
+
+        with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
+            plan = build_dispatch_plan(
+                snapshot,
+                demand,
+                ("office",),
+                current_hvac_mode="off",
+                current_fan_mode="low",
+            )
+
+        self.assertEqual(plan.setpoint, 19)
+        self.assertTrue(
+            any(
+                "SETPOINT: inlet_temp=14.0 zone=office enable_below=19.0" in message
+                and "normalized=19" in message
+                for message in captured.output
+            )
+        )
+
     def test_equipment_demand_lists_all_requesting_zones(self):
         snapshot = build_snapshot(
             FakeReader(
