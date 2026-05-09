@@ -41,7 +41,7 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
         temp_gap = minimum_room_target - snapshot.inlet_temp
         allowed_increase = min(temp_gap, SETPOINT_DELTA_FROM_INLET)
         inlet_cap_target = snapshot.inlet_temp + allowed_increase
-        raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)
+        raw_requested_setpoint = max(minimum_room_target + temp_gap, inlet_cap_target)
         normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
         LOGGER.info(
             "SETPOINT: inlet_temp=%.1f zone=%s enable_below=%.1f temp_gap=%.1f capped_delta=%.1f raw=%.1f normalized=%s",
