@@ -23,7 +23,6 @@ class ZoneConfig:
 @dataclass(frozen=True)
 class SystemConfig:
     house_temperature_sensor: str
-    inlet_temperature_sensor: str
     comfort_mode_entity: str
     climate_entity: str
     zones: dict[str, ZoneConfig]
