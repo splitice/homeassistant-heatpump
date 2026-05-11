@@ -12,6 +12,7 @@ from .constants import (
     HEAT_START_MEDIUM_FAN_DIFFERENTIAL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
+    HVAC_OFF,
     LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
     LOGGER_NAME,
     MAX_HEAT_SETPOINT,
@@ -118,6 +119,10 @@ def build_dispatch_plan(
             open_zones=predicted_open_zones,
             reason=demand.reason,
         )
+
+    # No active demand, provided is currently on continue by setting to heat mode with the temperature setpoint at the inlet temp to allow for a more graceful cooldown while still providing some circulation. Otherwise, turn off.
+    if current_hvac_mode and current_hvac_mode.lower() != HVAC_OFF:
+        return DispatchPlan(open_zones=predicted_open_zones, reason=demand.reason)
 
     return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
 

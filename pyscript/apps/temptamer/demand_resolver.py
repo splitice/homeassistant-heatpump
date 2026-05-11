@@ -87,5 +87,6 @@ def resolve_equipment_demand(snapshot: DemandSnapshot, predicted_open_zones: tup
             reason="balancing enabled zones with neutral heating setpoint",
         )
 
+
     return EquipmentDemand(reason="no active heating demand")
 
