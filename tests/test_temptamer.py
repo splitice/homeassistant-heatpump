@@ -426,6 +426,38 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 22)
 
+    def test_maintain_cooling_uses_continue_threshold_setpoint(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "21.0",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("25.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+        )
+
+        self.assertFalse(demand.cool_requested)
+        self.assertTrue(demand.maintain_cool_mode)
+        self.assertEqual(demand.requested_by_zones, ("office",))
+        self.assertEqual(plan.setpoint, 20)
+
     def test_equipment_demand_lists_all_requesting_zones(self):
         snapshot = build_snapshot(
             FakeReader(

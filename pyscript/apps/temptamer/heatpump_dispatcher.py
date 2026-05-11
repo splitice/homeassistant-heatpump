@@ -38,10 +38,16 @@ def normalize_setpoint(value: float) -> int:
 
 
 def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
-    if demand.cool_requested or demand.maintain_cool_mode:
+    if demand.cool_requested:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
             return normalize_setpoint(zone.scheme.cool_enable_above())
+        return normalize_setpoint(snapshot.inlet_temp)
+
+    if demand.maintain_cool_mode:
+        if demand.requested_by_zones:
+            zone = snapshot.zones[demand.requested_by_zones[0]]
+            return normalize_setpoint(zone.scheme.cool_continue_until())
         return normalize_setpoint(snapshot.inlet_temp)
 
     if demand.heat_requested and demand.requested_by_zones:
