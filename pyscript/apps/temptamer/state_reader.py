@@ -186,12 +186,14 @@ def build_snapshot(
             applied_comfort_mode = comfort_mode
         comfort_mapping = config.comfort_modes[applied_comfort_mode]
         scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
-        scheme = config.control_schemes[scheme_name]
+        scheme = config.heat_control_schemes[scheme_name]
+        cool_scheme = config.cool_control_schemes[scheme_name]
         current_temp = _resolve_temperature(reader, zone.sensor_entity_id, house_temp)
         zones[zone_key] = ZoneRuntimeState(
             key=zone_key,
             current_temp=current_temp,
             scheme=scheme,
+            cool_scheme=cool_scheme,
             applied_comfort_mode=applied_comfort_mode,
             is_enabled_by_mode=scheme.name != SCHEME_OFF,
             switch_is_on=_resolve_switch_state(
@@ -219,7 +221,7 @@ def build_snapshot(
             continue
 
         enabled_zones[key] = zone
-        if zone.current_temp < zone.scheme.enable_below:
+        if zone.current_temp < zone.scheme.enable_outside:
             heat_calling_list.append(key)
         if zone.current_temp < zone.scheme.continue_until:
             continue_heating_list.append(key)
@@ -227,11 +229,11 @@ def build_snapshot(
             below_ideal_list.append(key)
         else:
             at_ideal_list.append(key)
-        if zone.current_temp > zone.scheme.cool_enable_above():
+        if zone.current_temp > zone.cool_scheme.enable_outside:
             cool_calling_list.append(key)
-        if zone.current_temp > zone.scheme.cool_continue_until():
+        if zone.current_temp > zone.cool_scheme.continue_until:
             continue_cooling_list.append(key)
-        if zone.current_temp > zone.scheme.ideal_target:
+        if zone.current_temp > zone.cool_scheme.ideal_target:
             above_ideal_list.append(key)
         else:
             at_or_below_ideal_list.append(key)

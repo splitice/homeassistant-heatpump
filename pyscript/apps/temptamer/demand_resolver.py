@@ -78,6 +78,11 @@ def _max_excess(
     return selected_zone_key, selected_excess
 
 
+def _intersect_zone_keys(zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
+    allowed = set(allowed_zone_keys)
+    return tuple(zone_key for zone_key in zone_keys if zone_key in allowed)
+
+
 def _normalize_timestamp(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -114,8 +119,8 @@ def resolve_operating_mode(
         last_active_mode = None
 
     active_mode = current_active_mode or last_active_mode
-    heat_zone, heat_deficit = _max_deficit(snapshot, snapshot.heat_calling_zones, "enable_below")
-    cool_zone, cool_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.scheme.cool_enable_above())
+    heat_zone, heat_deficit = _max_deficit(snapshot, snapshot.heat_calling_zones, "enable_outside")
+    cool_zone, cool_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.cool_scheme.enable_outside)
 
     preferred_mode: str | None = None
     if heat_zone and cool_zone:
@@ -172,7 +177,7 @@ def resolve_equipment_demand(
         return EquipmentDemand(reason=f"no zones are predicted to be open for {operation_mode}")
 
     if operation_mode == HVAC_COOL:
-        requested_by_zone, max_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.scheme.cool_enable_above())
+        requested_by_zone, max_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.cool_scheme.enable_outside)
         if requested_by_zone is not None:
             return EquipmentDemand(
                 cool_requested=True,
@@ -183,8 +188,8 @@ def resolve_equipment_demand(
 
         continue_zone, continue_excess = _max_excess(
             snapshot,
-            snapshot.continue_cooling_zones,
-            lambda zone: zone.scheme.cool_continue_until(),
+            _intersect_zone_keys(snapshot.continue_cooling_zones, snapshot.above_ideal_zones),
+            lambda zone: zone.cool_scheme.continue_until,
         )
         if continue_zone is not None:
             return EquipmentDemand(
@@ -196,7 +201,7 @@ def resolve_equipment_demand(
 
         return EquipmentDemand(reason="no active cooling demand")
 
-    requested_by_zones, max_deficit = _ranked_requesting_zones(snapshot, snapshot.heat_calling_zones, "enable_below")
+    requested_by_zones, max_deficit = _ranked_requesting_zones(snapshot, snapshot.heat_calling_zones, "enable_outside")
     if requested_by_zones:
         primary_zone = requested_by_zones[0]
         return EquipmentDemand(
@@ -208,7 +213,7 @@ def resolve_equipment_demand(
 
     continue_zones, continue_deficit = _ranked_requesting_zones(
         snapshot,
-        snapshot.continue_heating_zones,
+        _intersect_zone_keys(snapshot.continue_heating_zones, snapshot.below_ideal_zones),
         "continue_until",
     )
     if continue_zones:
