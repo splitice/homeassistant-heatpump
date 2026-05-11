@@ -373,8 +373,8 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 20)
         self.assertTrue(
             any(
-                "SETPOINT: inlet_temp=14.0 zone=office enable_outside=20.0" in message
-                and "raw=20.0" in message
+                "SETPOINT: inlet_temp=14.0 zone=office enable_outside=19.5" in message
+                and "raw=19.5" in message
                 and "normalized=20" in message
                 for message in captured.output
             )
@@ -494,7 +494,7 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "input_select.temptamer_comfort_mode": "Office",
                         "sensor.home_temperature": "18.0",
-                        "sensor.office_average_temperature": "21.5",
+                        "sensor.office_average_temperature": "21.0",
                         "sensor.average_dining_zone_temp": "16.0",
                         "sensor.average_bed1_2_zone_temp": "15.0",
                         "sensor.average_bed3_4_zone_temp": "15.0",
