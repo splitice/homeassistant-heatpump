@@ -15,11 +15,11 @@ from .models import ControlScheme, SystemConfig, ZoneConfig
 
 DEFAULT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_below=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=9.0, continue_until=14.0, ideal_target=12.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_below=19.0,
-        continue_until=20.0,
+        enable_below=20.0,
+        continue_until=22.0,
         ideal_target=21.0,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
@@ -28,7 +28,7 @@ DEFAULT_CONTROL_SCHEMES = {
         continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=10.0, continue_until=15.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=14.0, continue_until=16.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {
@@ -93,7 +93,6 @@ DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
 
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
-    inlet_temperature_sensor="sensor.wt32_hpctrl_e8dbd0_inside_coil_inlet_temp",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
     hvac_mode_entity="input_select.temptamer_hvac_mode",
     climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
@@ -112,7 +111,7 @@ def _add_temperature_trigger_entity(entity_id: str | None) -> None:
 
 
 _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.house_temperature_sensor)
-_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.inlet_temperature_sensor)
+_add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.climate_entity)
 for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
     _add_temperature_trigger_entity(zone.sensor_entity_id)
 

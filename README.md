@@ -17,7 +17,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - `pyscript/apps/temptamer/__init__.py` – the Home Assistant app package entrypoint that is autoloaded by `pyscript`
 - `pyscript/apps/temptamer/main.py` – the TempTamer runtime with trigger-driven periodic control, status entities, and immediate comfort-mode reconciliation
 - `pyscript/apps/temptamer/config.py` – entity IDs, zone definitions, comfort-mode mapping, and default thresholds
-- `pyscript/apps/temptamer/state_reader.py` – Home Assistant state normalization with fallback to `sensor.home_temperature`
+- `pyscript/apps/temptamer/state_reader.py` – Home Assistant state normalization with fallback to `sensor.home_temperature` and `climate.current_temperature`
 - `pyscript/apps/temptamer/zone_control.py` – zone opening/closing decisions
 - `pyscript/apps/temptamer/demand_resolver.py` – abstract heating demand resolution
 - `pyscript/apps/temptamer/heatpump_dispatcher.py` – HVAC mode, fan mode, and setpoint planning
@@ -39,10 +39,10 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 5. Ensure these helper entities exist, or adjust `pyscript/apps/temptamer/config.py` to match your setup:
    - `input_select.temptamer_comfort_mode`
    - `input_select.temptamer_hvac_mode` with `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`
-   - `input_select.temptamer_comfort_mode_office`
-   - `input_select.temptamer_comfort_mode_dining`
-   - `input_select.temptamer_comfort_mode_bed12`
-   - `input_select.temptamer_comfort_mode_bed34`
+   - `input_select.temptamer_comfort_mode_office` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_dining` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_bed12` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_bed34` with `Auto`, `Day`, `Night`, `Office`, and `Off`
    - `sensor.home_temperature`
    - `climate.wt32_hpctrl_e8dbd0_heatpump`
 6. Reload `pyscript`.
@@ -57,7 +57,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - The runtime calls `task.unique(...)` for each control pass so overlapping periodic, startup, and comfort-mode triggers do not pile up across reloads or rapid state changes.
 - Comfort-mode changes still trigger an immediate reconciliation pass whenever TempTamer is enabled.
 - HVAC selection supports `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`. `Manual` leaves both the zone switches and heatpump untouched, while `HeatCool` enforces a one-hour anti-flap delay before changing between heating and cooling.
-- Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity; if the override entity is missing or has an unrecognized value, the global comfort mode remains in effect for that zone.
+- Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity. Selecting `Auto`, omitting the override entity, or providing an unrecognized value keeps the global comfort mode in effect for that zone.
 
 ## Validation
 

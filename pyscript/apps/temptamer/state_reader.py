@@ -6,6 +6,7 @@ from typing import Protocol
 
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
+    COMFORT_MODE_AUTO,
     COMFORT_MODE_OFF,
     CONTROL_HVAC_MODE_COOL,
     CONTROL_HVAC_MODE_HEAT,
@@ -20,8 +21,13 @@ from .constants import (
 from .models import DemandSnapshot, SystemConfig, ZoneRuntimeState
 
 
+CLIMATE_CURRENT_TEMPERATURE_ATTR = "current_temperature"
+
+
 class StateReader(Protocol):
     def get_state(self, entity_id: str) -> object | None: ...
+
+    def get_attr(self, entity_id: str, attr_name: str) -> object | None: ...
 
 
 VALID_HVAC_MODES = frozenset(
@@ -102,14 +108,32 @@ def _resolve_temperature(reader: StateReader, entity_id: str | None, fallback: f
     return fallback
 
 
+def _resolve_entity_attribute_temperature(
+    reader: StateReader,
+    entity_id: str,
+    attr_name: str,
+    fallback: float | None = None,
+) -> float | None:
+    get_attr = getattr(reader, "get_attr", None)
+    if callable(get_attr):
+        value = parse_float(get_attr(entity_id, attr_name))
+        if value is not None:
+            return value
+    return fallback
+
+
 def _resolve_house_temperature(reader: StateReader, config: SystemConfig) -> float:
     raw_house_temp = reader.get_state(config.house_temperature_sensor)
     house_temp = parse_float(raw_house_temp)
     if house_temp is not None:
         return house_temp
 
-    raw_inlet_temp = reader.get_state(config.inlet_temperature_sensor)
-    inlet_temp = parse_float(raw_inlet_temp)
+    raw_inlet_temp = _resolve_entity_attribute_temperature(
+        reader,
+        config.climate_entity,
+        CLIMATE_CURRENT_TEMPERATURE_ATTR,
+    )
+    inlet_temp = raw_inlet_temp
     if inlet_temp is not None:
         return inlet_temp
 
@@ -124,7 +148,7 @@ def _resolve_house_temperature(reader: StateReader, config: SystemConfig) -> flo
     raise ValueError(
         "No usable temperature source is available; "
         f"house={config.house_temperature_sensor}:{raw_house_temp!r}, "
-        f"inlet={config.inlet_temperature_sensor}:{raw_inlet_temp!r}, "
+        f"inlet={config.climate_entity}.{CLIMATE_CURRENT_TEMPERATURE_ATTR}:{raw_inlet_temp!r}, "
         f"zones={attempted_zone_values!r}"
     )
 
@@ -146,13 +170,23 @@ def build_snapshot(
 
     house_temp = _resolve_house_temperature(reader, config)
 
-    inlet_temp = _resolve_temperature(reader, config.inlet_temperature_sensor, house_temp)
+    inlet_temp = _resolve_entity_attribute_temperature(
+        reader,
+        config.climate_entity,
+        CLIMATE_CURRENT_TEMPERATURE_ATTR,
+        house_temp,
+    )
 
     zones: dict[str, ZoneRuntimeState] = {}
     for zone_key, zone in config.zones.items():
         override_entity_id = config.zone_comfort_mode_entities.get(zone_key)
         raw_override_mode = reader.get_state(override_entity_id) if override_entity_id else None
-        applied_comfort_mode = str(raw_override_mode) if raw_override_mode in config.comfort_modes else comfort_mode
+        if raw_override_mode == COMFORT_MODE_AUTO:
+            applied_comfort_mode = comfort_mode
+        elif raw_override_mode in config.comfort_modes:
+            applied_comfort_mode = str(raw_override_mode)
+        else:
+            applied_comfort_mode = comfort_mode
         comfort_mapping = config.comfort_modes[applied_comfort_mode]
         scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
         scheme = config.control_schemes[scheme_name]
