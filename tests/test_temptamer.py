@@ -27,11 +27,6 @@ class FakeReader:
     def get_attr(self, entity_id, attr_name):
         return self.attr_map.get(entity_id, {}).get(attr_name)
 
-
-def make_demand(**overrides):
-    return EquipmentDemand(**overrides)
-
-
 def base_state_map(**overrides):
     state_map = {
         "input_select.temptamer_comfort_mode": "Day",
@@ -570,7 +565,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                make_demand(heat_requested=True, max_temperature_deficit=LOW_TO_MEDIUM_FAN_DIFFERENTIAL),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=LOW_TO_MEDIUM_FAN_DIFFERENTIAL),
             ),
             "medium",
         )
@@ -578,7 +573,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                make_demand(heat_requested=True, max_temperature_deficit=1.9),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.9),
             ),
             "low",
         )

@@ -46,8 +46,8 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         minimum_room_target = zone.scheme.enable_below
-        inlet_cap_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
-        raw_requested_setpoint = max(minimum_room_target, inlet_cap_target)
+        inlet_offset_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
+        raw_requested_setpoint = max(minimum_room_target, inlet_offset_target)
         normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
         LOGGER.info(
             "SETPOINT: inlet_temp=%.1f zone=%s enable_below=%.1f raw=%.1f normalized=%s",

@@ -114,11 +114,9 @@ def _resolve_entity_attribute_temperature(
     attr_name: str,
     fallback: float | None = None,
 ) -> float | None:
-    get_attr = getattr(reader, "get_attr", None)
-    if callable(get_attr):
-        value = parse_float(get_attr(entity_id, attr_name))
-        if value is not None:
-            return value
+    value = parse_float(reader.get_attr(entity_id, attr_name))
+    if value is not None:
+        return value
     return fallback
 
 
