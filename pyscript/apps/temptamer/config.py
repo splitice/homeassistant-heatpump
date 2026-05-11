@@ -31,19 +31,22 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
 }
 
-
-def _mirror_heat_scheme_for_cooling(heat_scheme: ControlScheme) -> ControlScheme:
-    return ControlScheme(
-        name=heat_scheme.name,
-        enable_outside=heat_scheme.ideal_target + (heat_scheme.ideal_target - heat_scheme.enable_outside),
-        continue_until=heat_scheme.ideal_target + (heat_scheme.ideal_target - heat_scheme.continue_until),
-        ideal_target=heat_scheme.ideal_target,
-    )
-
-
 DEFAULT_COOL_CONTROL_SCHEMES = {
-    scheme_name: _mirror_heat_scheme_for_cooling(heat_scheme)
-    for scheme_name, heat_scheme in DEFAULT_HEAT_CONTROL_SCHEMES.items()
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
+    SCHEME_DAY_LIVING: ControlScheme(
+        name=SCHEME_DAY_LIVING,
+        enable_outside=21.5,
+        continue_until=19.5,
+        ideal_target=20.5,
+    ),
+    SCHEME_DINING_BASIC: ControlScheme(
+        name=SCHEME_DINING_BASIC,
+        enable_outside=17.0,
+        continue_until=17.0,
+        ideal_target=15.0,
+    ),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {
