@@ -42,11 +42,11 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
-        enable_outside=16.0,
-        continue_until=13.0,
+        enable_outside=17.0,
+        continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=12.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {

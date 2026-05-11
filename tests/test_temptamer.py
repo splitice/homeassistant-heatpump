@@ -4,10 +4,20 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock
 
-from pyscript.apps.temptamer.constants import HVAC_COOL, HVAC_HEAT, LOW_TO_MEDIUM_FAN_DIFFERENTIAL
+from pyscript.apps.temptamer.config import DEFAULT_SYSTEM_CONFIG
+from pyscript.apps.temptamer.constants import (
+    HVAC_COOL,
+    HVAC_HEAT,
+    LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
+    SCHEME_BEDROOM,
+    SCHEME_DAY_LIVING,
+    SCHEME_DINING_BASIC,
+    SCHEME_NIGHT,
+    SCHEME_OFF,
+)
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand, resolve_operating_mode
 from pyscript.apps.temptamer.heatpump_dispatcher import build_dispatch_plan, normalize_setpoint, resolve_fan_mode
-from pyscript.apps.temptamer.models import EquipmentDemand
+from pyscript.apps.temptamer.models import ControlScheme, EquipmentDemand, SystemConfig
 import pyscript.apps.temptamer.main as temptamer_main
 from pyscript.apps.temptamer.state_reader import build_snapshot
 from pyscript.apps.temptamer.zone_control import describe_zone_predictions, resolve_zone_actions
@@ -56,6 +66,45 @@ def base_attr_map(current_temperature="19.0"):
             "current_temperature": current_temperature,
         }
     }
+
+
+TEST_HEAT_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
+    SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=20.0, continue_until=22.0, ideal_target=21.0),
+    SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=14.0, continue_until=17.0, ideal_target=15.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+}
+
+TEST_COOL_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
+    SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=22.0, continue_until=20.0, ideal_target=21.0),
+    SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=16.0, continue_until=13.0, ideal_target=15.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=12.0, ideal_target=14.0),
+}
+
+TEST_SYSTEM_CONFIG = SystemConfig(
+    house_temperature_sensor=DEFAULT_SYSTEM_CONFIG.house_temperature_sensor,
+    comfort_mode_entity=DEFAULT_SYSTEM_CONFIG.comfort_mode_entity,
+    hvac_mode_entity=DEFAULT_SYSTEM_CONFIG.hvac_mode_entity,
+    climate_entity=DEFAULT_SYSTEM_CONFIG.climate_entity,
+    zones=DEFAULT_SYSTEM_CONFIG.zones,
+    zone_comfort_mode_entities=DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities,
+    comfort_modes=DEFAULT_SYSTEM_CONFIG.comfort_modes,
+    heat_control_schemes=TEST_HEAT_CONTROL_SCHEMES,
+    cool_control_schemes=TEST_COOL_CONTROL_SCHEMES,
+)
+
+
+def build_behavior_snapshot(reader, *, last_switch_changes=None, pending_switch_states=None, now=None):
+    return build_snapshot(
+        reader,
+        config=TEST_SYSTEM_CONFIG,
+        last_switch_changes=last_switch_changes,
+        pending_switch_states=pending_switch_states,
+        now=now,
+    )
 
 
 class TempTamerTests(unittest.TestCase):
@@ -143,7 +192,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["bedroom_3_4"].current_temp, 22.1)
 
     def test_zone_actions_respect_antiflap_but_allow_mode_change(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -179,7 +228,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_zone_actions_force_safety_open_with_realistic_temperatures(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -209,7 +258,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_zone_actions_keep_same_safety_zone_when_multiple_zones_need_heat(self):
         first_now = datetime(2026, 5, 7, 12, 3, 0, tzinfo=timezone.utc)
-        first_snapshot = build_snapshot(
+        first_snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -242,7 +291,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(first_actions[0].safety_required)
 
         second_now = datetime(2026, 5, 7, 12, 3, 30, tzinfo=timezone.utc)
-        second_snapshot = build_snapshot(
+        second_snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -276,7 +325,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_zone_prediction_diagnostics_explain_anti_flap_decisions(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -308,7 +357,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(any("dining:" in entry and "held closed by anti-flap delay" in entry for entry in diagnostics))
 
     def test_equipment_demand_and_dispatch_plan_choose_heat_setpoint(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -342,7 +391,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.fan_mode, "low")
 
     def test_dispatch_plan_logs_setpoint_calculation(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -373,8 +422,8 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 20)
         self.assertTrue(
             any(
-                "SETPOINT: inlet_temp=14.0 zone=office enable_outside=19.5" in message
-                and "raw=19.5" in message
+                "SETPOINT: inlet_temp=14.0 zone=office enable_outside=20.0" in message
+                and "raw=20.0" in message
                 and "normalized=20" in message
                 for message in captured.output
             )
@@ -382,7 +431,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_cooling_mode_dispatches_cool_plan(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -427,7 +476,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 22)
 
     def test_maintain_cooling_uses_continue_threshold_setpoint(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -459,7 +508,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 20)
 
     def test_no_heat_demand_turns_system_off_once_all_zones_exceed_continue_threshold(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -488,13 +537,13 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.turn_off)
 
     def test_no_heat_demand_holds_status_quo_in_neutral_band(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
                         "input_select.temptamer_comfort_mode": "Office",
                         "sensor.home_temperature": "18.0",
-                        "sensor.office_average_temperature": "21.0",
+                        "sensor.office_average_temperature": "21.5",
                         "sensor.average_dining_zone_temp": "16.0",
                         "sensor.average_bed1_2_zone_temp": "15.0",
                         "sensor.average_bed3_4_zone_temp": "15.0",
@@ -518,7 +567,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertIsNone(plan.hvac_mode)
 
     def test_no_cool_demand_turns_system_off_once_all_zones_drop_below_continue_threshold(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -548,7 +597,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.turn_off)
 
     def test_no_cool_demand_holds_status_quo_in_neutral_band(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -579,7 +628,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertIsNone(plan.hvac_mode)
 
     def test_equipment_demand_lists_all_requesting_zones(self):
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -611,7 +660,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_heatcool_mode_holds_current_mode_during_antiflap_window(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
@@ -640,7 +689,7 @@ class TempTamerTests(unittest.TestCase):
 
     def test_heatcool_mode_ignores_backward_time_skew_for_antiflap(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
-        snapshot = build_snapshot(
+        snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
