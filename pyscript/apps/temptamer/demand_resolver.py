@@ -240,4 +240,5 @@ def resolve_equipment_demand(
             reason="balancing enabled zones with neutral heating setpoint",
         )
 
+
     return EquipmentDemand(reason="no active heating demand")
