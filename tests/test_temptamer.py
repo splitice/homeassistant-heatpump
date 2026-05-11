@@ -373,7 +373,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 20)
         self.assertTrue(
             any(
-                "SETPOINT: inlet_temp=14.0 zone=office enable_below=20.0" in message
+                "SETPOINT: inlet_temp=14.0 zone=office enable_outside=20.0" in message
                 and "raw=20.0" in message
                 and "normalized=20" in message
                 for message in captured.output
@@ -457,6 +457,126 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(demand.maintain_cool_mode)
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 20)
+
+    def test_no_heat_demand_turns_system_off_once_all_zones_exceed_continue_threshold(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertTrue(plan.turn_off)
+
+    def test_no_heat_demand_holds_status_quo_in_neutral_band(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "18.0",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "16.0",
+                        "sensor.average_bed1_2_zone_temp": "15.0",
+                        "sensor.average_bed3_4_zone_temp": "15.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertFalse(plan.turn_off)
+        self.assertIsNone(plan.hvac_mode)
+
+    def test_no_cool_demand_turns_system_off_once_all_zones_drop_below_continue_threshold(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "19.0",
+                        "sensor.office_average_temperature": "19.5",
+                        "sensor.average_dining_zone_temp": "12.0",
+                        "sensor.average_bed1_2_zone_temp": "11.0",
+                        "sensor.average_bed3_4_zone_temp": "11.0",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.reason, "no active cooling demand")
+        self.assertTrue(plan.turn_off)
+
+    def test_no_cool_demand_holds_status_quo_in_neutral_band(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "20.5",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(demand.reason, "no active cooling demand")
+        self.assertFalse(plan.turn_off)
+        self.assertIsNone(plan.hvac_mode)
 
     def test_equipment_demand_lists_all_requesting_zones(self):
         snapshot = build_snapshot(

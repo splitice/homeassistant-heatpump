@@ -13,22 +13,37 @@ from .constants import (
 )
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
-DEFAULT_CONTROL_SCHEMES = {
-    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_below=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=15.0, continue_until=17.0, ideal_target=16.0),
+DEFAULT_HEAT_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_below=20.0,
+        enable_outside=20.0,
         continue_until=22.0,
         ideal_target=21.0,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
-        enable_below=14.0,
+        enable_outside=14.0,
         continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+}
+
+
+def _mirror_heat_scheme_for_cooling(heat_scheme: ControlScheme) -> ControlScheme:
+    return ControlScheme(
+        name=heat_scheme.name,
+        enable_outside=heat_scheme.ideal_target + (heat_scheme.ideal_target - heat_scheme.enable_outside),
+        continue_until=heat_scheme.ideal_target + (heat_scheme.ideal_target - heat_scheme.continue_until),
+        ideal_target=heat_scheme.ideal_target,
+    )
+
+
+DEFAULT_COOL_CONTROL_SCHEMES = {
+    scheme_name: _mirror_heat_scheme_for_cooling(heat_scheme)
+    for scheme_name, heat_scheme in DEFAULT_HEAT_CONTROL_SCHEMES.items()
 }
 
 DEFAULT_ZONES = {
@@ -99,7 +114,8 @@ DEFAULT_SYSTEM_CONFIG = SystemConfig(
     zones=DEFAULT_ZONES,
     zone_comfort_mode_entities=DEFAULT_ZONE_COMFORT_MODE_ENTITIES,
     comfort_modes=DEFAULT_COMFORT_MODES,
-    control_schemes=DEFAULT_CONTROL_SCHEMES,
+    heat_control_schemes=DEFAULT_HEAT_CONTROL_SCHEMES,
+    cool_control_schemes=DEFAULT_COOL_CONTROL_SCHEMES,
 )
 
 _temperature_trigger_entities: list[str] = []
