@@ -18,9 +18,9 @@ DEFAULT_CONTROL_SCHEMES = {
     SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_below=20.0,
-        continue_until=22.0,
-        ideal_target=21.0,
+        enable_below=19.5,
+        continue_until=21.5,
+        ideal_target=20.5,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
