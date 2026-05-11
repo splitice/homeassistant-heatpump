@@ -155,7 +155,7 @@ def build_dispatch_plan(
       
     # No active demand, provided is currently on continue by setting to heat mode with the temperature setpoint at the inlet temp to allow for a more graceful cooldown while still providing some circulation. Otherwise, turn off.
     if current_hvac_mode and current_hvac_mode.lower() != HVAC_OFF:
-        return DispatchPlan(open_zones=predicted_open_zones, reason=demand.reason)
+        return DispatchPlan(turn_off=False, open_zones=predicted_open_zones, reason=demand.reason)
 
     return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
 

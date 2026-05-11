@@ -90,7 +90,7 @@ class EquipmentDemand:
 
 @dataclass(frozen=True)
 class DispatchPlan:
-    turn_off: bool
+    turn_off: bool = False
     hvac_mode: str | None = None
     fan_mode: str | None = None
     setpoint: int | None = None
