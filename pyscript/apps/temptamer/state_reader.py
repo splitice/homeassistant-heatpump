@@ -181,10 +181,9 @@ def build_snapshot(
     for zone_key, zone in config.zones.items():
         override_entity_id = config.zone_comfort_mode_entities.get(zone_key)
         raw_override_mode = reader.get_state(override_entity_id) if override_entity_id else None
-        if raw_override_mode == COMFORT_MODE_AUTO:
-            applied_comfort_mode = comfort_mode
-        elif raw_override_mode in config.comfort_modes:
-            applied_comfort_mode = str(raw_override_mode)
+        override_mode = str(raw_override_mode)
+        if override_mode != COMFORT_MODE_AUTO and raw_override_mode in config.comfort_modes:
+            applied_comfort_mode = override_mode
         else:
             applied_comfort_mode = comfort_mode
         comfort_mapping = config.comfort_modes[applied_comfort_mode]

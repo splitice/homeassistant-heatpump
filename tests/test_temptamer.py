@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock
 
-from pyscript.apps.temptamer.constants import HVAC_COOL, HVAC_HEAT
+from pyscript.apps.temptamer.constants import HVAC_COOL, HVAC_HEAT, LOW_TO_MEDIUM_FAN_DIFFERENTIAL
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand, resolve_operating_mode
 from pyscript.apps.temptamer.heatpump_dispatcher import build_dispatch_plan, normalize_setpoint, resolve_fan_mode
 from pyscript.apps.temptamer.models import EquipmentDemand
@@ -570,7 +570,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                make_demand(heat_requested=True, max_temperature_deficit=2.0),
+                make_demand(heat_requested=True, max_temperature_deficit=LOW_TO_MEDIUM_FAN_DIFFERENTIAL),
             ),
             "medium",
         )
