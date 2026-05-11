@@ -343,7 +343,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.requested_by_zones, ("office",))
-        self.assertEqual(plan.setpoint, 24)
+        self.assertEqual(plan.setpoint, 20)
         self.assertEqual(plan.fan_mode, "low")
 
     def test_dispatch_plan_logs_setpoint_calculation(self):
@@ -375,11 +375,12 @@ class TempTamerTests(unittest.TestCase):
                 current_fan_mode="low",
             )
 
-        self.assertEqual(plan.setpoint, 25)
+        self.assertEqual(plan.setpoint, 20)
         self.assertTrue(
             any(
                 "SETPOINT: inlet_temp=14.0 zone=office enable_below=20.0" in message
-                and "normalized=25" in message
+                and "raw=20.0" in message
+                and "normalized=20" in message
                 for message in captured.output
             )
         )
@@ -459,7 +460,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(demand.requested_by_zones, ("office", "dining"))
         self.assertEqual(plan.requested_by_zones, ("office", "dining"))
-        self.assertEqual(plan.setpoint, 24)
+        self.assertEqual(plan.setpoint, 20)
 
     def test_heatcool_mode_holds_current_mode_during_antiflap_window(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
@@ -569,7 +570,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=2.0),
+                make_demand(heat_requested=True, max_temperature_deficit=2.0),
             ),
             "medium",
         )
