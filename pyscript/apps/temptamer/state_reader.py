@@ -184,7 +184,7 @@ def build_snapshot(
         override_entity_id = config.zone_comfort_mode_entities.get(zone_key)
         raw_override_mode = reader.get_state(override_entity_id) if override_entity_id else None
         override_mode = str(raw_override_mode)
-        if override_mode != COMFORT_MODE_AUTO and _is_supported_override_scheme(config, override_mode):
+        if raw_override_mode is not None and override_mode != COMFORT_MODE_AUTO and _is_supported_override_scheme(config, override_mode):
             applied_comfort_mode = override_mode
             scheme_name = override_mode
         else:
