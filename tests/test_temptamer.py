@@ -168,7 +168,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "DiningBasic")
 
-    def test_build_snapshot_unrecognized_zone_override_falls_back_to_global_mode(self):
+    def test_unrecognized_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
             FakeReader(
                 base_state_map(
