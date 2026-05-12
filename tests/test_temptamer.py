@@ -9,6 +9,7 @@ from pyscript.apps.temptamer.constants import (
     HVAC_COOL,
     HVAC_HEAT,
     LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
+    SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
     SCHEME_DINING_BASIC,
@@ -51,6 +52,7 @@ def base_state_map(**overrides):
         "sensor.average_dining_zone_temp": "18.0",
         "sensor.average_bed1_2_zone_temp": "18.0",
         "sensor.average_bed3_4_zone_temp": "18.0",
+        "sensor.bathroom_motion_temperature": "18.0",
         "switch.wt32_hpctrl_e8dbd0_office": "off",
         "switch.wt32_hpctrl_e8dbd0_dining": "off",
         "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
@@ -74,6 +76,7 @@ TEST_HEAT_CONTROL_SCHEMES = {
     SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=20.0, continue_until=22.0, ideal_target=21.0),
     SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=14.0, continue_until=17.0, ideal_target=15.0),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
 }
 
 TEST_COOL_CONTROL_SCHEMES = {
@@ -82,6 +85,7 @@ TEST_COOL_CONTROL_SCHEMES = {
     SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=22.0, continue_until=20.0, ideal_target=21.0),
     SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=16.0, continue_until=13.0, ideal_target=15.0),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=12.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=16.0, continue_until=12.0, ideal_target=14.0),
 }
 
 TEST_SYSTEM_CONFIG = SystemConfig(
@@ -210,6 +214,30 @@ class TempTamerTests(unittest.TestCase):
         self.assertNotIn("bedroom_1_2", demand.requested_by_zones)
         self.assertEqual(demand.requested_by_zones, ("bedroom_3_4",))
         self.assertTrue(demand.heat_requested)
+
+    def test_bathroom_override_uses_bathroom_sensor_for_bedroom_3_4(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "input_select.temptamer_comfort_mode_bed34": "Bathroom",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_bed3_4_zone_temp": "18.0",
+                        "sensor.bathroom_motion_temperature": "13.5",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("bedroom_3_4",), operation_mode=HVAC_HEAT)
+
+        self.assertEqual(snapshot.zones["bedroom_3_4"].applied_comfort_mode, "Bathroom")
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, "Bathroom")
+        self.assertEqual(snapshot.zones["bedroom_3_4"].current_temp, 13.5)
+        self.assertTrue(demand.heat_requested)
+        self.assertEqual(demand.requested_by_zones, ("bedroom_3_4",))
 
     def test_build_snapshot_uses_climate_current_temperature_when_house_sensor_missing(self):
         snapshot = build_snapshot(
@@ -577,7 +605,10 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertEqual(demand.reason, "no active heating demand")
-        self.assertTrue(plan.turn_off)
+        self.assertTrue(plan.idle)
+        self.assertFalse(plan.turn_off)
+        self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.setpoint, 21)
 
     def test_no_heat_demand_holds_status_quo_in_neutral_band(self):
         snapshot = build_behavior_snapshot(
@@ -637,7 +668,10 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertEqual(demand.reason, "no active cooling demand")
-        self.assertTrue(plan.turn_off)
+        self.assertTrue(plan.idle)
+        self.assertFalse(plan.turn_off)
+        self.assertEqual(plan.hvac_mode, "cool")
+        self.assertEqual(plan.setpoint, 20)
 
     def test_no_cool_demand_holds_status_quo_in_neutral_band(self):
         snapshot = build_behavior_snapshot(
@@ -669,6 +703,39 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.reason, "no active cooling demand")
         self.assertFalse(plan.turn_off)
         self.assertIsNone(plan.hvac_mode)
+
+    def test_idle_dispatch_turns_system_off_after_one_hour(self):
+        now = datetime(2026, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            idle_started_at=now - timedelta(hours=1),
+            now=now,
+        )
+
+        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertTrue(plan.turn_off)
+        self.assertFalse(plan.idle)
 
     def test_equipment_demand_lists_all_requesting_zones(self):
         snapshot = build_behavior_snapshot(
@@ -771,6 +838,7 @@ class TempTamerTests(unittest.TestCase):
                 "last_error": None,
                 "last_heatcool_transition": None,
                 "last_active_hvac_mode": None,
+                "idle_started_at": None,
                 "last_trigger": None,
             }
         )

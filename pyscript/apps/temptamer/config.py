@@ -5,6 +5,7 @@ from .constants import (
     COMFORT_MODE_OFF,
     COMFORT_MODE_NIGHT,
     COMFORT_MODE_OFFICE,
+    SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
     SCHEME_DINING_BASIC,
@@ -29,6 +30,7 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
         ideal_target=15.0,
     ),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
 }
 
 DEFAULT_COOL_CONTROL_SCHEMES = {
@@ -47,6 +49,7 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
         ideal_target=15.0,
     ),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {
@@ -73,6 +76,9 @@ DEFAULT_ZONES = {
         label="Bedroom 3&4",
         sensor_entity_id="sensor.average_bed3_4_zone_temp",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_bed_34",
+        scheme_sensor_entity_ids={
+            SCHEME_BATHROOM: "sensor.bathroom_motion_temperature",
+        },
     ),
 }
 
@@ -133,6 +139,8 @@ _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.house_temperature_sensor)
 _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.climate_entity)
 for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
     _add_temperature_trigger_entity(zone.sensor_entity_id)
+    for entity_id in zone.scheme_sensor_entity_ids.values():
+        _add_temperature_trigger_entity(entity_id)
 
 TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 

@@ -136,6 +136,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_error": None,
     "last_heatcool_transition": None,
     "last_active_hvac_mode": None,
+    "idle_started_at": None,
     "last_trigger": None,
 }
 
@@ -200,6 +201,7 @@ def _publish_runtime_state(status: str) -> None:
             "last_successful_control_pass": _isoformat(RUNTIME_STATE["last_successful_control_pass"]),
             "last_heatcool_transition": _isoformat(RUNTIME_STATE["last_heatcool_transition"]),
             "last_active_hvac_mode": RUNTIME_STATE["last_active_hvac_mode"],
+            "idle_started_at": _isoformat(RUNTIME_STATE["idle_started_at"]),
             "last_error": RUNTIME_STATE["last_error"],
         },
     )
@@ -301,6 +303,8 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         current_hvac_mode=current_hvac_mode_str,
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
+        idle_started_at=RUNTIME_STATE["idle_started_at"],
+        now=now,
     )
 
     apply_dispatch_plan(
@@ -319,15 +323,21 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         RUNTIME_STATE["last_heatcool_transition"] = now
     if plan.hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode
+    if plan.idle:
+        if RUNTIME_STATE["idle_started_at"] is None:
+            RUNTIME_STATE["idle_started_at"] = now
+    else:
+        RUNTIME_STATE["idle_started_at"] = None
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
         plan.reason,
         ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
+        plan.idle,
         plan.fan_mode,
         plan.setpoint,
         _describe_open_zones(plan.open_zones),

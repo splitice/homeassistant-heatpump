@@ -42,7 +42,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
    - `input_select.temptamer_comfort_mode_office` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
    - `input_select.temptamer_comfort_mode_dining` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
    - `input_select.temptamer_comfort_mode_bed12` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
-   - `input_select.temptamer_comfort_mode_bed34` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
+   - `input_select.temptamer_comfort_mode_bed34` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, `Bedroom`, and `Bathroom`
    - `sensor.home_temperature`
    - `climate.wt32_hpctrl_e8dbd0_heatpump`
 6. Reload `pyscript`.
@@ -57,7 +57,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - The runtime calls `task.unique(...)` for each control pass so overlapping periodic, startup, and comfort-mode triggers do not pile up across reloads or rapid state changes.
 - Comfort-mode changes still trigger an immediate reconciliation pass whenever TempTamer is enabled.
 - HVAC selection supports `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`. `Manual` leaves both the zone switches and heatpump untouched, while `HeatCool` enforces a one-hour anti-flap delay before changing between heating and cooling.
-- Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity. Use `Auto` to follow the global comfort mode, or choose one of the configured control scheme names (`Off`, `Night`, `DayLiving`, `DiningBasic`, or `Bedroom`) to apply that scheme directly. Omitting the override entity or providing an unrecognized value keeps the global comfort mode in effect for that zone.
+- Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity. Use `Auto` to follow the global comfort mode, or choose one of the configured control scheme names (`Off`, `Night`, `DayLiving`, `DiningBasic`, or `Bedroom`) to apply that scheme directly. Bedroom 3&4 also supports a `Bathroom` override that uses `sensor.bathroom_motion_temperature` for that zone's temperature decisions while keeping the same thresholds as the bedroom scheme. Omitting the override entity or providing an unrecognized value keeps the global comfort mode in effect for that zone.
 
 ## Validation
 

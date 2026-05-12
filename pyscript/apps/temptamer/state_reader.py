@@ -194,7 +194,8 @@ def build_snapshot(
             scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
         scheme = config.heat_control_schemes[scheme_name]
         cool_scheme = config.cool_control_schemes[scheme_name]
-        current_temp = _resolve_temperature(reader, zone.sensor_entity_id, house_temp)
+        temperature_sensor_entity_id = zone.scheme_sensor_entity_ids.get(scheme_name, zone.sensor_entity_id)
+        current_temp = _resolve_temperature(reader, temperature_sensor_entity_id, house_temp)
         zones[zone_key] = ZoneRuntimeState(
             key=zone_key,
             current_temp=current_temp,
