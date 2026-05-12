@@ -29,7 +29,6 @@ class SystemConfig:
     zones: dict[str, ZoneConfig]
     zone_comfort_mode_entities: dict[str, str]
     comfort_modes: dict[str, dict[str, str]]
-    zone_override_schemes: dict[str, dict[str, str]]
     heat_control_schemes: dict[str, ControlScheme]
     cool_control_schemes: dict[str, ControlScheme]
 

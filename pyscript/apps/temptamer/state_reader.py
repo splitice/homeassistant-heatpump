@@ -120,6 +120,10 @@ def _resolve_entity_attribute_temperature(
     return fallback
 
 
+def _is_supported_override_scheme(config: SystemConfig, scheme_name: str) -> bool:
+    return scheme_name in config.heat_control_schemes and scheme_name in config.cool_control_schemes
+
+
 def _resolve_house_temperature(reader: StateReader, config: SystemConfig) -> float:
     raw_house_temp = reader.get_state(config.house_temperature_sensor)
     house_temp = parse_float(raw_house_temp)
@@ -180,14 +184,13 @@ def build_snapshot(
         override_entity_id = config.zone_comfort_mode_entities.get(zone_key)
         raw_override_mode = reader.get_state(override_entity_id) if override_entity_id else None
         override_mode = str(raw_override_mode)
-        if override_mode != COMFORT_MODE_AUTO and raw_override_mode in config.comfort_modes:
+        if override_mode != COMFORT_MODE_AUTO and _is_supported_override_scheme(config, override_mode):
             applied_comfort_mode = override_mode
-            zone_override_schemes = config.zone_override_schemes.get(zone_key, {})
+            scheme_name = override_mode
         else:
             applied_comfort_mode = comfort_mode
-            zone_override_schemes = {}
-        comfort_mapping = config.comfort_modes[applied_comfort_mode]
-        scheme_name = zone_override_schemes.get(override_mode, comfort_mapping.get(zone_key, SCHEME_OFF))
+            comfort_mapping = config.comfort_modes[applied_comfort_mode]
+            scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
         scheme = config.heat_control_schemes[scheme_name]
         cool_scheme = config.cool_control_schemes[scheme_name]
         current_temp = _resolve_temperature(reader, zone.sensor_entity_id, house_temp)
