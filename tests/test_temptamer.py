@@ -168,6 +168,30 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "DiningBasic")
 
+    def test_day_zone_override_uses_day_scheme_for_bedroom_heat_demand(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "input_select.temptamer_comfort_mode_bed34": "Day",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "18.0",
+                        "sensor.average_bed1_2_zone_temp": "19.5",
+                        "sensor.average_bed3_4_zone_temp": "16.3",
+                    }
+                ),
+                base_attr_map("16.4"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("bedroom_3_4",), operation_mode=HVAC_HEAT)
+
+        self.assertEqual(snapshot.zones["bedroom_3_4"].applied_comfort_mode, "Day")
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, "DayLiving")
+        self.assertEqual(demand.requested_by_zones, ("bedroom_3_4",))
+        self.assertTrue(demand.heat_requested)
+
     def test_build_snapshot_uses_climate_current_temperature_when_house_sensor_missing(self):
         snapshot = build_snapshot(
             FakeReader(

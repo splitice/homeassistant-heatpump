@@ -91,8 +91,8 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_DAY: {
         "office": SCHEME_DAY_LIVING,
         "dining": SCHEME_DAY_LIVING,
-        "bedroom_1_2": SCHEME_BEDROOM,
-        "bedroom_3_4": SCHEME_BEDROOM,
+        "bedroom_1_2": SCHEME_DAY_LIVING,
+        "bedroom_3_4": SCHEME_DAY_LIVING,
     },
     COMFORT_MODE_OFFICE: {
         "office": SCHEME_DAY_LIVING,
