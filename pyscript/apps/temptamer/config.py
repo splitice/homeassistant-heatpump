@@ -19,9 +19,9 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_outside=19.5,
+        enable_outside=19.25,
         continue_until=21.5,
-        ideal_target=20.5,
+        ideal_target=20,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
