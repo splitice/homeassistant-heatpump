@@ -15,7 +15,7 @@ from .constants import (
     SWITCH_STATE_SETTLE_SECONDS,
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
-from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan
+from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan, resolve_idle_started_at
 from .state_reader import build_snapshot, is_switch_on
 from .zone_control import describe_zone_predictions, resolve_zone_actions
 
@@ -323,11 +323,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         RUNTIME_STATE["last_heatcool_transition"] = now
     if plan.hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode
-    if plan.idle:
-        if RUNTIME_STATE["idle_started_at"] is None:
-            RUNTIME_STATE["idle_started_at"] = now
-    else:
-        RUNTIME_STATE["idle_started_at"] = None
+    RUNTIME_STATE["idle_started_at"] = resolve_idle_started_at(
+        RUNTIME_STATE["idle_started_at"],
+        plan,
+        current_hvac_mode=current_hvac_mode_str,
+        now=now,
+    )
 
     LOGGER.info(
         "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",

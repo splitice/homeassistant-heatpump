@@ -17,7 +17,12 @@ from pyscript.apps.temptamer.constants import (
     SCHEME_OFF,
 )
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand, resolve_operating_mode
-from pyscript.apps.temptamer.heatpump_dispatcher import build_dispatch_plan, normalize_setpoint, resolve_fan_mode
+from pyscript.apps.temptamer.heatpump_dispatcher import (
+    build_dispatch_plan,
+    normalize_setpoint,
+    resolve_fan_mode,
+    resolve_idle_started_at,
+)
 from pyscript.apps.temptamer.models import ControlScheme, EquipmentDemand, SystemConfig
 import pyscript.apps.temptamer.main as temptamer_main
 from pyscript.apps.temptamer.state_reader import build_snapshot
@@ -546,7 +551,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 22)
 
-    def test_maintain_cooling_uses_continue_threshold_setpoint(self):
+    def test_maintain_cooling_uses_ideal_target_setpoint(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -576,9 +581,10 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(demand.cool_requested)
         self.assertTrue(demand.maintain_cool_mode)
         self.assertEqual(demand.requested_by_zones, ("office",))
-        self.assertEqual(plan.setpoint, 20)
+        self.assertEqual(demand.reason, "office is above ideal target")
+        self.assertEqual(plan.setpoint, 21)
 
-    def test_no_heat_demand_turns_system_off_once_all_zones_exceed_continue_threshold(self):
+    def test_no_heat_demand_enters_idle_once_all_zones_reach_continue_threshold(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -604,13 +610,13 @@ class TempTamerTests(unittest.TestCase):
             current_fan_mode="low",
         )
 
-        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertEqual(demand.reason, "all enabled zones are at or above continue-until threshold")
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 21)
+        self.assertEqual(plan.setpoint, 22)
 
-    def test_no_heat_demand_holds_status_quo_in_neutral_band(self):
+    def test_heating_continues_until_all_zones_reach_continue_threshold(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -618,9 +624,9 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_comfort_mode": "Office",
                         "sensor.home_temperature": "18.0",
                         "sensor.office_average_temperature": "21.5",
-                        "sensor.average_dining_zone_temp": "16.0",
-                        "sensor.average_bed1_2_zone_temp": "15.0",
-                        "sensor.average_bed3_4_zone_temp": "15.0",
+                        "sensor.average_dining_zone_temp": "17.0",
+                        "sensor.average_bed1_2_zone_temp": "16.0",
+                        "sensor.average_bed3_4_zone_temp": "16.0",
                     }
                 ),
                 base_attr_map("20.0"),
@@ -636,11 +642,13 @@ class TempTamerTests(unittest.TestCase):
             current_fan_mode="low",
         )
 
-        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertTrue(demand.maintain_heat_mode)
+        self.assertEqual(demand.reason, "office is below continue-until threshold")
         self.assertFalse(plan.turn_off)
-        self.assertIsNone(plan.hvac_mode)
+        self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.setpoint, 20)
 
-    def test_no_cool_demand_turns_system_off_once_all_zones_drop_below_continue_threshold(self):
+    def test_no_cool_demand_enters_idle_once_all_zones_drop_to_ideal_target(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -667,21 +675,21 @@ class TempTamerTests(unittest.TestCase):
             current_fan_mode="low",
         )
 
-        self.assertEqual(demand.reason, "no active cooling demand")
+        self.assertEqual(demand.reason, "all enabled zones are at or below ideal target")
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "cool")
-        self.assertEqual(plan.setpoint, 20)
+        self.assertEqual(plan.setpoint, 21)
 
-    def test_no_cool_demand_holds_status_quo_in_neutral_band(self):
+    def test_cooling_continues_until_all_zones_drop_to_ideal_target(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
                     **{
                         "input_select.temptamer_hvac_mode": "Cool",
                         "input_select.temptamer_comfort_mode": "Office",
-                        "sensor.home_temperature": "20.5",
-                        "sensor.office_average_temperature": "20.5",
+                        "sensor.home_temperature": "21.5",
+                        "sensor.office_average_temperature": "21.5",
                         "sensor.average_dining_zone_temp": "14.0",
                         "sensor.average_bed1_2_zone_temp": "13.0",
                         "sensor.average_bed3_4_zone_temp": "13.0",
@@ -700,9 +708,11 @@ class TempTamerTests(unittest.TestCase):
             current_fan_mode="low",
         )
 
-        self.assertEqual(demand.reason, "no active cooling demand")
+        self.assertTrue(demand.maintain_cool_mode)
+        self.assertEqual(demand.reason, "office is above ideal target")
         self.assertFalse(plan.turn_off)
-        self.assertIsNone(plan.hvac_mode)
+        self.assertEqual(plan.hvac_mode, "cool")
+        self.assertEqual(plan.setpoint, 21)
 
     def test_idle_dispatch_turns_system_off_after_one_hour(self):
         now = datetime(2026, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
@@ -733,9 +743,54 @@ class TempTamerTests(unittest.TestCase):
             now=now,
         )
 
-        self.assertEqual(demand.reason, "no active heating demand")
+        self.assertEqual(demand.reason, "all enabled zones are at or above continue-until threshold")
         self.assertTrue(plan.turn_off)
         self.assertFalse(plan.idle)
+
+    def test_idle_timer_is_preserved_until_hvac_reports_off(self):
+        started_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        plan = build_dispatch_plan(
+            build_behavior_snapshot(
+                FakeReader(
+                    base_state_map(
+                        **{
+                            "input_select.temptamer_comfort_mode": "Office",
+                            "sensor.home_temperature": "23.0",
+                            "sensor.office_average_temperature": "22.5",
+                            "sensor.average_dining_zone_temp": "17.5",
+                            "sensor.average_bed1_2_zone_temp": "16.5",
+                            "sensor.average_bed3_4_zone_temp": "16.5",
+                        }
+                    ),
+                    base_attr_map("22.0"),
+                )
+            ),
+            EquipmentDemand(reason="all enabled zones are at or above continue-until threshold"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            idle_started_at=started_at,
+            now=started_at + timedelta(hours=1),
+        )
+
+        self.assertTrue(plan.turn_off)
+        self.assertEqual(
+            resolve_idle_started_at(
+                started_at,
+                plan,
+                current_hvac_mode="heat",
+                now=started_at + timedelta(hours=1, minutes=5),
+            ),
+            started_at,
+        )
+        self.assertIsNone(
+            resolve_idle_started_at(
+                started_at,
+                plan,
+                current_hvac_mode="off",
+                now=started_at + timedelta(hours=1, minutes=5),
+            )
+        )
 
     def test_equipment_demand_lists_all_requesting_zones(self):
         snapshot = build_behavior_snapshot(
