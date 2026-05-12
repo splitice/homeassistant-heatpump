@@ -75,10 +75,8 @@ def _maintain_trim_score(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], *
         distance_to_ideal = abs(current_temp - scheme.ideal_target)
         distance_to_continue = abs(current_temp - scheme.continue_until)
         score += 1 if distance_to_ideal <= distance_to_continue else -1
-        if cooling:
-            if current_temp <= scheme.continue_until:
-                score -= 1
-        elif current_temp >= scheme.continue_until:
+        crossed_continue_threshold = current_temp <= scheme.continue_until if cooling else current_temp >= scheme.continue_until
+        if crossed_continue_threshold:
             score -= 1
     return score
 
