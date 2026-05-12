@@ -123,11 +123,11 @@ class TempTamerTests(unittest.TestCase):
 
     def test_build_snapshot_uses_house_sensor_fallback_and_zone_overrides(self):
         reader = FakeReader(
-                base_state_map(
-                    **{
-                        "input_select.temptamer_comfort_mode": "Night",
-                        "input_select.temptamer_hvac_mode": "Cool",
-                        "input_select.temptamer_comfort_mode_office": "DayLiving",
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Night",
+                    "input_select.temptamer_hvac_mode": "Cool",
+                    "input_select.temptamer_comfort_mode_office": "DayLiving",
                     "sensor.home_temperature": "18.5",
                     "sensor.office_average_temperature": "unavailable",
                     "sensor.average_dining_zone_temp": "17.0",
