@@ -18,6 +18,7 @@ class ZoneConfig:
     label: str
     sensor_entity_id: str | None
     switch_entity_id: str
+    scheme_sensor_entity_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ class EquipmentDemand:
 @dataclass(frozen=True)
 class DispatchPlan:
     turn_off: bool = False
+    idle: bool = False
     hvac_mode: str | None = None
     fan_mode: str | None = None
     setpoint: int | None = None

@@ -77,16 +77,6 @@ def _max_excess(
 
     return selected_zone_key, selected_excess
 
-
-def _intersect_zone_keys(zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
-    allowed = set(allowed_zone_keys)
-    intersected_zone_keys: list[str] = []
-    for zone_key in zone_keys:
-        if zone_key in allowed:
-            intersected_zone_keys.append(zone_key)
-    return tuple(intersected_zone_keys)
-
-
 def _normalize_timestamp(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -192,18 +182,18 @@ def resolve_equipment_demand(
 
         continue_zone, continue_excess = _max_excess(
             snapshot,
-            _intersect_zone_keys(snapshot.continue_cooling_zones, snapshot.above_ideal_zones),
-            lambda zone: zone.cool_scheme.continue_until,
+            snapshot.above_ideal_zones,
+            lambda zone: zone.cool_scheme.ideal_target,
         )
         if continue_zone is not None:
             return EquipmentDemand(
                 maintain_cool_mode=True,
                 requested_by_zones=(continue_zone,),
                 max_temperature_deficit=continue_excess,
-                reason=f"{continue_zone} is above continue-until threshold",
+                reason=f"{continue_zone} is above ideal target",
             )
 
-        return EquipmentDemand(reason="no active cooling demand")
+        return EquipmentDemand(reason="all enabled zones are at or below ideal target")
 
     requested_by_zones, max_deficit = _ranked_requesting_zones(snapshot, snapshot.heat_calling_zones, "enable_outside")
     if requested_by_zones:
@@ -217,7 +207,7 @@ def resolve_equipment_demand(
 
     continue_zones, continue_deficit = _ranked_requesting_zones(
         snapshot,
-        _intersect_zone_keys(snapshot.continue_heating_zones, snapshot.below_ideal_zones),
+        snapshot.continue_heating_zones,
         "continue_until",
     )
     if continue_zones:
@@ -250,4 +240,4 @@ def resolve_equipment_demand(
         )
 
 
-    return EquipmentDemand(reason="no active heating demand")
+    return EquipmentDemand(reason="all enabled zones are at or above continue-until threshold")

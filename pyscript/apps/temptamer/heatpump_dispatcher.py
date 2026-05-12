@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .config import DEFAULT_SYSTEM_CONFIG
@@ -15,6 +16,7 @@ from .constants import (
     HVAC_FAN_ONLY,
     HVAC_HEAT,
     HVAC_OFF,
+    MIN_IDLE_SECONDS,
     LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
     LOGGER_NAME,
     MAX_HEAT_SETPOINT,
@@ -37,6 +39,33 @@ def normalize_setpoint(value: float) -> int:
     return max(MIN_HEAT_SETPOINT, min(MAX_HEAT_SETPOINT, int(math.ceil(value))))
 
 
+def _normalize_timestamp(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def resolve_idle_started_at(
+    idle_started_at: datetime | None,
+    plan: DispatchPlan,
+    *,
+    current_hvac_mode: str | None,
+    now: datetime | None,
+) -> datetime | None:
+    normalized_idle_started_at = _normalize_timestamp(idle_started_at)
+    current_mode = (current_hvac_mode or "").lower()
+
+    if plan.idle:
+        return normalized_idle_started_at or _normalize_timestamp(now)
+    if current_mode == HVAC_OFF:
+        return None
+    if plan.turn_off and normalized_idle_started_at is not None and current_mode in {HVAC_HEAT, HVAC_COOL}:
+        return normalized_idle_started_at
+    return None
+
+
 def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
     if demand.cool_requested:
         if demand.requested_by_zones:
@@ -47,7 +76,7 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
     if demand.maintain_cool_mode:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
-            return normalize_setpoint(zone.cool_scheme.continue_until)
+            return normalize_setpoint(zone.cool_scheme.ideal_target)
         return normalize_setpoint(snapshot.inlet_temp)
 
     if demand.heat_requested and demand.requested_by_zones:
@@ -74,23 +103,6 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
         normalized_setpoint,
     )
     return normalized_setpoint
-
-
-def _enabled_zones_within_hold_band(snapshot: DemandSnapshot, hvac_mode: str) -> bool:
-    enabled_zones = [zone for zone in snapshot.zones.values() if zone.is_enabled_by_mode]
-    if not enabled_zones:
-        return False
-
-    if hvac_mode == HVAC_COOL:
-        for zone in enabled_zones:
-            if not zone.cool_scheme.continue_until < zone.current_temp <= zone.cool_scheme.ideal_target:
-                return False
-        return True
-
-    for zone in enabled_zones:
-        if not zone.scheme.ideal_target <= zone.current_temp < zone.scheme.continue_until:
-            return False
-    return True
 
 
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
@@ -131,6 +143,8 @@ def build_dispatch_plan(
     *,
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
+    idle_started_at: datetime | None = None,
+    now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="comfort mode is Off")
@@ -176,12 +190,23 @@ def build_dispatch_plan(
             reason=demand.reason,
         )
       
-    # No active demand: keep the current mode only while every enabled zone remains in the neutral band
-    # between ideal_target and continue_until. Once every zone is beyond the continue threshold,
-    # turn the heatpump off for over/under protection.
     current_mode = (current_hvac_mode or "").lower()
-    if current_mode in {HVAC_HEAT, HVAC_COOL} and _enabled_zones_within_hold_band(snapshot, current_mode):
-        return DispatchPlan(turn_off=False, open_zones=predicted_open_zones, reason=demand.reason)
+    if current_mode in {HVAC_HEAT, HVAC_COOL}:
+        normalized_now = _normalize_timestamp(now)
+        normalized_idle_started_at = _normalize_timestamp(idle_started_at)
+        if (
+            normalized_now is not None
+            and normalized_idle_started_at is not None
+            and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
+        ):
+            return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
+        return DispatchPlan(
+            idle=True,
+            hvac_mode=current_mode,
+            setpoint=normalize_setpoint(snapshot.inlet_temp),
+            open_zones=predicted_open_zones,
+            reason=demand.reason,
+        )
 
     return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
 
