@@ -190,6 +190,8 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(snapshot.zones["bedroom_3_4"].applied_comfort_mode, "Day")
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, "DayLiving")
+        self.assertEqual(snapshot.zones["bedroom_1_2"].applied_comfort_mode, "Office")
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Bedroom")
         self.assertEqual(demand.requested_by_zones, ("bedroom_3_4",))
         self.assertTrue(demand.heat_requested)
 
