@@ -91,8 +91,8 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_DAY: {
         "office": SCHEME_DAY_LIVING,
         "dining": SCHEME_DAY_LIVING,
-        "bedroom_1_2": SCHEME_DAY_LIVING,
-        "bedroom_3_4": SCHEME_DAY_LIVING,
+        "bedroom_1_2": SCHEME_BEDROOM,
+        "bedroom_3_4": SCHEME_BEDROOM,
     },
     COMFORT_MODE_OFFICE: {
         "office": SCHEME_DAY_LIVING,
@@ -109,6 +109,15 @@ DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
     "bedroom_3_4": "input_select.temptamer_comfort_mode_bed34",
 }
 
+DEFAULT_ZONE_OVERRIDE_SCHEMES = {
+    "bedroom_1_2": {
+        COMFORT_MODE_DAY: SCHEME_DAY_LIVING,
+    },
+    "bedroom_3_4": {
+        COMFORT_MODE_DAY: SCHEME_DAY_LIVING,
+    },
+}
+
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
@@ -117,6 +126,7 @@ DEFAULT_SYSTEM_CONFIG = SystemConfig(
     zones=DEFAULT_ZONES,
     zone_comfort_mode_entities=DEFAULT_ZONE_COMFORT_MODE_ENTITIES,
     comfort_modes=DEFAULT_COMFORT_MODES,
+    zone_override_schemes=DEFAULT_ZONE_OVERRIDE_SCHEMES,
     heat_control_schemes=DEFAULT_HEAT_CONTROL_SCHEMES,
     cool_control_schemes=DEFAULT_COOL_CONTROL_SCHEMES,
 )

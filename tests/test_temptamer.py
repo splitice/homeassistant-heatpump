@@ -92,6 +92,7 @@ TEST_SYSTEM_CONFIG = SystemConfig(
     zones=DEFAULT_SYSTEM_CONFIG.zones,
     zone_comfort_mode_entities=DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities,
     comfort_modes=DEFAULT_SYSTEM_CONFIG.comfort_modes,
+    zone_override_schemes=DEFAULT_SYSTEM_CONFIG.zone_override_schemes,
     heat_control_schemes=TEST_HEAT_CONTROL_SCHEMES,
     cool_control_schemes=TEST_COOL_CONTROL_SCHEMES,
 )
