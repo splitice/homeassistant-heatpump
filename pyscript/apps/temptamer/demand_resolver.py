@@ -80,7 +80,11 @@ def _max_excess(
 
 def _intersect_zone_keys(zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
     allowed = set(allowed_zone_keys)
-    return tuple(zone_key for zone_key in zone_keys if zone_key in allowed)
+    intersected_zone_keys: list[str] = []
+    for zone_key in zone_keys:
+        if zone_key in allowed:
+            intersected_zone_keys.append(zone_key)
+    return tuple(intersected_zone_keys)
 
 
 def _normalize_timestamp(value: datetime | None) -> datetime | None:

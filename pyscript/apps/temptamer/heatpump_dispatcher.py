@@ -82,9 +82,15 @@ def _enabled_zones_within_hold_band(snapshot: DemandSnapshot, hvac_mode: str) ->
         return False
 
     if hvac_mode == HVAC_COOL:
-        return all(zone.cool_scheme.continue_until < zone.current_temp <= zone.cool_scheme.ideal_target for zone in enabled_zones)
+        for zone in enabled_zones:
+            if not zone.cool_scheme.continue_until < zone.current_temp <= zone.cool_scheme.ideal_target:
+                return False
+        return True
 
-    return all(zone.scheme.ideal_target <= zone.current_temp < zone.scheme.continue_until for zone in enabled_zones)
+    for zone in enabled_zones:
+        if not zone.scheme.ideal_target <= zone.current_temp < zone.scheme.continue_until:
+            return False
+    return True
 
 
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
