@@ -121,6 +121,7 @@ def _resolve_entity_attribute_temperature(
 
 
 def _is_supported_override_scheme(config: SystemConfig, scheme_name: str) -> bool:
+    """Return whether a zone override can directly select this scheme for both heating and cooling."""
     return scheme_name in config.heat_control_schemes and scheme_name in config.cool_control_schemes
 
 
