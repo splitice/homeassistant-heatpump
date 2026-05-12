@@ -36,7 +36,15 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 
 	 If you already keep `pyscript` configuration in `config/pyscript/config.yaml`, add the same `apps.temptamer` entry there instead.
 4. Update `pyscript/apps/temptamer/config.py` so the zone sensor and switch entity IDs match your Home Assistant entities.
-5. Ensure `input_select.temptamer_comfort_mode`, `sensor.home_temperature`, and `climate.wt32_hpctrl_e8dbd0_heatpump` exist or are adjusted in the config.
+5. Ensure these helper entities exist, or adjust `pyscript/apps/temptamer/config.py` to match your setup:
+   - `input_select.temptamer_comfort_mode`
+   - `input_select.temptamer_hvac_mode` with `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`
+   - `input_select.temptamer_comfort_mode_office` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_dining` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_bed12` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `input_select.temptamer_comfort_mode_bed34` with `Auto`, `Day`, `Night`, `Office`, and `Off`
+   - `sensor.home_temperature`
+   - `climate.wt32_hpctrl_e8dbd0_heatpump`
 6. Reload `pyscript`.
 
 ## Runtime model
@@ -48,6 +56,8 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - Runtime status is published to `pyscript.temptamer_status`, and the enabled/disabled switch is persisted in `pyscript.temptamer_enabled`.
 - The runtime calls `task.unique(...)` for each control pass so overlapping periodic, startup, and comfort-mode triggers do not pile up across reloads or rapid state changes.
 - Comfort-mode changes still trigger an immediate reconciliation pass whenever TempTamer is enabled.
+- HVAC selection supports `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`. `Manual` leaves both the zone switches and heatpump untouched, while `HeatCool` enforces a one-hour anti-flap delay before changing between heating and cooling.
+- Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity. Selecting `Auto`, omitting the override entity, or providing an unrecognized value keeps the global comfort mode in effect for that zone.
 
 ## Validation
 

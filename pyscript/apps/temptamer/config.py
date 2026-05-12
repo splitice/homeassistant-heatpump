@@ -13,22 +13,40 @@ from .constants import (
 )
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
-DEFAULT_CONTROL_SCHEMES = {
-    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_below=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_below=15.0, continue_until=17.0, ideal_target=16.0),
+DEFAULT_HEAT_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_below=19.5,
+        enable_outside=19.5,
         continue_until=21.5,
         ideal_target=20.5,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
-        enable_below=14.0,
+        enable_outside=14.0,
         continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_below=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+}
+
+DEFAULT_COOL_CONTROL_SCHEMES = {
+    SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
+    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
+    SCHEME_DAY_LIVING: ControlScheme(
+        name=SCHEME_DAY_LIVING,
+        enable_outside=21.5,
+        continue_until=19.5,
+        ideal_target=20.5,
+    ),
+    SCHEME_DINING_BASIC: ControlScheme(
+        name=SCHEME_DINING_BASIC,
+        enable_outside=17.0,
+        continue_until=17.0,
+        ideal_target=15.0,
+    ),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
 }
 
 DEFAULT_ZONES = {
@@ -84,13 +102,23 @@ DEFAULT_COMFORT_MODES = {
     },
 }
 
+DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
+    "office": "input_select.temptamer_comfort_mode_office",
+    "dining": "input_select.temptamer_comfort_mode_dining",
+    "bedroom_1_2": "input_select.temptamer_comfort_mode_bed12",
+    "bedroom_3_4": "input_select.temptamer_comfort_mode_bed34",
+}
+
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
+    hvac_mode_entity="input_select.temptamer_hvac_mode",
     climate_entity="climate.wt32_hpctrl_e8dbd0_heatpump",
     zones=DEFAULT_ZONES,
+    zone_comfort_mode_entities=DEFAULT_ZONE_COMFORT_MODE_ENTITIES,
     comfort_modes=DEFAULT_COMFORT_MODES,
-    control_schemes=DEFAULT_CONTROL_SCHEMES,
+    heat_control_schemes=DEFAULT_HEAT_CONTROL_SCHEMES,
+    cool_control_schemes=DEFAULT_COOL_CONTROL_SCHEMES,
 )
 
 _temperature_trigger_entities: list[str] = []
@@ -108,3 +136,10 @@ for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
 
 TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 
+_mode_trigger_entities = [
+    DEFAULT_SYSTEM_CONFIG.comfort_mode_entity,
+    DEFAULT_SYSTEM_CONFIG.hvac_mode_entity,
+    *DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values(),
+]
+
+MODE_TRIGGER_ENTITIES = tuple(_mode_trigger_entities)

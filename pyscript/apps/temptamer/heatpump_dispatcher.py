@@ -7,6 +7,8 @@ from typing import Protocol
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_OFF,
+    CONTROL_HVAC_MODE_OFF,
+    HVAC_COOL,
     FAN_LOW,
     FAN_MEDIUM,
     HEAT_START_MEDIUM_FAN_DIFFERENTIAL,
@@ -36,19 +38,29 @@ def normalize_setpoint(value: float) -> int:
 
 
 def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
+    if demand.cool_requested:
+        if demand.requested_by_zones:
+            zone = snapshot.zones[demand.requested_by_zones[0]]
+            return normalize_setpoint(zone.cool_scheme.enable_outside)
+        return normalize_setpoint(snapshot.inlet_temp)
+
+    if demand.maintain_cool_mode:
+        if demand.requested_by_zones:
+            zone = snapshot.zones[demand.requested_by_zones[0]]
+            return normalize_setpoint(zone.cool_scheme.continue_until)
+        return normalize_setpoint(snapshot.inlet_temp)
+
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
-        minimum_room_target = zone.scheme.enable_below
-        temp_gap = minimum_room_target - snapshot.inlet_temp
-        inlet_cap_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
-        raw_requested_setpoint = max(minimum_room_target + temp_gap, inlet_cap_target)
+        minimum_room_target = zone.scheme.enable_outside
+        inlet_offset_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
+        raw_requested_setpoint = max(minimum_room_target, inlet_offset_target)
         normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_below=%.1f temp_gap=%.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             minimum_room_target,
-            temp_gap,
             raw_requested_setpoint,
             normalized_setpoint,
         )
@@ -64,16 +76,37 @@ def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> in
     return normalized_setpoint
 
 
+def _enabled_zones_within_hold_band(snapshot: DemandSnapshot, hvac_mode: str) -> bool:
+    enabled_zones = [zone for zone in snapshot.zones.values() if zone.is_enabled_by_mode]
+    if not enabled_zones:
+        return False
+
+    if hvac_mode == HVAC_COOL:
+        return all(zone.cool_scheme.continue_until < zone.current_temp <= zone.cool_scheme.ideal_target for zone in enabled_zones)
+
+    return all(zone.scheme.ideal_target <= zone.current_temp < zone.scheme.continue_until for zone in enabled_zones)
+
+
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
     if demand.fan_only_requested:
         return FAN_LOW
 
-    if not (demand.heat_requested or demand.maintain_heat_mode):
+    if not (demand.heat_requested or demand.maintain_heat_mode or demand.cool_requested or demand.maintain_cool_mode):
         return None
 
     current_fan = (current_fan_mode or "").lower()
     differential = demand.max_temperature_deficit
     currently_heating = (current_hvac_mode or "").lower() == HVAC_HEAT
+    currently_cooling = (current_hvac_mode or "").lower() == HVAC_COOL
+
+    if demand.cool_requested or demand.maintain_cool_mode:
+        if not currently_cooling:
+            return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        if current_fan == FAN_MEDIUM:
+            return FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+        if current_fan == FAN_LOW:
+            return FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
 
     if not currently_heating:
         return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
@@ -93,10 +126,16 @@ def build_dispatch_plan(
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
 ) -> DispatchPlan:
-    if snapshot.comfort_mode == COMFORT_MODE_OFF:
+    if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="comfort mode is Off")
 
-    if not predicted_open_zones and (demand.heat_requested or demand.maintain_heat_mode or demand.fan_only_requested):
+    if not predicted_open_zones and (
+        demand.heat_requested
+        or demand.maintain_heat_mode
+        or demand.fan_only_requested
+        or demand.cool_requested
+        or demand.maintain_cool_mode
+    ):
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="no zones open for safe dispatch")
 
     if demand.fan_only_requested:
@@ -120,8 +159,22 @@ def build_dispatch_plan(
             reason=demand.reason,
         )
 
-    # No active demand, provided is currently on continue by setting to heat mode with the temperature setpoint at the inlet temp to allow for a more graceful cooldown while still providing some circulation. Otherwise, turn off.
-    if current_hvac_mode and current_hvac_mode.lower() != HVAC_OFF:
+    if demand.cool_requested or demand.maintain_cool_mode:
+        return DispatchPlan(
+            turn_off=False,
+            hvac_mode=HVAC_COOL,
+            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            setpoint=_requested_setpoint(snapshot, demand),
+            requested_by_zones=demand.requested_by_zones,
+            open_zones=predicted_open_zones,
+            reason=demand.reason,
+        )
+      
+    # No active demand: keep the current mode only while every enabled zone remains in the neutral band
+    # between ideal_target and continue_until. Once every zone is beyond the continue threshold,
+    # turn the heatpump off for over/under protection.
+    current_mode = (current_hvac_mode or "").lower()
+    if current_mode in {HVAC_HEAT, HVAC_COOL} and _enabled_zones_within_hold_band(snapshot, current_mode):
         return DispatchPlan(turn_off=False, open_zones=predicted_open_zones, reason=demand.reason)
 
     return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
