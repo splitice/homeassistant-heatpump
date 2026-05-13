@@ -30,7 +30,12 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
         ideal_target=15.0,
     ),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
-    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(
+        name=SCHEME_BATHROOM, 
+        enable_outside=19.25,
+        continue_until=21.5,
+        ideal_target=20
+    ),
 }
 
 DEFAULT_COOL_CONTROL_SCHEMES = {
@@ -49,7 +54,12 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
         ideal_target=15.0,
     ),
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
-    SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
+    SCHEME_BATHROOM: ControlScheme(
+        name=SCHEME_BATHROOM, 
+        enable_outside=31,
+        continue_until=26,
+        ideal_target=29,
+    ),
 }
 
 DEFAULT_ZONES = {
