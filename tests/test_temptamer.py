@@ -69,10 +69,11 @@ def base_state_map(**overrides):
     return state_map
 
 
-def base_attr_map(current_temperature="19.0"):
+def base_attr_map(current_temperature="19.0", temperature=None):
     return {
         TEST_CLIMATE_ENTITY: {
             "current_temperature": current_temperature,
+            "temperature": current_temperature if temperature is None else temperature,
         }
     }
 
@@ -171,7 +172,7 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_comfort_mode_office": "Auto",
                     }
                 ),
-                base_attr_map("21.0"),
+                base_attr_map("21.0", temperature="18.0"),
             )
         )
 
@@ -578,6 +579,7 @@ class TempTamerTests(unittest.TestCase):
             ("office",),
             current_hvac_mode="cool",
             current_fan_mode="low",
+            current_setpoint="18.0",
         )
 
         self.assertFalse(demand.cool_requested)
@@ -610,6 +612,7 @@ class TempTamerTests(unittest.TestCase):
             ("office",),
             current_hvac_mode="heat",
             current_fan_mode="low",
+            current_setpoint="17.0",
         )
 
         self.assertTrue(demand.maintain_heat_mode)
@@ -692,7 +695,7 @@ class TempTamerTests(unittest.TestCase):
                         "switch.wt32_hpctrl_e8dbd0_dining": "on",
                     }
                 ),
-                base_attr_map("22.0"),
+                base_attr_map("22.0", temperature="17.0"),
             )
         )
 
@@ -722,7 +725,7 @@ class TempTamerTests(unittest.TestCase):
                         "sensor.average_bed3_4_zone_temp": "16.5",
                     }
                 ),
-                base_attr_map("22.0"),
+                base_attr_map("22.0", temperature="17.0"),
             )
         )
 
@@ -733,13 +736,14 @@ class TempTamerTests(unittest.TestCase):
             ("office",),
             current_hvac_mode="heat",
             current_fan_mode="low",
+            current_setpoint="17.0",
         )
 
         self.assertEqual(demand.reason, "all enabled zones are at or above continue-until threshold")
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 22)
+        self.assertEqual(plan.setpoint, 17)
 
     def test_heating_continues_until_all_zones_reach_continue_threshold(self):
         snapshot = build_behavior_snapshot(
@@ -787,7 +791,7 @@ class TempTamerTests(unittest.TestCase):
                         "sensor.average_bed3_4_zone_temp": "11.0",
                     }
                 ),
-                base_attr_map("21.0"),
+                base_attr_map("21.0", temperature="18.0"),
             )
         )
 
@@ -798,13 +802,14 @@ class TempTamerTests(unittest.TestCase):
             ("office",),
             current_hvac_mode="cool",
             current_fan_mode="low",
+            current_setpoint="18.0",
         )
 
         self.assertEqual(demand.reason, "all enabled zones are at or below ideal target")
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "cool")
-        self.assertEqual(plan.setpoint, 21)
+        self.assertEqual(plan.setpoint, 18)
 
     def test_cooling_continues_until_all_zones_drop_to_ideal_target(self):
         snapshot = build_behavior_snapshot(

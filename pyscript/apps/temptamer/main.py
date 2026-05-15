@@ -303,6 +303,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         current_hvac_mode=current_hvac_mode_str,
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
+        current_setpoint=current_setpoint,
         idle_started_at=RUNTIME_STATE["idle_started_at"],
         now=now,
     )

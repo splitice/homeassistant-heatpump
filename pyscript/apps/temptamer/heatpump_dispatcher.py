@@ -212,6 +212,7 @@ def build_dispatch_plan(
     *,
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
+    current_setpoint: object | None = None,
     idle_started_at: datetime | None = None,
     now: datetime | None = None,
 ) -> DispatchPlan:
@@ -290,10 +291,11 @@ def build_dispatch_plan(
             and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
         ):
             return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
+        normalized_current_setpoint = parse_float(current_setpoint)
         return DispatchPlan(
             idle=True,
             hvac_mode=current_mode,
-            setpoint=normalize_setpoint(snapshot.inlet_temp),
+            setpoint=normalize_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None,
             open_zones=predicted_open_zones,
             reason=demand.reason,
         )
