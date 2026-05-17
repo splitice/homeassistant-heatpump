@@ -66,40 +66,109 @@ def resolve_idle_started_at(
     return None
 
 
-def _requested_setpoint(snapshot: DemandSnapshot, demand: EquipmentDemand) -> int:
+def _maintain_trim_score(snapshot: DemandSnapshot, zone_keys: tuple[str, ...], *, cooling: bool) -> int:
+    score = 0
+    for zone_key in zone_keys:
+        zone = snapshot.zones[zone_key]
+        current_temp = zone.current_temp
+        scheme = zone.cool_scheme if cooling else zone.scheme
+        distance_to_ideal = abs(current_temp - scheme.ideal_target)
+        distance_to_continue = abs(current_temp - scheme.continue_until)
+        score += 1 if distance_to_ideal <= distance_to_continue else -1
+        # Once a zone has already reached the continue threshold, bias the trim decision
+        # further toward releasing heat/cooling instead of holding the current inlet target.
+        reached_continue_threshold = current_temp <= scheme.continue_until if cooling else current_temp >= scheme.continue_until
+        if reached_continue_threshold:
+            score -= 1
+    return score
+
+
+def _requested_setpoint_raw(
+    snapshot: DemandSnapshot,
+    demand: EquipmentDemand,
+    predicted_open_zones: tuple[str, ...],
+) -> float:
     if demand.cool_requested:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
-            return normalize_setpoint(zone.cool_scheme.enable_outside)
-        return normalize_setpoint(snapshot.inlet_temp)
+            return zone.cool_scheme.enable_outside
+        return snapshot.inlet_temp
 
     if demand.maintain_cool_mode:
-        if demand.requested_by_zones:
-            zone = snapshot.zones[demand.requested_by_zones[0]]
-            return normalize_setpoint(zone.cool_scheme.ideal_target)
-        return normalize_setpoint(snapshot.inlet_temp)
+        trim_score = _maintain_trim_score(snapshot, predicted_open_zones, cooling=True)
+        return snapshot.inlet_temp if trim_score > 0 else snapshot.inlet_temp + 1.0
 
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         minimum_room_target = zone.scheme.enable_outside
         inlet_offset_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
-        raw_requested_setpoint = max(minimum_room_target, inlet_offset_target)
-        normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
+        return max(minimum_room_target, inlet_offset_target)
+
+    if demand.maintain_heat_mode:
+        trim_score = _maintain_trim_score(snapshot, predicted_open_zones, cooling=False)
+        return snapshot.inlet_temp if trim_score > 0 else snapshot.inlet_temp - 1.0
+
+    return snapshot.inlet_temp
+
+
+def _requested_setpoint(
+    snapshot: DemandSnapshot,
+    demand: EquipmentDemand,
+    predicted_open_zones: tuple[str, ...],
+) -> int:
+    raw_requested_setpoint = _requested_setpoint_raw(snapshot, demand, predicted_open_zones)
+    normalized_setpoint = normalize_setpoint(raw_requested_setpoint)
+
+    if demand.cool_requested and demand.requested_by_zones:
+        zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
             "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
-            minimum_room_target,
+            zone.cool_scheme.enable_outside,
             raw_requested_setpoint,
             normalized_setpoint,
         )
         return normalized_setpoint
 
-    normalized_setpoint = normalize_setpoint(snapshot.inlet_temp)
+    if demand.maintain_cool_mode:
+        LOGGER.info(
+            "SETPOINT: inlet_temp=%.1f mode=maintain_cool zones=%s score=%s raw=%.1f normalized=%s",
+            snapshot.inlet_temp,
+            ",".join(predicted_open_zones) if predicted_open_zones else "none",
+            _maintain_trim_score(snapshot, predicted_open_zones, cooling=True),
+            raw_requested_setpoint,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    if demand.heat_requested and demand.requested_by_zones:
+        zone = snapshot.zones[demand.requested_by_zones[0]]
+        LOGGER.info(
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f raw=%.1f normalized=%s",
+            snapshot.inlet_temp,
+            zone.key,
+            zone.scheme.enable_outside,
+            raw_requested_setpoint,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    if demand.maintain_heat_mode:
+        LOGGER.info(
+            "SETPOINT: inlet_temp=%.1f mode=maintain_heat zones=%s score=%s raw=%.1f normalized=%s",
+            snapshot.inlet_temp,
+            ",".join(predicted_open_zones) if predicted_open_zones else "none",
+            _maintain_trim_score(snapshot, predicted_open_zones, cooling=False),
+            raw_requested_setpoint,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
     LOGGER.info(
         "SETPOINT: inlet_temp=%.1f no heat-requested zones raw=%.1f normalized=%s",
         snapshot.inlet_temp,
-        snapshot.inlet_temp,
+        raw_requested_setpoint,
         normalized_setpoint,
     )
     return normalized_setpoint
@@ -143,6 +212,7 @@ def build_dispatch_plan(
     *,
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
+    current_setpoint: object | None = None,
     idle_started_at: datetime | None = None,
     now: datetime | None = None,
 ) -> DispatchPlan:
@@ -163,20 +233,41 @@ def build_dispatch_plan(
             turn_off=False,
             hvac_mode=HVAC_FAN_ONLY,
             fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
-            setpoint=_requested_setpoint(snapshot, demand),
+            setpoint=_requested_setpoint(snapshot, demand, predicted_open_zones),
             open_zones=predicted_open_zones,
             reason=demand.reason,
         )
 
-    if demand.heat_requested or demand.maintain_heat_mode:
+    if demand.maintain_heat_mode:
+        raw_requested_setpoint = _requested_setpoint_raw(snapshot, demand, predicted_open_zones)
+        if raw_requested_setpoint < MIN_HEAT_SETPOINT:
+            return DispatchPlan(
+                turn_off=False,
+                hvac_mode=HVAC_FAN_ONLY,
+                fan_mode=FAN_LOW,
+                requested_by_zones=demand.requested_by_zones,
+                open_zones=predicted_open_zones,
+                reason="maintain_heat: " + demand.reason,
+            )
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_HEAT,
             fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
-            setpoint=_requested_setpoint(snapshot, demand),
+            setpoint=_requested_setpoint(snapshot, demand, predicted_open_zones),
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
             reason=demand.reason,
+        )
+
+    if demand.heat_requested:
+        return DispatchPlan(
+            turn_off=False,
+            hvac_mode=HVAC_HEAT,
+            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            setpoint=_requested_setpoint(snapshot, demand, predicted_open_zones),
+            requested_by_zones=demand.requested_by_zones,
+            open_zones=predicted_open_zones,
+            reason="heat_requested: " + demand.reason,
         )
 
     if demand.cool_requested or demand.maintain_cool_mode:
@@ -184,7 +275,7 @@ def build_dispatch_plan(
             turn_off=False,
             hvac_mode=HVAC_COOL,
             fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
-            setpoint=_requested_setpoint(snapshot, demand),
+            setpoint=_requested_setpoint(snapshot, demand, predicted_open_zones),
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
             reason=demand.reason,
@@ -200,15 +291,16 @@ def build_dispatch_plan(
             and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
         ):
             return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
+        normalized_current_setpoint = parse_float(current_setpoint)
         return DispatchPlan(
             idle=True,
             hvac_mode=current_mode,
-            setpoint=normalize_setpoint(snapshot.inlet_temp),
+            setpoint=normalize_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None,
             open_zones=predicted_open_zones,
-            reason=demand.reason,
+            reason="idle: " + demand.reason,
         )
 
-    return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
+    return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="else: " + demand.reason)
 
 
 def apply_zone_actions(
