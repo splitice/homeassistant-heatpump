@@ -247,7 +247,7 @@ def build_dispatch_plan(
                 fan_mode=FAN_LOW,
                 requested_by_zones=demand.requested_by_zones,
                 open_zones=predicted_open_zones,
-                reason=demand.reason,
+                reason="maintain_heat: " + demand.reason,
             )
         return DispatchPlan(
             turn_off=False,
@@ -267,7 +267,7 @@ def build_dispatch_plan(
             setpoint=_requested_setpoint(snapshot, demand, predicted_open_zones),
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
-            reason=demand.reason,
+            reason="heat_requested: " + demand.reason,
         )
 
     if demand.cool_requested or demand.maintain_cool_mode:
@@ -297,10 +297,10 @@ def build_dispatch_plan(
             hvac_mode=current_mode,
             setpoint=normalize_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None,
             open_zones=predicted_open_zones,
-            reason=demand.reason,
+            reason="idle: " + demand.reason,
         )
 
-    return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
+    return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="else: " + demand.reason)
 
 
 def apply_zone_actions(

@@ -343,7 +343,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         plan.fan_mode,
         plan.setpoint,
         _describe_open_zones(plan.open_zones),
-        reason,
+        plan.reason,
     )
     RUNTIME_STATE["last_error"] = None
     RUNTIME_STATE["last_successful_control_pass"] = now
