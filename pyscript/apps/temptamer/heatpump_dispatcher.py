@@ -102,7 +102,7 @@ def _requested_setpoint_raw(
         zone = snapshot.zones[demand.requested_by_zones[0]]
         minimum_room_target = zone.scheme.enable_outside
         inlet_offset_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
-        return max(minimum_room_target, inlet_offset_target)
+        return min(minimum_room_target, inlet_offset_target)
 
     if demand.maintain_heat_mode:
         trim_score = _maintain_trim_score(snapshot, predicted_open_zones, cooling=False)
