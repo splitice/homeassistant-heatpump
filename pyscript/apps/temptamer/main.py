@@ -168,6 +168,34 @@ def _describe_open_zones(open_zones: tuple[str, ...]) -> str:
     return ", ".join(zone_labels)
 
 
+def _format_zone_temps(snapshot, plan) -> str:
+    """Return a string avg/min/max for the primary zone relevant to the plan.
+
+    Order: average/current, min, max. Use '-' where a value is not available.
+    Primary zone preference: first requested_by_zones, then first open zone.
+    """
+    zone_key = None
+    if plan.requested_by_zones:
+        zone_key = plan.requested_by_zones[0]
+    elif plan.open_zones:
+        zone_key = plan.open_zones[0]
+
+    if not zone_key:
+        return "-/-/-"
+
+    zone = snapshot.zones.get(zone_key)
+    if zone is None:
+        return "-/-/-"
+
+    def fmt(value):
+        return f"{value:.1f}" if isinstance(value, (int, float)) else "-"
+
+    avg = fmt(zone.current_temp)
+    mn = fmt(zone.min_temp) if getattr(zone, "min_temp", None) is not None else "-"
+    mx = fmt(zone.max_temp) if getattr(zone, "max_temp", None) is not None else "-"
+    return f"{avg}/{mn}/{mx}"
+
+
 def _isoformat(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -332,7 +360,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s temp=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -343,6 +371,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         plan.fan_mode,
         plan.setpoint,
         _describe_open_zones(plan.open_zones),
+        _format_zone_temps(snapshot, plan),
         plan.reason,
     )
     RUNTIME_STATE["last_error"] = None

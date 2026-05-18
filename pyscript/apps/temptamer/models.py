@@ -19,6 +19,8 @@ class ZoneConfig:
     sensor_entity_id: str | None
     switch_entity_id: str
     scheme_sensor_entity_ids: dict[str, str] = field(default_factory=dict)
+    min_sensor_entity_id: str | None = None
+    max_sensor_entity_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class SystemConfig:
 class ZoneRuntimeState:
     key: str
     current_temp: float
+    min_temp: float | None
+    max_temp: float | None
     scheme: ControlScheme
     cool_scheme: ControlScheme
     applied_comfort_mode: str

@@ -108,6 +108,12 @@ def _resolve_temperature(reader: StateReader, entity_id: str | None, fallback: f
     return fallback
 
 
+def _resolve_optional_sensor(reader: StateReader, entity_id: str | None) -> float | None:
+    if not entity_id:
+        return None
+    return parse_float(reader.get_state(entity_id))
+
+
 def _resolve_entity_attribute_temperature(
     reader: StateReader,
     entity_id: str,
@@ -196,9 +202,13 @@ def build_snapshot(
         cool_scheme = config.cool_control_schemes[scheme_name]
         temperature_sensor_entity_id = zone.scheme_sensor_entity_ids.get(scheme_name, zone.sensor_entity_id)
         current_temp = _resolve_temperature(reader, temperature_sensor_entity_id, house_temp)
+        min_temp = _resolve_optional_sensor(reader, zone.min_sensor_entity_id)
+        max_temp = _resolve_optional_sensor(reader, zone.max_sensor_entity_id)
         zones[zone_key] = ZoneRuntimeState(
             key=zone_key,
             current_temp=current_temp,
+            min_temp=min_temp,
+            max_temp=max_temp,
             scheme=scheme,
             cool_scheme=cool_scheme,
             applied_comfort_mode=applied_comfort_mode,
@@ -228,16 +238,28 @@ def build_snapshot(
             continue
 
         enabled_zones[key] = zone
+        # Primary activation: average/primary sensor below enable threshold
         if zone.current_temp < zone.scheme.enable_outside:
             heat_calling_list.append(key)
+        else:
+            # Secondary activation for heating: if a min sensor exists and it's below the enable threshold
+            # AND the average/current temp is still below the ideal target
+            if zone.min_temp is not None and zone.min_temp < zone.scheme.enable_outside and zone.current_temp < zone.scheme.ideal_target:
+                heat_calling_list.append(key)
         if zone.current_temp < zone.scheme.continue_until:
             continue_heating_list.append(key)
         if zone.current_temp < zone.scheme.ideal_target:
             below_ideal_list.append(key)
         else:
             at_ideal_list.append(key)
+        # Primary activation: average/primary sensor above enable threshold
         if zone.current_temp > zone.cool_scheme.enable_outside:
             cool_calling_list.append(key)
+        else:
+            # Secondary activation for cooling: if a max sensor exists and it's above the enable threshold
+            # AND the average/current temp is still above the ideal target
+            if zone.max_temp is not None and zone.max_temp > zone.cool_scheme.enable_outside and zone.current_temp > zone.cool_scheme.ideal_target:
+                cool_calling_list.append(key)
         if zone.current_temp > zone.cool_scheme.continue_until:
             continue_cooling_list.append(key)
         if zone.current_temp > zone.cool_scheme.ideal_target:

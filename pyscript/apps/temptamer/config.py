@@ -68,6 +68,8 @@ DEFAULT_ZONES = {
         label="Office",
         sensor_entity_id="sensor.office_average_temperature",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_office",
+        min_sensor_entity_id="sensor.office_minimum_temperature",
+        max_sensor_entity_id="sensor.office_maximum_temperature",
     ),
     "dining": ZoneConfig(
         key="dining",
@@ -149,6 +151,8 @@ _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.house_temperature_sensor)
 _add_temperature_trigger_entity(DEFAULT_SYSTEM_CONFIG.climate_entity)
 for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
     _add_temperature_trigger_entity(zone.sensor_entity_id)
+    _add_temperature_trigger_entity(getattr(zone, "min_sensor_entity_id", None))
+    _add_temperature_trigger_entity(getattr(zone, "max_sensor_entity_id", None))
     for entity_id in zone.scheme_sensor_entity_ids.values():
         _add_temperature_trigger_entity(entity_id)
 
