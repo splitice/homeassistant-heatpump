@@ -270,6 +270,95 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].current_temp, 22.1)
         self.assertEqual(snapshot.zones["bedroom_3_4"].current_temp, 22.1)
 
+    def test_min_sensor_can_trigger_heat_when_max_is_at_continue_until(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.office_minimum_temperature": "19.5",
+                        "sensor.office_maximum_temperature": "22.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        self.assertIn("office", snapshot.heat_calling_zones)
+
+    def test_min_sensor_heat_request_is_suppressed_when_max_exceeds_continue_until(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.office_minimum_temperature": "19.5",
+                        "sensor.office_maximum_temperature": "22.1",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        self.assertNotIn("office", snapshot.heat_calling_zones)
+
+    def test_heating_continuation_still_uses_average_sensor_when_below_continue_until(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "21.8",
+                        "sensor.office_minimum_temperature": "19.0",
+                        "sensor.office_maximum_temperature": "22.5",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        self.assertIn("office", snapshot.continue_heating_zones)
+
+    def test_heating_continuation_from_min_sensor_is_suppressed_when_max_exceeds_continue_until(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "22.0",
+                        "sensor.office_minimum_temperature": "21.5",
+                        "sensor.office_maximum_temperature": "22.1",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        self.assertNotIn("office", snapshot.continue_heating_zones)
+
+    def test_missing_max_sensor_preserves_min_sensor_heating_behavior(self):
+        state_map = base_state_map(
+            **{
+                "input_select.temptamer_comfort_mode": "Office",
+                "sensor.office_average_temperature": "20.5",
+                "sensor.office_minimum_temperature": "19.5",
+                "sensor.office_maximum_temperature": None,
+            }
+        )
+        reader = FakeReader(state_map, base_attr_map("20.0"))
+
+        snapshot = build_behavior_snapshot(reader)
+
+        self.assertIn("office", snapshot.heat_calling_zones)
+
+        state_map["sensor.office_average_temperature"] = "22.0"
+        state_map["sensor.office_minimum_temperature"] = "21.5"
+        continuation_snapshot = build_behavior_snapshot(reader)
+
+        self.assertIn("office", continuation_snapshot.continue_heating_zones)
+
     def test_zone_actions_respect_antiflap_but_allow_mode_change(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -468,6 +557,54 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.requested_by_zones, ("office",))
         self.assertEqual(plan.setpoint, 20)
         self.assertEqual(plan.fan_mode, "low")
+
+    def test_equipment_demand_excludes_guarded_min_sensor_heat_request(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.office_minimum_temperature": "19.5",
+                        "sensor.office_maximum_temperature": "22.1",
+                        "sensor.average_dining_zone_temp": "22.0",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+
+        self.assertFalse(demand.heat_requested)
+        self.assertTrue(demand.maintain_heat_mode)
+        self.assertEqual(demand.requested_by_zones, ("office",))
+        self.assertEqual(demand.reason, "office is below continue-until threshold")
+
+    def test_equipment_demand_excludes_guarded_min_sensor_continue_request(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "22.0",
+                        "sensor.office_minimum_temperature": "21.5",
+                        "sensor.office_maximum_temperature": "22.1",
+                        "sensor.average_dining_zone_temp": "22.0",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+
+        self.assertFalse(demand.maintain_heat_mode)
+        self.assertNotIn("office", demand.requested_by_zones)
 
     def test_dispatch_plan_logs_setpoint_calculation(self):
         snapshot = build_behavior_snapshot(

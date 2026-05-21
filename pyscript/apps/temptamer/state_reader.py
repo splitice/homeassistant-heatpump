@@ -114,6 +114,14 @@ def _resolve_optional_sensor(reader: StateReader, entity_id: str | None) -> floa
     return parse_float(reader.get_state(entity_id))
 
 
+def _can_use_min_sensor_for_heating(zone: ZoneRuntimeState, threshold: float) -> bool:
+    if zone.min_temp is None or zone.min_temp >= threshold:
+        return False
+    if zone.max_temp is not None and zone.max_temp > zone.scheme.continue_until:
+        return False
+    return True
+
+
 def _resolve_entity_attribute_temperature(
     reader: StateReader,
     entity_id: str,
@@ -244,9 +252,9 @@ def build_snapshot(
         else:
             # Secondary activation for heating: if a min sensor exists and it's below the enable threshold
             # AND the average/current temp is still below the ideal target
-            if zone.min_temp is not None and zone.min_temp < zone.scheme.enable_outside and zone.current_temp < zone.scheme.ideal_target:
+            if _can_use_min_sensor_for_heating(zone, zone.scheme.enable_outside) and zone.current_temp < zone.scheme.ideal_target:
                 heat_calling_list.append(key)
-        if zone.current_temp < zone.scheme.continue_until:
+        if zone.current_temp < zone.scheme.continue_until or _can_use_min_sensor_for_heating(zone, zone.scheme.continue_until):
             continue_heating_list.append(key)
         if zone.current_temp < zone.scheme.ideal_target:
             below_ideal_list.append(key)
