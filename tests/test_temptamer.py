@@ -882,6 +882,336 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.setpoint, 17)
 
+    def test_heating_idle_preserves_current_setpoint_on_entry(self):
+        now = datetime(2026, 1, 1, 12, 4, 59, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=4, seconds=59),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 18)
+
+    def test_heating_idle_stage_1_applies_after_five_minutes_above_continue_until(self):
+        now = datetime(2026, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=5),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+
+    def test_heating_idle_stage_1_does_not_raise_existing_inlet_minus_2_setpoint(self):
+        now = datetime(2026, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "24.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="20.0",
+            idle_started_at=now - timedelta(minutes=5),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+
+    def test_heating_idle_stage_2_applies_after_fifteen_minutes_above_continue_until(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 19)
+
+    def test_heating_idle_stage_2_does_not_raise_existing_inlet_minus_3_setpoint(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "24.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="19.0",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 19)
+
+    def test_heating_idle_stage_2_waits_until_fifteen_minutes(self):
+        now = datetime(2026, 1, 1, 12, 14, 59, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=14, seconds=59),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+
+    def test_heating_idle_preserves_current_setpoint_when_zone_is_at_continue_until(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "22.0",
+                        "sensor.office_average_temperature": "22.0",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 18)
+
+    def test_heating_idle_preserves_current_setpoint_without_open_zone(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, (), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            (),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 18)
+
+    def test_heating_idle_returns_none_when_current_setpoint_missing(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="unknown",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertIsNone(plan.setpoint)
+
+    def test_heating_idle_stage_2_respects_minimum_heat_setpoint(self):
+        now = datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "23.0",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("19.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="18.0",
+            idle_started_at=now - timedelta(minutes=15),
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 17)
+
     def test_heating_continues_until_all_zones_reach_continue_threshold(self):
         snapshot = build_behavior_snapshot(
             FakeReader(

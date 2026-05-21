@@ -13,6 +13,10 @@ from .constants import (
     FAN_LOW,
     FAN_MEDIUM,
     HEAT_START_MEDIUM_FAN_DIFFERENTIAL,
+    IDLE_HEAT_STAGE_1_DELTA,
+    IDLE_HEAT_STAGE_1_SECONDS,
+    IDLE_HEAT_STAGE_2_DELTA,
+    IDLE_HEAT_STAGE_2_SECONDS,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
     HVAC_OFF,
@@ -174,6 +178,84 @@ def _requested_setpoint(
     return normalized_setpoint
 
 
+def _requested_idle_heat_setpoint(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    current_setpoint: object | None,
+    idle_started_at: datetime | None,
+    now: datetime | None,
+) -> int | None:
+    current_setpoint_value = parse_float(current_setpoint)
+    if current_setpoint_value is None:
+        LOGGER.info("SETPOINT: idle_heat stage=hold zones=none reason=missing_current_setpoint")
+        return None
+
+    normalized_setpoint = normalize_setpoint(current_setpoint_value)
+    normalized_idle_started_at = _normalize_timestamp(idle_started_at)
+    normalized_now = _normalize_timestamp(now)
+    if normalized_idle_started_at is None or normalized_now is None or not predicted_open_zones:
+        LOGGER.info(
+            "SETPOINT: idle_heat stage=hold zones=%s raw=%.1f normalized=%s",
+            ",".join(predicted_open_zones) if predicted_open_zones else "none",
+            current_setpoint_value,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    zone = snapshot.zones[predicted_open_zones[0]]
+    if zone.current_temp <= zone.scheme.continue_until:
+        LOGGER.info(
+            "SETPOINT: idle_heat stage=hold zone=%s zone_temp=%.1f continue_until=%.1f raw=%.1f normalized=%s",
+            zone.key,
+            zone.current_temp,
+            zone.scheme.continue_until,
+            current_setpoint_value,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    idle_seconds = (normalized_now - normalized_idle_started_at).total_seconds()
+    if idle_seconds >= IDLE_HEAT_STAGE_2_SECONDS:
+        raw_setpoint = snapshot.inlet_temp - IDLE_HEAT_STAGE_2_DELTA
+        stage = "idle_heat_stage_2"
+    elif idle_seconds >= IDLE_HEAT_STAGE_1_SECONDS:
+        raw_setpoint = snapshot.inlet_temp - IDLE_HEAT_STAGE_1_DELTA
+        stage = "idle_heat_stage_1"
+    else:
+        LOGGER.info(
+            "SETPOINT: idle_heat stage=hold zone=%s zone_temp=%.1f continue_until=%.1f idle_seconds=%.0f raw=%.1f normalized=%s",
+            zone.key,
+            zone.current_temp,
+            zone.scheme.continue_until,
+            idle_seconds,
+            current_setpoint_value,
+            normalized_setpoint,
+        )
+        return normalized_setpoint
+
+    minimum_allowed_setpoint = snapshot.inlet_temp - IDLE_HEAT_STAGE_2_DELTA
+    if minimum_allowed_setpoint <= current_setpoint_value <= raw_setpoint:
+        selected_setpoint = current_setpoint_value
+    else:
+        selected_setpoint = raw_setpoint
+    normalized_idle_setpoint = normalize_setpoint(selected_setpoint)
+    LOGGER.info(
+        "SETPOINT: inlet_temp=%.1f stage=%s zone=%s zone_temp=%.1f continue_until=%.1f idle_seconds=%.0f current=%.1f raw=%.1f floor=%.1f selected=%.1f normalized=%s",
+        snapshot.inlet_temp,
+        stage,
+        zone.key,
+        zone.current_temp,
+        zone.scheme.continue_until,
+        idle_seconds,
+        current_setpoint_value,
+        raw_setpoint,
+        minimum_allowed_setpoint,
+        selected_setpoint,
+        normalized_idle_setpoint,
+    )
+    return normalized_idle_setpoint
+
+
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
     if demand.fan_only_requested:
         return FAN_LOW
@@ -291,11 +373,21 @@ def build_dispatch_plan(
             and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
         ):
             return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason=demand.reason)
-        normalized_current_setpoint = parse_float(current_setpoint)
+        if current_mode == HVAC_HEAT:
+            idle_setpoint = _requested_idle_heat_setpoint(
+                snapshot,
+                predicted_open_zones,
+                current_setpoint,
+                idle_started_at,
+                now,
+            )
+        else:
+            normalized_current_setpoint = parse_float(current_setpoint)
+            idle_setpoint = normalize_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None
         return DispatchPlan(
             idle=True,
             hvac_mode=current_mode,
-            setpoint=normalize_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None,
+            setpoint=idle_setpoint,
             open_zones=predicted_open_zones,
             reason="idle: " + demand.reason,
         )
