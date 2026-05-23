@@ -137,6 +137,12 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_heatcool_transition": None,
     "last_active_hvac_mode": None,
     "idle_started_at": None,
+    "idle_heat_step": None,
+    "idle_heat_step_changed_at": None,
+    "idle_heat_zone_key": None,
+    "idle_shutdown_at": None,
+    "idle_shutdown_heat_step": None,
+    "idle_shutdown_zone_key": None,
     "last_trigger": None,
 }
 
@@ -230,6 +236,12 @@ def _publish_runtime_state(status: str) -> None:
             "last_heatcool_transition": _isoformat(RUNTIME_STATE["last_heatcool_transition"]),
             "last_active_hvac_mode": RUNTIME_STATE["last_active_hvac_mode"],
             "idle_started_at": _isoformat(RUNTIME_STATE["idle_started_at"]),
+            "idle_heat_step": RUNTIME_STATE.get("idle_heat_step"),
+            "idle_heat_step_changed_at": _isoformat(RUNTIME_STATE.get("idle_heat_step_changed_at")),
+            "idle_heat_zone_key": RUNTIME_STATE.get("idle_heat_zone_key"),
+            "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
+            "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
+            "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
             "last_error": RUNTIME_STATE["last_error"],
         },
     )
@@ -255,11 +267,62 @@ def _reconcile_pending_zone_state(controller: PyscriptController, now: datetime)
             del pending_zone_state[zone_key]
 
 
+def _update_idle_heat_runtime_state(plan, now: datetime) -> None:
+    if not (plan.idle and plan.hvac_mode == HVAC_HEAT and plan.open_zones):
+        RUNTIME_STATE["idle_heat_step"] = None
+        RUNTIME_STATE["idle_heat_step_changed_at"] = None
+        RUNTIME_STATE["idle_heat_zone_key"] = None
+        return
+
+    zone_key = plan.open_zones[0]
+    zone_changed = RUNTIME_STATE["idle_heat_zone_key"] != zone_key
+    RUNTIME_STATE["idle_heat_zone_key"] = zone_key
+    RUNTIME_STATE["idle_heat_step"] = plan.idle_heat_step
+    if zone_changed or plan.idle_heat_step_changed:
+        RUNTIME_STATE["idle_heat_step_changed_at"] = now
+
+
+def _clear_idle_shutdown_runtime_state() -> None:
+    RUNTIME_STATE["idle_shutdown_at"] = None
+    RUNTIME_STATE["idle_shutdown_heat_step"] = None
+    RUNTIME_STATE["idle_shutdown_zone_key"] = None
+
+
+def _update_idle_shutdown_runtime_state(plan, now: datetime, *, current_hvac_mode: str | None) -> None:
+    if plan.idle_shutdown:
+        remembered_step = (
+            plan.idle_heat_step
+            if plan.idle_heat_step in {-7, -6, -5, -4, -3, -2, -1}
+            else RUNTIME_STATE.get("idle_heat_step")
+        )
+        remembered_zone_key = plan.open_zones[0] if plan.open_zones else RUNTIME_STATE.get("idle_heat_zone_key")
+        if remembered_step in {-7, -6, -5, -4, -3, -2, -1} and remembered_zone_key:
+            RUNTIME_STATE["idle_shutdown_at"] = now
+            RUNTIME_STATE["idle_shutdown_heat_step"] = remembered_step
+            RUNTIME_STATE["idle_shutdown_zone_key"] = remembered_zone_key
+        else:
+            _clear_idle_shutdown_runtime_state()
+        return
+
+    if not plan.turn_off:
+        _clear_idle_shutdown_runtime_state()
+        return
+
+    if (current_hvac_mode or "").lower() != "off":
+        _clear_idle_shutdown_runtime_state()
+
+
 def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None:
     task.unique(CONTROL_PASS_TASK_NAME)
 
     controller = PyscriptController()
     now = datetime.now(timezone.utc)
+    RUNTIME_STATE.setdefault("idle_heat_step", None)
+    RUNTIME_STATE.setdefault("idle_heat_step_changed_at", None)
+    RUNTIME_STATE.setdefault("idle_heat_zone_key", None)
+    RUNTIME_STATE.setdefault("idle_shutdown_at", None)
+    RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
+    RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
     RUNTIME_STATE["last_trigger"] = reason
     _reconcile_pending_zone_state(controller, now)
 
@@ -333,6 +396,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
         current_setpoint=current_setpoint,
         idle_started_at=RUNTIME_STATE["idle_started_at"],
+        idle_heat_step=RUNTIME_STATE["idle_heat_step"],
+        idle_heat_step_changed_at=RUNTIME_STATE["idle_heat_step_changed_at"],
+        idle_heat_zone_key=RUNTIME_STATE["idle_heat_zone_key"],
+        idle_shutdown_at=RUNTIME_STATE["idle_shutdown_at"],
+        idle_shutdown_heat_step=RUNTIME_STATE["idle_shutdown_heat_step"],
+        idle_shutdown_zone_key=RUNTIME_STATE["idle_shutdown_zone_key"],
         now=now,
     )
 
@@ -352,12 +421,14 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         RUNTIME_STATE["last_heatcool_transition"] = now
     if plan.hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         RUNTIME_STATE["last_active_hvac_mode"] = plan.hvac_mode
+    _update_idle_shutdown_runtime_state(plan, now, current_hvac_mode=current_hvac_mode_str)
     RUNTIME_STATE["idle_started_at"] = resolve_idle_started_at(
         RUNTIME_STATE["idle_started_at"],
         plan,
         current_hvac_mode=current_hvac_mode_str,
         now=now,
     )
+    _update_idle_heat_runtime_state(plan, now)
 
     LOGGER.info(
         "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s temp=%s trigger=%s",

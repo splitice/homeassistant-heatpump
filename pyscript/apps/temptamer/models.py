@@ -91,9 +91,12 @@ class EquipmentDemand:
 class DispatchPlan:
     turn_off: bool = False
     idle: bool = False
+    idle_shutdown: bool = False
     hvac_mode: str | None = None
     fan_mode: str | None = None
     setpoint: int | None = None
+    idle_heat_step: int | None = None
+    idle_heat_step_changed: bool = False
     requested_by_zones: tuple[str, ...] = field(default_factory=tuple)
     open_zones: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""

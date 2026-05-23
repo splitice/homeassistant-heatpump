@@ -69,14 +69,14 @@ def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list
 
 def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp > zone.cool_scheme.continue_until
-    return zone.current_temp < zone.scheme.continue_until
+        return zone.current_temp > zone.cool_scheme.ideal_target
+    return zone.current_temp < zone.scheme.ideal_target
 
 
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp <= zone.cool_scheme.ideal_target
-    return zone.current_temp >= zone.scheme.ideal_target
+        return zone.current_temp <= zone.cool_scheme.continue_until
+    return zone.current_temp >= zone.scheme.continue_until
 
 
 def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
@@ -88,8 +88,8 @@ def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, d
 
 def _closing_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
     if operation_mode == HVAC_COOL:
-        return (zone.current_temp - zone.cool_scheme.ideal_target, _last_change_key(zone))
-    return (-(zone.current_temp - zone.scheme.ideal_target), _last_change_key(zone))
+        return (zone.current_temp - zone.cool_scheme.continue_until, _last_change_key(zone))
+    return (-(zone.current_temp - zone.scheme.continue_until), _last_change_key(zone))
 
 
 def _safety_open_rank(zone: ZoneRuntimeState, operation_mode: str, *, continue_threshold: bool) -> tuple[float, timedelta]:
@@ -145,18 +145,18 @@ def _zone_temperature_reason(zone: ZoneRuntimeState, operation_mode: str | None)
     if operation_mode == HVAC_COOL:
         if zone.current_temp > zone.cool_scheme.enable_outside:
             return f"above enable threshold {zone.current_temp:.1f}>{zone.cool_scheme.enable_outside:.1f}"
-        if zone.current_temp > zone.cool_scheme.continue_until:
-            return f"above continue-until threshold {zone.current_temp:.1f}>{zone.cool_scheme.continue_until:.1f}"
         if zone.current_temp > zone.cool_scheme.ideal_target:
             return f"above ideal target {zone.current_temp:.1f}>{zone.cool_scheme.ideal_target:.1f}"
-        return f"at or below ideal target {zone.current_temp:.1f}<={zone.cool_scheme.ideal_target:.1f}"
+        if zone.current_temp > zone.cool_scheme.continue_until:
+            return f"above continue-until threshold {zone.current_temp:.1f}>{zone.cool_scheme.continue_until:.1f}"
+        return f"at or below continue-until target {zone.current_temp:.1f}<={zone.cool_scheme.continue_until:.1f}"
     if zone.current_temp < zone.scheme.enable_outside:
         return f"below enable threshold {zone.current_temp:.1f}<{zone.scheme.enable_outside:.1f}"
-    if zone.current_temp < zone.scheme.continue_until:
-        return f"below continue-until threshold {zone.current_temp:.1f}<{zone.scheme.continue_until:.1f}"
     if zone.current_temp < zone.scheme.ideal_target:
         return f"below ideal target {zone.current_temp:.1f}<{zone.scheme.ideal_target:.1f}"
-    return f"at or above ideal target {zone.current_temp:.1f}>={zone.scheme.ideal_target:.1f}"
+    if zone.current_temp < zone.scheme.continue_until:
+        return f"below continue-until threshold {zone.current_temp:.1f}<{zone.scheme.continue_until:.1f}"
+    return f"at or above continue-until target {zone.current_temp:.1f}>={zone.scheme.continue_until:.1f}"
 
 
 def describe_zone_predictions(
@@ -273,9 +273,9 @@ def resolve_zone_actions(
                     zone_key=zone.key,
                     turn_on=True,
                     reason=(
-                        f"{zone.current_temp:.1f} is above continue-until target {zone.cool_scheme.continue_until:.1f}"
+                        f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
                         if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}"
+                        else f"{zone.current_temp:.1f} is below ideal target {zone.scheme.ideal_target:.1f}"
                     ),
                 )
             )
@@ -293,9 +293,9 @@ def resolve_zone_actions(
                 zone_key=zone.key,
                 turn_on=False,
                     reason=(
-                        f"{zone.current_temp:.1f} is at or below ideal target {zone.cool_scheme.ideal_target:.1f}"
+                        f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
                         if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is at or above ideal target {zone.scheme.ideal_target:.1f}"
+                        else f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
                     ),
             )
         )
@@ -314,9 +314,9 @@ def resolve_zone_actions(
                     zone_key=zone.key,
                     turn_on=True,
                     reason=(
-                        f"{zone.current_temp:.1f} is above continue-until target {zone.cool_scheme.continue_until:.1f}"
+                        f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
                         if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}"
+                        else f"{zone.current_temp:.1f} is below ideal target {zone.scheme.ideal_target:.1f}"
                     ),
                 )
             )
