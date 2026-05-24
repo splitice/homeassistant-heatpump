@@ -38,9 +38,8 @@ from .constants import (
     MAX_HEAT_SETPOINT,
     MEDIUM_TO_LOW_FAN_DIFFERENTIAL,
     MIN_HEAT_SETPOINT,
-    SETPOINT_DELTA_FROM_INLET,
 )
-from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig
+from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig, ZoneRuntimeState
 from .state_reader import parse_float
 
 
@@ -163,7 +162,7 @@ def _requested_setpoint_raw(
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         minimum_room_target = zone.scheme.enable_outside
-        inlet_offset_target = snapshot.inlet_temp + SETPOINT_DELTA_FROM_INLET
+        inlet_offset_target = snapshot.inlet_temp + zone.setpoint_delta_from_inlet
         return min(minimum_room_target, inlet_offset_target)
 
     if demand.maintain_heat_mode:
@@ -258,11 +257,21 @@ def _requested_setpoint(
     return normalized_setpoint
 
 
-def _relax_idle_heat_step(step: int, intervals: int = 1) -> int | None:
+def _minimum_idle_heat_step(zone: ZoneRuntimeState) -> int:
+    required_delta = max(0.0, -zone.setpoint_delta_from_inlet)
+    for step in (-1, -2, -3, -4, -5, -6, -7, -11):
+        if _idle_heat_delta_for_step(step) >= required_delta:
+            return step
+    return -11
+
+
+def _relax_idle_heat_step(step: int, intervals: int = 1, *, minimum_step: int | None = None) -> int | None:
     if step not in IDLE_HEAT_UNWIND_LADDER or intervals < 0:
         return None
 
     relaxed_index = IDLE_HEAT_UNWIND_LADDER.index(step) + intervals
+    if minimum_step in IDLE_HEAT_UNWIND_LADDER:
+        relaxed_index = min(relaxed_index, IDLE_HEAT_UNWIND_LADDER.index(minimum_step))
     if relaxed_index >= len(IDLE_HEAT_UNWIND_LADDER):
         return None
     return IDLE_HEAT_UNWIND_LADDER[relaxed_index]
@@ -335,6 +344,7 @@ def _resolve_idle_heat_step(
         return normalized_setpoint, None, False, False
 
     zone = snapshot.zones[predicted_open_zones[0]]
+    minimum_step = _minimum_idle_heat_step(zone)
     idle_seconds = (normalized_now - normalized_idle_started_at).total_seconds()
     tracked_step = idle_heat_step if idle_heat_step in IDLE_HEAT_ALLOWED_STEPS else None
     inferred_step = _infer_idle_heat_step(snapshot, current_setpoint_value)
@@ -373,20 +383,25 @@ def _resolve_idle_heat_step(
             stage = "idle_heat_step_1"
         else:
             required_step = 0
+        if required_step < 0:
+            required_step = min(required_step, minimum_step)
         selected_step = min(tracked_step, required_step)
     else:
-        if tracked_step is not None and tracked_step <= -2:
+        if tracked_step is not None and tracked_step < minimum_step:
             stage = "idle_heat_unwind"
             if tracked_changed_at is None:
                 timer_reset = True
             else:
                 unwind_seconds = (normalized_now - tracked_changed_at).total_seconds()
                 if unwind_seconds >= IDLE_HEAT_UNWIND_SECONDS:
-                    selected_step = _relax_idle_heat_step(tracked_step) or tracked_step
+                    selected_step = _relax_idle_heat_step(
+                        tracked_step,
+                        minimum_step=minimum_step,
+                    ) or tracked_step
                 else:
                     selected_step = tracked_step
-        elif tracked_step == -1:
-            stage = "idle_heat_step_1"
+        elif tracked_step is not None and tracked_step == minimum_step and tracked_step < 0:
+            stage = f"idle_heat_step_{abs(tracked_step)}"
         else:
             stage = "hold"
 
@@ -445,6 +460,7 @@ def _requested_idle_heat_setpoint(
 
 
 def _resolve_idle_heat_restart_step(
+    snapshot: DemandSnapshot,
     demand: EquipmentDemand,
     predicted_open_zones: tuple[str, ...],
     *,
@@ -472,6 +488,7 @@ def _resolve_idle_heat_restart_step(
     primary_zone_key = demand.requested_by_zones[0] if demand.requested_by_zones else predicted_open_zones[0]
     if idle_shutdown_zone_key != primary_zone_key:
         return None
+    minimum_step = _minimum_idle_heat_step(snapshot.zones[primary_zone_key])
 
     normalized_shutdown_at = _normalize_timestamp(idle_shutdown_at)
     normalized_now = _normalize_timestamp(now)
@@ -482,7 +499,11 @@ def _resolve_idle_heat_restart_step(
     if off_seconds < 0 or off_seconds > IDLE_HEAT_RESTART_MEMORY_SECONDS:
         return None
 
-    return _relax_idle_heat_step(remembered_step, int(off_seconds // IDLE_HEAT_UNWIND_SECONDS))
+    return _relax_idle_heat_step(
+        remembered_step,
+        int(off_seconds // IDLE_HEAT_UNWIND_SECONDS),
+        minimum_step=minimum_step,
+    )
 
 
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
@@ -589,6 +610,7 @@ def build_dispatch_plan(
             idle_heat_step=idle_heat_step,
         )
         restart_step = _resolve_idle_heat_restart_step(
+            snapshot,
             demand,
             predicted_open_zones,
             current_hvac_mode=current_hvac_mode,

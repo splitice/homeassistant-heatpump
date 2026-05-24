@@ -42,6 +42,10 @@ def _temperature_excess(zone: ZoneRuntimeState, threshold: float) -> float:
     return max(0.0, zone.current_temp - threshold)
 
 
+def _heat_reopen_threshold(zone: ZoneRuntimeState) -> float:
+    return (zone.scheme.enable_outside + zone.scheme.ideal_target) / 2
+
+
 def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: bool) -> bool:
     if comfort_mode_changed or zone.last_switch_change is None:
         return True
@@ -70,7 +74,7 @@ def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list
 def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
         return zone.current_temp > zone.cool_scheme.ideal_target
-    return zone.current_temp < zone.scheme.ideal_target
+    return zone.current_temp < _heat_reopen_threshold(zone)
 
 
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
@@ -152,6 +156,8 @@ def _zone_temperature_reason(zone: ZoneRuntimeState, operation_mode: str | None)
         return f"at or below continue-until target {zone.current_temp:.1f}<={zone.cool_scheme.continue_until:.1f}"
     if zone.current_temp < zone.scheme.enable_outside:
         return f"below enable threshold {zone.current_temp:.1f}<{zone.scheme.enable_outside:.1f}"
+    if zone.current_temp < _heat_reopen_threshold(zone):
+        return f"below heat reopen threshold {zone.current_temp:.1f}<{_heat_reopen_threshold(zone):.1f}"
     if zone.current_temp < zone.scheme.ideal_target:
         return f"below ideal target {zone.current_temp:.1f}<{zone.scheme.ideal_target:.1f}"
     if zone.current_temp < zone.scheme.continue_until:
@@ -275,7 +281,7 @@ def resolve_zone_actions(
                     reason=(
                         f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
                         if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below ideal target {zone.scheme.ideal_target:.1f}"
+                        else f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
                     ),
                 )
             )
@@ -316,7 +322,7 @@ def resolve_zone_actions(
                     reason=(
                         f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
                         if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below ideal target {zone.scheme.ideal_target:.1f}"
+                        else f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
                     ),
                 )
             )

@@ -18,6 +18,7 @@ class ZoneConfig:
     label: str
     sensor_entity_id: str | None
     switch_entity_id: str
+    setpoint_delta_from_inlet: float = -1.0
     scheme_sensor_entity_ids: dict[str, str] = field(default_factory=dict)
     min_sensor_entity_id: str | None = None
     max_sensor_entity_id: str | None = None
@@ -42,6 +43,7 @@ class ZoneRuntimeState:
     current_temp: float
     min_temp: float | None
     max_temp: float | None
+    setpoint_delta_from_inlet: float
     scheme: ControlScheme
     cool_scheme: ControlScheme
     applied_comfort_mode: str

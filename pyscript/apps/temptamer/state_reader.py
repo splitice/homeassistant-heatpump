@@ -217,6 +217,7 @@ def build_snapshot(
             current_temp=current_temp,
             min_temp=min_temp,
             max_temp=max_temp,
+            setpoint_delta_from_inlet=zone.setpoint_delta_from_inlet,
             scheme=scheme,
             cool_scheme=cool_scheme,
             applied_comfort_mode=applied_comfort_mode,

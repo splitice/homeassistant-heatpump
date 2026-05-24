@@ -68,6 +68,7 @@ DEFAULT_ZONES = {
         label="Office",
         sensor_entity_id="sensor.office_average_temperature",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_office",
+        setpoint_delta_from_inlet=-2.0,
         min_sensor_entity_id="sensor.office_minimum_temperature",
         max_sensor_entity_id="sensor.office_maximum_temperature",
     ),
