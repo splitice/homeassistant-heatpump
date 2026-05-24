@@ -292,11 +292,11 @@ def _update_idle_shutdown_runtime_state(plan, now: datetime, *, current_hvac_mod
     if plan.idle_shutdown:
         remembered_step = (
             plan.idle_heat_step
-            if plan.idle_heat_step in {-7, -6, -5, -4, -3, -2, -1}
+            if plan.idle_heat_step in {-11, -7, -6, -5, -4, -3, -2, -1}
             else RUNTIME_STATE.get("idle_heat_step")
         )
         remembered_zone_key = plan.open_zones[0] if plan.open_zones else RUNTIME_STATE.get("idle_heat_zone_key")
-        if remembered_step in {-7, -6, -5, -4, -3, -2, -1} and remembered_zone_key:
+        if remembered_step in {-11, -7, -6, -5, -4, -3, -2, -1} and remembered_zone_key:
             RUNTIME_STATE["idle_shutdown_at"] = now
             RUNTIME_STATE["idle_shutdown_heat_step"] = remembered_step
             RUNTIME_STATE["idle_shutdown_zone_key"] = remembered_zone_key

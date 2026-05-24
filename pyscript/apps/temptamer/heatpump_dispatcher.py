@@ -18,7 +18,9 @@ from .constants import (
     IDLE_HEAT_STAGE_3_SECONDS,
     IDLE_HEAT_STAGE_4_SECONDS,
     IDLE_HEAT_STAGE_5_SECONDS,
+    IDLE_HEAT_STAGE_6_SECONDS,
     IDLE_HEAT_RESTART_MEMORY_SECONDS,
+    IDLE_HEAT_STEP_11_DELTA,
     IDLE_HEAT_STEP_1_DELTA,
     IDLE_HEAT_STEP_2_DELTA,
     IDLE_HEAT_STEP_3_DELTA,
@@ -43,7 +45,8 @@ from .state_reader import parse_float
 
 
 LOGGER = logging.getLogger(LOGGER_NAME)
-IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7)
+IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7, -11)
+IDLE_HEAT_UNWIND_LADDER = (-11, -7, -6, -5, -4, -3, -2, -1)
 
 
 class ServiceController(Protocol):
@@ -255,7 +258,19 @@ def _requested_setpoint(
     return normalized_setpoint
 
 
+def _relax_idle_heat_step(step: int, intervals: int = 1) -> int | None:
+    if step not in IDLE_HEAT_UNWIND_LADDER or intervals < 0:
+        return None
+
+    relaxed_index = IDLE_HEAT_UNWIND_LADDER.index(step) + intervals
+    if relaxed_index >= len(IDLE_HEAT_UNWIND_LADDER):
+        return None
+    return IDLE_HEAT_UNWIND_LADDER[relaxed_index]
+
+
 def _idle_heat_delta_for_step(step: int) -> float:
+    if step == -11:
+        return IDLE_HEAT_STEP_11_DELTA
     if step == -7:
         return IDLE_HEAT_STEP_7_DELTA
     if step == -1:
@@ -279,7 +294,7 @@ def _idle_heat_raw_setpoint_for_step(snapshot: DemandSnapshot, current_setpoint_
 
 def _infer_idle_heat_step(snapshot: DemandSnapshot, current_setpoint_value: float) -> int | None:
     normalized_current_setpoint = normalize_setpoint(current_setpoint_value)
-    for step in (-7, -6, -5, -4, -3, -2, -1):
+    for step in (-11, -7, -6, -5, -4, -3, -2, -1):
         raw_setpoint = _idle_heat_raw_setpoint_for_step(snapshot, current_setpoint_value, step)
         if raw_setpoint <= MIN_HEAT_SETPOINT:
             continue
@@ -338,7 +353,10 @@ def _resolve_idle_heat_step(
     stage = "hold"
 
     if zone.current_temp > zone.scheme.continue_until:
-        if idle_seconds >= IDLE_HEAT_STAGE_5_SECONDS:
+        if idle_seconds >= IDLE_HEAT_STAGE_6_SECONDS:
+            required_step = -11
+            stage = "idle_heat_step_11"
+        elif idle_seconds >= IDLE_HEAT_STAGE_5_SECONDS:
             required_step = -7
             stage = "idle_heat_step_7"
         elif idle_seconds >= IDLE_HEAT_STAGE_4_SECONDS:
@@ -364,7 +382,7 @@ def _resolve_idle_heat_step(
             else:
                 unwind_seconds = (normalized_now - tracked_changed_at).total_seconds()
                 if unwind_seconds >= IDLE_HEAT_UNWIND_SECONDS:
-                    selected_step = tracked_step + 1
+                    selected_step = _relax_idle_heat_step(tracked_step) or tracked_step
                 else:
                     selected_step = tracked_step
         elif tracked_step == -1:
@@ -445,7 +463,7 @@ def _resolve_idle_heat_restart_step(
 
     remembered_step = (
         idle_shutdown_heat_step
-        if idle_shutdown_heat_step in {-7, -6, -5, -4, -3, -2, -1}
+        if idle_shutdown_heat_step in {-11, -7, -6, -5, -4, -3, -2, -1}
         else None
     )
     if remembered_step is None:
@@ -464,11 +482,7 @@ def _resolve_idle_heat_restart_step(
     if off_seconds < 0 or off_seconds > IDLE_HEAT_RESTART_MEMORY_SECONDS:
         return None
 
-    resumed_step = remembered_step + int(off_seconds // IDLE_HEAT_UNWIND_SECONDS)
-    if resumed_step >= 0:
-        return None
-
-    return resumed_step
+    return _relax_idle_heat_step(remembered_step, int(off_seconds // IDLE_HEAT_UNWIND_SECONDS))
 
 
 def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
