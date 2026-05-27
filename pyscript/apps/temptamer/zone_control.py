@@ -71,10 +71,20 @@ def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list
     return result
 
 
-def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str) -> bool:
+def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> bool:
     if operation_mode == HVAC_COOL:
         return zone.current_temp > zone.cool_scheme.ideal_target
+    if reconcile_all and zone.current_temp < zone.scheme.continue_until:
+        return True
     return zone.current_temp < _heat_reopen_threshold(zone)
+
+
+def _opening_reason(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> str:
+    if operation_mode == HVAC_COOL:
+        return f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
+    if reconcile_all and zone.current_temp < zone.scheme.continue_until and zone.current_temp >= _heat_reopen_threshold(zone):
+        return f"{zone.current_temp:.1f} is below continue-until threshold {zone.scheme.continue_until:.1f}"
+    return f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
 
 
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
@@ -172,8 +182,10 @@ def describe_zone_predictions(
     *,
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
+    startup_reconcile: bool = False,
 ) -> tuple[str, ...]:
     predicted_open = set(predicted_open_zones)
+    reconcile_all = comfort_mode_changed or startup_reconcile
     descriptions: list[str] = []
 
     for zone_key, zone in snapshot.zones.items():
@@ -197,7 +209,11 @@ def describe_zone_predictions(
             else:
                 status_parts.append("predicted to open")
         else:
-            if zone.is_enabled_by_mode and operation_mode in {HVAC_HEAT, HVAC_COOL} and _zone_should_open(zone, operation_mode):
+            if zone.is_enabled_by_mode and operation_mode in {HVAC_HEAT, HVAC_COOL} and _zone_should_open(
+                zone,
+                operation_mode,
+                reconcile_all=reconcile_all,
+            ):
                 if _can_toggle(zone, now, comfort_mode_changed):
                     status_parts.append("eligible to open but another zone ranked ahead")
                 else:
@@ -224,9 +240,11 @@ def resolve_zone_actions(
     *,
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
+    startup_reconcile: bool = False,
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
     predicted_open: set[str] = set()
+    reconcile_all = comfort_mode_changed or startup_reconcile
     for key, zone in snapshot.zones.items():
         if zone.switch_is_on:
             predicted_open.add(key)
@@ -253,7 +271,11 @@ def resolve_zone_actions(
 
     opening_candidates: list[ZoneRuntimeState] = []
     for zone in snapshot.zones.values():
-        if zone.is_enabled_by_mode and not zone.switch_is_on and _zone_should_open(zone, operation_mode):
+        if zone.is_enabled_by_mode and not zone.switch_is_on and _zone_should_open(
+            zone,
+            operation_mode,
+            reconcile_all=reconcile_all,
+        ):
             opening_candidates.append(zone)
     ranked_opening_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
     for zone in opening_candidates:
@@ -269,7 +291,7 @@ def resolve_zone_actions(
         ranked_closing_candidates.append((_closing_rank(zone, operation_mode), zone))
     closing_candidates = _sorted_by_rank(ranked_closing_candidates)
 
-    if comfort_mode_changed:
+    if reconcile_all:
         for zone in opening_candidates:
             if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
                 continue
@@ -278,11 +300,7 @@ def resolve_zone_actions(
                 ZoneAction(
                     zone_key=zone.key,
                     turn_on=True,
-                    reason=(
-                        f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
-                    ),
+                    reason=_opening_reason(zone, operation_mode, reconcile_all=reconcile_all),
                 )
             )
 
@@ -291,7 +309,7 @@ def resolve_zone_actions(
             continue
         if not _can_toggle(zone, now, comfort_mode_changed):
             continue
-        if not comfort_mode_changed and discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
+        if not reconcile_all and discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
             break
         predicted_open.remove(zone.key)
         actions.append(
@@ -305,10 +323,10 @@ def resolve_zone_actions(
                     ),
             )
         )
-        if not comfort_mode_changed:
+        if not reconcile_all:
             discretionary_used += 1
 
-    if not comfort_mode_changed:
+    if not reconcile_all:
         for zone in opening_candidates:
             if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
                 continue
@@ -319,11 +337,7 @@ def resolve_zone_actions(
                 ZoneAction(
                     zone_key=zone.key,
                     turn_on=True,
-                    reason=(
-                        f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
-                    ),
+                    reason=_opening_reason(zone, operation_mode, reconcile_all=reconcile_all),
                 )
             )
             discretionary_used += 1

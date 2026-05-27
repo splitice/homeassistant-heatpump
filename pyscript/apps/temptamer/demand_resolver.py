@@ -77,6 +77,15 @@ def _max_excess(
 
     return selected_zone_key, selected_excess
 
+
+def _filter_zone_keys(candidate_zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
+    allowed = set(allowed_zone_keys)
+    filtered_zone_keys: list[str] = []
+    for zone_key in candidate_zone_keys:
+        if zone_key in allowed:
+            filtered_zone_keys.append(zone_key)
+    return tuple(filtered_zone_keys)
+
 def _normalize_timestamp(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -180,9 +189,10 @@ def resolve_equipment_demand(
                 reason=f"{requested_by_zone} is above enable threshold",
             )
 
+        predicted_open_above_ideal_zones = _filter_zone_keys(snapshot.above_ideal_zones, predicted_open_zones)
         continue_zone, continue_excess = _max_excess(
             snapshot,
-            snapshot.above_ideal_zones,
+            predicted_open_above_ideal_zones,
             lambda zone: zone.cool_scheme.ideal_target,
         )
         if continue_zone is not None:
@@ -205,9 +215,10 @@ def resolve_equipment_demand(
             reason=f"{primary_zone} is below enable threshold",
         )
 
+    predicted_open_continue_zones = _filter_zone_keys(snapshot.continue_heating_zones, predicted_open_zones)
     continue_zones, continue_deficit = _ranked_requesting_zones(
         snapshot,
-        snapshot.continue_heating_zones,
+        predicted_open_continue_zones,
         "continue_until",
     )
     if continue_zones:

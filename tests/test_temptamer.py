@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from pyscript.apps.temptamer.config import DEFAULT_SYSTEM_CONFIG
 from pyscript.apps.temptamer.constants import (
@@ -583,6 +583,31 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertEqual(predicted_open, ("dining",))
 
+    def test_closed_heating_zone_in_continue_band_does_not_drive_maintain_heat(self):
+        now = datetime(2026, 5, 7, 12, 10, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Night",
+                        "sensor.office_average_temperature": "18.0",
+                        "sensor.average_dining_zone_temp": "16.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("18.5"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_HEAT, comfort_mode_changed=False)
+        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_HEAT)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(predicted_open, ("office",))
+        self.assertFalse(demand.maintain_heat_mode)
+        self.assertEqual(demand.requested_by_zones, ())
+
     def test_heating_zone_hysteresis_holds_closed_above_midpoint_between_enable_and_ideal(self):
         now = datetime(2026, 5, 7, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
@@ -678,6 +703,38 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertEqual(predicted_open, ("office",))
 
+    def test_antiflap_closed_cooling_zone_does_not_drive_maintain_cool(self):
+        now = datetime(2026, 5, 7, 12, 2, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "13.0",
+                        "sensor.average_bed1_2_zone_temp": "12.0",
+                        "sensor.average_bed3_4_zone_temp": "12.0",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                ),
+                base_attr_map("20.5"),
+            ),
+            last_switch_changes={
+                "office": datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc),
+                "dining": datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc),
+            },
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_COOL, comfort_mode_changed=False)
+        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_COOL)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(predicted_open, ("dining",))
+        self.assertFalse(demand.maintain_cool_mode)
+        self.assertEqual(demand.requested_by_zones, ())
+
     def test_equipment_demand_and_dispatch_plan_choose_heat_setpoint(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -712,7 +769,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 17)
         self.assertEqual(plan.fan_mode, "low")
 
-    def test_non_office_heat_request_uses_zone_setpoint_delta_from_inlet(self):
+    def test_non_office_heat_request_uses_zone_setpoint_delta_from_inlet_and_rounds_down(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -743,7 +800,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("dining",))
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.requested_by_zones, ("dining",))
-        self.assertEqual(plan.setpoint, 18)
+        self.assertEqual(plan.setpoint, 17)
 
     def test_equipment_demand_excludes_guarded_min_sensor_heat_request(self):
         snapshot = build_behavior_snapshot(
@@ -943,6 +1000,37 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.setpoint, 18)
 
+    def test_maintain_heat_from_off_uses_primary_zone_delta_and_rounds_down(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "18.0",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "17.5",
+                        "sensor.average_bed1_2_zone_temp": "16.5",
+                        "sensor.average_bed3_4_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("24.5"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="off",
+            current_fan_mode="low",
+        )
+
+        self.assertTrue(demand.maintain_heat_mode)
+        self.assertEqual(demand.requested_by_zones, ("office",))
+        self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.setpoint, 22)
+
     def test_maintain_heat_preserves_tracked_idle_step_when_setpoint_has_not_caught_up(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1003,7 +1091,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertTrue(demand.maintain_heat_mode)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.setpoint, 18)
 
     def test_maintain_heat_below_minimum_setpoint_falls_back_to_fan_only(self):
         snapshot = build_behavior_snapshot(
@@ -1035,6 +1123,38 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.hvac_mode, HVAC_FAN_ONLY)
         self.assertEqual(plan.fan_mode, FAN_LOW)
         self.assertIsNone(plan.setpoint)
+
+    def test_maintain_cooling_rounds_up_fractional_setpoint(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "21.0",
+                        "sensor.office_average_temperature": "21.8",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("22.5"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+        )
+
+        self.assertTrue(demand.maintain_cool_mode)
+        self.assertEqual(plan.hvac_mode, "cool")
+        self.assertEqual(plan.setpoint, 23)
 
     def test_maintain_cooling_increases_setpoint_when_open_zones_are_closer_to_continue_until(self):
         snapshot = build_behavior_snapshot(
@@ -1100,6 +1220,138 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.setpoint, 17)
+
+    def test_initial_heating_idle_with_large_stale_target_clamps_to_midpoint(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Night",
+                        "sensor.home_temperature": "18.0",
+                        "sensor.office_average_temperature": "18.0",
+                        "sensor.average_dining_zone_temp": "18.5",
+                        "sensor.average_bed1_2_zone_temp": "18.5",
+                        "sensor.average_bed3_4_zone_temp": "18.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+        self.assertEqual(plan.idle_heat_step, 0)
+
+    def test_initial_heating_idle_with_small_gap_preserves_current_target(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Night",
+                        "sensor.home_temperature": "19.5",
+                        "sensor.office_average_temperature": "19.5",
+                        "sensor.average_dining_zone_temp": "19.8",
+                        "sensor.average_bed1_2_zone_temp": "19.8",
+                        "sensor.average_bed3_4_zone_temp": "19.8",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="21.0",
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 21)
+        self.assertEqual(plan.idle_heat_step, 0)
+
+    def test_initial_heating_idle_uses_coldest_predicted_open_zone_as_anchor(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Night",
+                        "sensor.home_temperature": "19.0",
+                        "sensor.office_average_temperature": "20.0",
+                        "sensor.average_dining_zone_temp": "18.0",
+                        "sensor.average_bed1_2_zone_temp": "18.5",
+                        "sensor.average_bed3_4_zone_temp": "18.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office", "dining"), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office", "dining"),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+        self.assertEqual(plan.idle_heat_step, 0)
+
+    def test_comfort_mode_drop_enters_idle_with_midpoint_clamp(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Night",
+                        "sensor.home_temperature": "18.0",
+                        "sensor.office_average_temperature": "18.0",
+                        "sensor.average_dining_zone_temp": "18.5",
+                        "sensor.average_bed1_2_zone_temp": "18.5",
+                        "sensor.average_bed3_4_zone_temp": "18.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_HEAT)
+
+        self.assertEqual(demand.reason, "all enabled zones are at or above continue-until threshold")
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 20)
+        self.assertEqual(plan.idle_heat_step, 0)
 
     def test_heating_idle_preserves_current_setpoint_on_entry(self):
         now = datetime(2026, 1, 1, 12, 1, 59, tzinfo=timezone.utc)
@@ -1237,7 +1489,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 20)
         self.assertEqual(plan.idle_heat_step, -2)
 
-    def test_heating_idle_stage_2_does_not_raise_existing_inlet_minus_3_setpoint(self):
+    def test_heating_idle_stage_2_preserves_existing_inlet_minus_3_setpoint(self):
         now = datetime(2026, 1, 1, 12, 6, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1268,8 +1520,8 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertTrue(plan.idle)
-        self.assertEqual(plan.setpoint, 18)
-        self.assertEqual(plan.idle_heat_step, -4)
+        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.idle_heat_step, -3)
 
     def test_heating_idle_stage_2_waits_until_six_minutes(self):
         now = datetime(2026, 1, 1, 12, 4, 59, tzinfo=timezone.utc)
@@ -1648,7 +1900,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.idle_shutdown)
         self.assertEqual(plan.idle_heat_step, -11)
 
-    def test_heating_idle_unwinds_from_minus_4_to_minus_3_after_ten_minutes(self):
+    def test_heating_idle_unwinds_from_minus_4_to_minus_3_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1676,7 +1928,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="18.0",
             idle_started_at=now - timedelta(minutes=20),
             idle_heat_step=-4,
-            idle_heat_step_changed_at=now - timedelta(minutes=10),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1686,7 +1938,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.idle_heat_step, -3)
         self.assertTrue(plan.idle_heat_step_changed)
 
-    def test_heating_idle_unwinds_from_minus_3_to_minus_2_after_ten_minutes(self):
+    def test_heating_idle_unwinds_from_minus_3_to_minus_2_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1714,7 +1966,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="19.0",
             idle_started_at=now - timedelta(minutes=20),
             idle_heat_step=-3,
-            idle_heat_step_changed_at=now - timedelta(minutes=10),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1724,7 +1976,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.idle_heat_step, -2)
         self.assertTrue(plan.idle_heat_step_changed)
 
-    def test_heating_idle_holds_zone_minimum_step_at_minus_2_after_ten_minutes(self):
+    def test_heating_idle_holds_zone_minimum_step_at_minus_2_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1752,7 +2004,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="20.0",
             idle_started_at=now - timedelta(minutes=20),
             idle_heat_step=-2,
-            idle_heat_step_changed_at=now - timedelta(minutes=10),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1762,7 +2014,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.idle_heat_step, -2)
         self.assertFalse(plan.idle_heat_step_changed)
 
-    def test_heating_idle_unwinds_from_minus_11_to_minus_7_after_ten_minutes(self):
+    def test_heating_idle_unwinds_from_minus_11_to_minus_7_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1790,7 +2042,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="18.0",
             idle_started_at=now - timedelta(minutes=35),
             idle_heat_step=-11,
-            idle_heat_step_changed_at=now - timedelta(minutes=10),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1800,7 +2052,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.idle_heat_step, -7)
         self.assertTrue(plan.idle_heat_step_changed)
 
-    def test_heating_idle_unwinds_from_minus_6_to_minus_5_after_ten_minutes(self):
+    def test_heating_idle_unwinds_from_minus_6_to_minus_5_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -1828,7 +2080,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="18.0",
             idle_started_at=now - timedelta(minutes=58),
             idle_heat_step=-6,
-            idle_heat_step_changed_at=now - timedelta(minutes=10),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1838,8 +2090,8 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.idle_heat_step, -5)
         self.assertTrue(plan.idle_heat_step_changed)
 
-    def test_heating_idle_does_not_unwind_before_ten_minutes(self):
-        now = datetime(2026, 1, 1, 12, 9, 59, tzinfo=timezone.utc)
+    def test_heating_idle_does_not_unwind_before_unwind_interval(self):
+        now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -1866,7 +2118,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="18.0",
             idle_started_at=now - timedelta(minutes=20),
             idle_heat_step=-4,
-            idle_heat_step_changed_at=now - timedelta(minutes=9, seconds=59),
+            idle_heat_step_changed_at=now - timedelta(seconds=IDLE_HEAT_UNWIND_SECONDS - 1),
             idle_heat_zone_key="office",
             now=now,
         )
@@ -1906,7 +2158,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.reason, "office is below continue-until threshold")
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.setpoint, 18)
 
     def test_idle_shutdown_restart_reuses_remembered_backoff_for_same_zone_maintain_heat(self):
         now = datetime(2026, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
@@ -2363,6 +2615,133 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertFalse(service_call.called)
         self.assertEqual(temptamer_main.state.get(temptamer_main.STATUS_ENTITY_ID), "manual")
+
+    def test_run_control_pass_startup_reconcile_opens_continue_heating_zone_and_logs_request(self):
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(
+            {
+                "last_successful_control_pass": None,
+                "last_zone_change": {},
+                "pending_zone_state": {},
+                "last_error": None,
+                "last_heatcool_transition": None,
+                "last_active_hvac_mode": None,
+                "idle_started_at": None,
+                "idle_heat_step": None,
+                "idle_heat_step_changed_at": None,
+                "idle_heat_zone_key": None,
+                "idle_shutdown_at": None,
+                "idle_shutdown_heat_step": None,
+                "idle_shutdown_zone_key": None,
+                "last_trigger": None,
+            }
+        )
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Night",
+                    TEST_CLIMATE_ENTITY: "heat",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.office_average_temperature": "16.95",
+                    "sensor.average_dining_zone_temp": "18.0",
+                    "sensor.average_bed1_2_zone_temp": "16.9",
+                    "sensor.average_bed3_4_zone_temp": "18.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "low",
+            "temperature": 23,
+            "current_temperature": 24.5,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
+            temptamer_main.run_control_pass(reason="startup")
+
+        self.assertEqual(
+            service_call.call_args_list,
+            [
+                call(
+                    "switch",
+                    "turn_on",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_bed_12",
+                )
+            ],
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["pending_zone_state"], {"bedroom_1_2": True})
+        self.assertTrue(
+            any(
+                "ZONES: requesting open for Bedroom 1&2 via switch.turn_on entity=switch.wt32_hpctrl_e8dbd0_bed_12 because 16.9 is below continue-until threshold 17.0"
+                in entry
+                for entry in captured.output
+            )
+        )
+
+    def test_run_control_pass_comfort_mode_change_clamps_initial_idle_setpoint(self):
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(
+            {
+                "last_successful_control_pass": None,
+                "last_zone_change": {},
+                "pending_zone_state": {},
+                "last_error": None,
+                "last_heatcool_transition": None,
+                "last_active_hvac_mode": None,
+                "idle_started_at": None,
+                "idle_heat_step": None,
+                "idle_heat_step_changed_at": None,
+                "idle_heat_zone_key": None,
+                "idle_shutdown_at": None,
+                "idle_shutdown_heat_step": None,
+                "idle_shutdown_zone_key": None,
+                "last_trigger": None,
+            }
+        )
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Night",
+                    TEST_CLIMATE_ENTITY: "heat",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.office_average_temperature": "18.0",
+                    "sensor.average_dining_zone_temp": "18.5",
+                    "sensor.average_bed1_2_zone_temp": "18.5",
+                    "sensor.average_bed3_4_zone_temp": "18.5",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "low",
+            "temperature": 22,
+            "current_temperature": 22,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        temptamer_main.run_control_pass(reason="mode selection changed", comfort_mode_changed=True)
+
+        self.assertEqual(
+            service_call.call_args_list,
+            [
+                call(
+                    "climate",
+                    "set_temperature",
+                    blocking=True,
+                    entity_id=TEST_CLIMATE_ENTITY,
+                    temperature=20,
+                )
+            ],
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["idle_heat_step"], 0)
 
     def test_fan_hysteresis_uses_medium_thresholds(self):
         self.assertEqual(

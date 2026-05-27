@@ -317,6 +317,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
 
     controller = PyscriptController()
     now = datetime.now(timezone.utc)
+    startup_reconcile = RUNTIME_STATE["last_successful_control_pass"] is None
     RUNTIME_STATE.setdefault("idle_heat_step", None)
     RUNTIME_STATE.setdefault("idle_heat_step_changed_at", None)
     RUNTIME_STATE.setdefault("idle_heat_zone_key", None)
@@ -359,6 +360,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         now,
         operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
+        startup_reconcile=startup_reconcile,
     )
     zone_diagnostics = describe_zone_predictions(
         snapshot,
@@ -366,6 +368,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
+        startup_reconcile=startup_reconcile,
     )
     demand = resolve_equipment_demand(
         snapshot,
