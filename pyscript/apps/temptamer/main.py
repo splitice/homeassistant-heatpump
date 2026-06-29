@@ -346,6 +346,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     climate_entity = DEFAULT_SYSTEM_CONFIG.climate_entity
     current_hvac_mode = controller.get_state(climate_entity)
     current_fan_mode = controller.get_attr(climate_entity, "fan_mode")
+    supported_fan_modes = controller.get_attr(climate_entity, "fan_modes")
+    if not isinstance(supported_fan_modes, (list, tuple, set)):
+        supported_fan_modes = None
     current_setpoint = controller.get_attr(climate_entity, "temperature")
     current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
 
@@ -419,6 +422,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         idle_shutdown_at=RUNTIME_STATE["idle_shutdown_at"],
         idle_shutdown_heat_step=RUNTIME_STATE["idle_shutdown_heat_step"],
         idle_shutdown_zone_key=RUNTIME_STATE["idle_shutdown_zone_key"],
+        supported_fan_modes=supported_fan_modes,
         now=now,
     )
 

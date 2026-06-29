@@ -2616,6 +2616,60 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(service_call.called)
         self.assertEqual(temptamer_main.state.get(temptamer_main.STATUS_ENTITY_ID), "manual")
 
+    def test_run_control_pass_uses_supported_level_fan_modes(self):
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(
+            {
+                "last_successful_control_pass": datetime(2026, 5, 7, 11, 59, 0, tzinfo=timezone.utc),
+                "last_zone_change": {},
+                "pending_zone_state": {},
+                "last_error": None,
+                "last_heatcool_transition": None,
+                "last_active_hvac_mode": None,
+                "idle_started_at": None,
+                "last_trigger": None,
+            }
+        )
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "input_select.temptamer_hvac_mode": "Heat",
+                    "sensor.office_average_temperature": "14.5",
+                    "sensor.average_dining_zone_temp": "18.0",
+                    "sensor.average_bed1_2_zone_temp": "18.0",
+                    "sensor.average_bed3_4_zone_temp": "18.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    TEST_CLIMATE_ENTITY: "heat",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 1",
+            "fan_modes": ["Level 1", "Level 2", "Level 3"],
+            "temperature": 19,
+            "current_temperature": 21,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        temptamer_main.run_control_pass(reason="level fan test")
+
+        self.assertEqual(
+            service_call.call_args_list,
+            [
+                call(
+                    "climate",
+                    "set_fan_mode",
+                    blocking=True,
+                    entity_id=TEST_CLIMATE_ENTITY,
+                    fan_mode="Level 2",
+                )
+            ],
+        )
+
     def test_run_control_pass_startup_reconcile_opens_continue_heating_zone_and_logs_request(self):
         temptamer_main.state._values.clear()
         temptamer_main.state._attrs.clear()
@@ -2887,6 +2941,37 @@ class TempTamerTests(unittest.TestCase):
             "low",
         )
         self.assertEqual(normalize_setpoint(25.1), 25)
+
+    def test_fan_hysteresis_prefers_supported_level_modes(self):
+        supported_fan_modes = ("Level 1", "Level 2", "Level 3")
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=4.1),
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 2",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 2",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.9),
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 1",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 2",
+                "fan_only",
+                EquipmentDemand(fan_only_requested=True),
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 1",
+        )
 
 
 if __name__ == "__main__":

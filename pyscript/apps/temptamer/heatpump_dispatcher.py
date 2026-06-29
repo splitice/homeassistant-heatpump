@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
@@ -48,6 +50,7 @@ from .state_reader import parse_float
 LOGGER = logging.getLogger(LOGGER_NAME)
 IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7, -11)
 IDLE_HEAT_UNWIND_LADDER = (-11, -7, -6, -5, -4, -3, -2, -1)
+LEVEL_FAN_MODE_PATTERN = re.compile(r"^level\s+([1-9]\d*)$", re.IGNORECASE)
 
 
 class ServiceController(Protocol):
@@ -577,35 +580,113 @@ def _resolve_idle_heat_restart_step(
     )
 
 
-def resolve_fan_mode(current_fan_mode: str | None, current_hvac_mode: str | None, demand: EquipmentDemand) -> str | None:
+def _fan_modes_tuple(supported_fan_modes: Iterable[object] | None) -> tuple[str, ...]:
+    if supported_fan_modes is None:
+        return ()
+    fan_modes: list[str] = []
+    for mode in supported_fan_modes:
+        if mode is not None:
+            fan_modes.append(str(mode))
+    return tuple(fan_modes)
+
+
+def _supported_level_fan_modes(supported_fan_modes: Iterable[object] | None) -> tuple[str, ...]:
+    levels: list[tuple[int, str]] = []
+    for fan_mode in _fan_modes_tuple(supported_fan_modes):
+        match = LEVEL_FAN_MODE_PATTERN.match(fan_mode.strip())
+        if match is not None:
+            levels.append((int(match.group(1)), fan_mode))
+
+    if not levels:
+        return ()
+
+    levels.sort(key=lambda item: item[0])
+    consecutive_levels: list[str] = []
+    expected_level = 1
+    for level_number, fan_mode in levels:
+        if level_number < expected_level:
+            continue
+        if level_number > expected_level:
+            break
+        consecutive_levels.append(fan_mode)
+        expected_level += 1
+    return tuple(consecutive_levels)
+
+
+def _supported_named_fan_mode(logical_fan_mode: str, supported_fan_modes: Iterable[object] | None) -> str | None:
+    for fan_mode in _fan_modes_tuple(supported_fan_modes):
+        if fan_mode.strip().lower() == logical_fan_mode:
+            return fan_mode
+    return None
+
+
+def _actual_fan_mode(logical_fan_mode: str, supported_fan_modes: Iterable[object] | None) -> str:
+    level_fan_modes = _supported_level_fan_modes(supported_fan_modes)
+    if level_fan_modes:
+        if logical_fan_mode == FAN_LOW:
+            return level_fan_modes[0]
+        if logical_fan_mode == FAN_MEDIUM:
+            return level_fan_modes[min(1, len(level_fan_modes) - 1)]
+
+    supported_named_mode = _supported_named_fan_mode(logical_fan_mode, supported_fan_modes)
+    return supported_named_mode or logical_fan_mode
+
+
+def _canonical_fan_mode(fan_mode: str | None) -> str:
+    normalized_fan_mode = (fan_mode or "").strip().lower()
+    if normalized_fan_mode in {FAN_LOW, FAN_MEDIUM}:
+        return normalized_fan_mode
+
+    match = LEVEL_FAN_MODE_PATTERN.match((fan_mode or "").strip())
+    if match is None:
+        return normalized_fan_mode
+    level_number = int(match.group(1))
+    return FAN_LOW if level_number <= 1 else FAN_MEDIUM
+
+
+def resolve_fan_mode(
+    current_fan_mode: str | None,
+    current_hvac_mode: str | None,
+    demand: EquipmentDemand,
+    *,
+    supported_fan_modes: Iterable[object] | None = None,
+) -> str | None:
     if demand.fan_only_requested:
-        return FAN_LOW
+        return _actual_fan_mode(FAN_LOW, supported_fan_modes)
 
     if not (demand.heat_requested or demand.maintain_heat_mode or demand.cool_requested or demand.maintain_cool_mode):
         return None
 
-    current_fan = (current_fan_mode or "").lower()
+    current_fan = _canonical_fan_mode(current_fan_mode)
     differential = demand.max_temperature_deficit
     currently_heating = (current_hvac_mode or "").lower() == HVAC_HEAT
     currently_cooling = (current_hvac_mode or "").lower() == HVAC_COOL
 
     if demand.cool_requested or demand.maintain_cool_mode:
         if not currently_cooling:
-            return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+            logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
         if current_fan == FAN_MEDIUM:
-            return FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+            logical_fan_mode = FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
         if current_fan == FAN_LOW:
-            return FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-        return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+            logical_fan_mode = FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
+        logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
 
     if not currently_heating:
-        return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
 
     if current_fan == FAN_MEDIUM:
-        return FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+        logical_fan_mode = FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
+        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
     if current_fan == FAN_LOW:
-        return FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-    return FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        logical_fan_mode = FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
+    logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
+    return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
 
 
 def build_dispatch_plan(
@@ -623,6 +704,7 @@ def build_dispatch_plan(
     idle_shutdown_at: datetime | None = None,
     idle_shutdown_heat_step: int | None = None,
     idle_shutdown_zone_key: str | None = None,
+    supported_fan_modes: Iterable[object] | None = None,
     now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
@@ -641,7 +723,12 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_FAN_ONLY,
-            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            fan_mode=resolve_fan_mode(
+                current_fan_mode,
+                current_hvac_mode,
+                demand,
+                supported_fan_modes=supported_fan_modes,
+            ),
             setpoint=_requested_setpoint(
                 snapshot,
                 demand,
@@ -667,7 +754,7 @@ def build_dispatch_plan(
             return DispatchPlan(
                 turn_off=False,
                 hvac_mode=HVAC_FAN_ONLY,
-                fan_mode=FAN_LOW,
+                fan_mode=_actual_fan_mode(FAN_LOW, supported_fan_modes),
                 requested_by_zones=demand.requested_by_zones,
                 open_zones=predicted_open_zones,
                 reason="maintain_heat: " + demand.reason,
@@ -706,7 +793,12 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_HEAT,
-            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            fan_mode=resolve_fan_mode(
+                current_fan_mode,
+                current_hvac_mode,
+                demand,
+                supported_fan_modes=supported_fan_modes,
+            ),
             setpoint=selected_setpoint,
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
@@ -717,7 +809,12 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_HEAT,
-            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            fan_mode=resolve_fan_mode(
+                current_fan_mode,
+                current_hvac_mode,
+                demand,
+                supported_fan_modes=supported_fan_modes,
+            ),
             setpoint=_requested_setpoint(
                 snapshot,
                 demand,
@@ -735,7 +832,12 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_COOL,
-            fan_mode=resolve_fan_mode(current_fan_mode, current_hvac_mode, demand),
+            fan_mode=resolve_fan_mode(
+                current_fan_mode,
+                current_hvac_mode,
+                demand,
+                supported_fan_modes=supported_fan_modes,
+            ),
             setpoint=_requested_setpoint(
                 snapshot,
                 demand,
