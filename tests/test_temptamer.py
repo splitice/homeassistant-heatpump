@@ -2670,15 +2670,133 @@ class TempTamerTests(unittest.TestCase):
                     "switch",
                     "turn_on",
                     blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_office",
+                ),
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_dining",
+                ),
+                call(
+                    "switch",
+                    "turn_on",
+                    blocking=True,
                     entity_id="switch.wt32_hpctrl_e8dbd0_bed_12",
+                ),
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_bed_34",
                 )
             ],
         )
-        self.assertEqual(temptamer_main.RUNTIME_STATE["pending_zone_state"], {"bedroom_1_2": True})
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["pending_zone_state"],
+            {
+                "office": True,
+                "dining": False,
+                "bedroom_1_2": True,
+                "bedroom_3_4": False,
+            },
+        )
         self.assertTrue(
             any(
                 "ZONES: requesting open for Bedroom 1&2 via switch.turn_on entity=switch.wt32_hpctrl_e8dbd0_bed_12 because 16.9 is below continue-until threshold 17.0"
                 in entry
+                for entry in captured.output
+            )
+        )
+        self.assertTrue(
+            any(
+                "ZONES: startup_reconcile reported_open=Office desired_open=Bedroom 1&2, Office" in entry
+                or "ZONES: startup_reconcile reported_open=Office desired_open=Office, Bedroom 1&2" in entry
+                for entry in captured.output
+            )
+        )
+
+    def test_run_control_pass_startup_reconcile_reasserts_desired_zone_state_when_reported_open_set_is_stale(self):
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(
+            {
+                "last_successful_control_pass": None,
+                "last_zone_change": {},
+                "pending_zone_state": {},
+                "last_error": None,
+                "last_heatcool_transition": None,
+                "last_active_hvac_mode": None,
+                "idle_started_at": None,
+                "idle_heat_step": None,
+                "idle_heat_step_changed_at": None,
+                "idle_heat_zone_key": None,
+                "idle_shutdown_at": None,
+                "idle_shutdown_heat_step": None,
+                "idle_shutdown_zone_key": None,
+                "last_trigger": None,
+            }
+        )
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Night",
+                    TEST_CLIMATE_ENTITY: "heat",
+                    "sensor.home_temperature": "18.0",
+                    "sensor.office_average_temperature": "18.2",
+                    "sensor.average_dining_zone_temp": "18.2",
+                    "sensor.average_bed1_2_zone_temp": "16.9",
+                    "sensor.average_bed3_4_zone_temp": "18.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "off",
+                    "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    "switch.wt32_hpctrl_e8dbd0_bed_12": "on",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "low",
+            "temperature": 23,
+            "current_temperature": 24.5,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
+            temptamer_main.run_control_pass(reason="startup")
+
+        self.assertEqual(
+            service_call.call_args_list,
+            [
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_office",
+                ),
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_dining",
+                ),
+                call(
+                    "switch",
+                    "turn_on",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_bed_12",
+                ),
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id="switch.wt32_hpctrl_e8dbd0_bed_34",
+                ),
+            ],
+        )
+        self.assertTrue(
+            any(
+                "ZONES: startup_reconcile reported_open=Bedroom 1&2, Dining desired_open=Bedroom 1&2" in entry
                 for entry in captured.output
             )
         )

@@ -174,6 +174,14 @@ def _describe_open_zones(open_zones: tuple[str, ...]) -> str:
     return ", ".join(zone_labels)
 
 
+def _reported_open_zones(snapshot) -> tuple[str, ...]:
+    reported_open: list[str] = []
+    for zone_key, zone in snapshot.zones.items():
+        if zone.switch_is_on:
+            reported_open.append(zone_key)
+    return tuple(sorted(reported_open))
+
+
 def _format_zone_temps(snapshot, plan) -> str:
     """Return a string avg/min/max for the primary zone relevant to the plan.
 
@@ -317,7 +325,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
 
     controller = PyscriptController()
     now = datetime.now(timezone.utc)
-    startup_reconcile = RUNTIME_STATE["last_successful_control_pass"] is None
+    startup_reconcile = RUNTIME_STATE["last_successful_control_pass"] is None and not comfort_mode_changed
     RUNTIME_STATE.setdefault("idle_heat_step", None)
     RUNTIME_STATE.setdefault("idle_heat_step_changed_at", None)
     RUNTIME_STATE.setdefault("idle_heat_zone_key", None)
@@ -370,6 +378,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         comfort_mode_changed=comfort_mode_changed,
         startup_reconcile=startup_reconcile,
     )
+    if startup_reconcile:
+        LOGGER.info(
+            "ZONES: startup_reconcile reported_open=%s desired_open=%s",
+            _describe_open_zones(_reported_open_zones(snapshot)),
+            _describe_open_zones(predicted_open_zones),
+        )
     demand = resolve_equipment_demand(
         snapshot,
         predicted_open_zones,

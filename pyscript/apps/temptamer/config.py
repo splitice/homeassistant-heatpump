@@ -29,7 +29,7 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
         continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=12.0, continue_until=14.5, ideal_target=14.0),
     SCHEME_BATHROOM: ControlScheme(
         name=SCHEME_BATHROOM, 
         enable_outside=20,

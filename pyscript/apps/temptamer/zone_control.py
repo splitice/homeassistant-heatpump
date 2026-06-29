@@ -87,6 +87,62 @@ def _opening_reason(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_al
     return f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
 
 
+def _closing_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
+    if operation_mode == HVAC_COOL:
+        return f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+    if operation_mode == HVAC_HEAT:
+        return f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
+    if not zone.is_enabled_by_mode:
+        return f"startup reconcile closes mode-disabled zone for scheme {zone.scheme.name}"
+    return "startup reconcile requires zone to be closed"
+
+
+def _resolve_authoritative_startup_actions(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    operation_mode: str,
+    existing_actions: list[ZoneAction],
+) -> list[ZoneAction]:
+    desired_open_zones = set(predicted_open_zones)
+    existing_actions_by_zone = {action.zone_key: action for action in existing_actions}
+    authoritative_actions: list[ZoneAction] = []
+
+    for zone_key in snapshot.zones:
+        existing_action = existing_actions_by_zone.get(zone_key)
+        if zone_key in desired_open_zones:
+            reason = existing_action.reason if existing_action is not None else _opening_reason(
+                snapshot.zones[zone_key],
+                operation_mode,
+                reconcile_all=True,
+            )
+            authoritative_actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=True,
+                    reason=reason,
+                    safety_required=existing_action.safety_required if existing_action is not None else False,
+                    discretionary=False,
+                )
+            )
+            continue
+
+        reason = existing_action.reason if existing_action is not None else _closing_reason(
+            snapshot.zones[zone_key],
+            operation_mode,
+        )
+        authoritative_actions.append(
+            ZoneAction(
+                zone_key=zone_key,
+                turn_on=False,
+                reason=reason,
+                safety_required=False,
+                discretionary=False,
+            )
+        )
+
+    return authoritative_actions
+
+
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
         return zone.current_temp <= zone.cool_scheme.continue_until
@@ -363,5 +419,13 @@ def resolve_zone_actions(
                 )
             elif zone.switch_is_on:
                 predicted_open.add(zone.key)
+
+    if startup_reconcile:
+        return _resolve_authoritative_startup_actions(
+            snapshot,
+            tuple(sorted(predicted_open)),
+            operation_mode,
+            actions,
+        ), tuple(sorted(predicted_open))
 
     return actions, tuple(sorted(predicted_open))
