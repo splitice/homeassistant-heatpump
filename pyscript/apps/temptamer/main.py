@@ -350,6 +350,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     if not isinstance(supported_fan_modes, (list, tuple, set)):
         supported_fan_modes = None
     current_setpoint = controller.get_attr(climate_entity, "temperature")
+    target_temp_step = controller.get_attr(climate_entity, "target_temp_step")
     current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
@@ -415,6 +416,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         current_hvac_mode=current_hvac_mode_str,
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
         current_setpoint=current_setpoint,
+        target_temp_step=target_temp_step,
         idle_started_at=RUNTIME_STATE["idle_started_at"],
         idle_heat_step=RUNTIME_STATE["idle_heat_step"],
         idle_heat_step_changed_at=RUNTIME_STATE["idle_heat_step_changed_at"],

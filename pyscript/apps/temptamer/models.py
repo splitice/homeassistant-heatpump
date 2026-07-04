@@ -96,7 +96,7 @@ class DispatchPlan:
     idle_shutdown: bool = False
     hvac_mode: str | None = None
     fan_mode: str | None = None
-    setpoint: int | None = None
+    setpoint: int | float | None = None
     idle_heat_step: int | None = None
     idle_heat_step_changed: bool = False
     requested_by_zones: tuple[str, ...] = field(default_factory=tuple)

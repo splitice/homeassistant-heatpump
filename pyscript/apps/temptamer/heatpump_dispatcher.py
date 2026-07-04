@@ -57,16 +57,36 @@ class ServiceController(Protocol):
     def call_service(self, domain: str, service: str, **kwargs: object) -> None: ...
 
 
-def normalize_setpoint(value: float) -> int:
-    return normalize_cool_setpoint(value)
+def _target_temp_step_value(target_temp_step: object | None) -> float:
+    parsed_step = parse_float(target_temp_step)
+    if parsed_step is None or parsed_step <= 0.0:
+        return 1.0
+    return parsed_step
 
 
-def normalize_heat_setpoint(value: float) -> int:
-    return max(MIN_HEAT_SETPOINT, min(MAX_HEAT_SETPOINT, int(math.floor(value))))
+def _setpoint_value(value: float) -> int | float:
+    rounded_value = round(value, 6)
+    if math.isclose(rounded_value, round(rounded_value), abs_tol=1e-9):
+        return int(round(rounded_value))
+    return rounded_value
 
 
-def normalize_cool_setpoint(value: float) -> int:
-    return max(MIN_HEAT_SETPOINT, min(MAX_HEAT_SETPOINT, int(math.ceil(value))))
+def normalize_setpoint(value: float, target_temp_step: object | None = 1.0) -> int | float:
+    return normalize_cool_setpoint(value, target_temp_step)
+
+
+def normalize_heat_setpoint(value: float, target_temp_step: object | None = 1.0) -> int | float:
+    step = _target_temp_step_value(target_temp_step)
+    snapped_value = math.floor((value / step) + 1e-9) * step
+    clamped_value = max(MIN_HEAT_SETPOINT, min(MAX_HEAT_SETPOINT, snapped_value))
+    return _setpoint_value(clamped_value)
+
+
+def normalize_cool_setpoint(value: float, target_temp_step: object | None = 1.0) -> int | float:
+    step = _target_temp_step_value(target_temp_step)
+    snapped_value = math.ceil((value / step) - 1e-9) * step
+    clamped_value = max(MIN_HEAT_SETPOINT, min(MAX_HEAT_SETPOINT, snapped_value))
+    return _setpoint_value(clamped_value)
 
 
 def _normalize_timestamp(value: datetime | None) -> datetime | None:
@@ -81,19 +101,20 @@ def _select_initial_idle_heat_setpoint(
     snapshot: DemandSnapshot,
     predicted_open_zones: tuple[str, ...],
     current_setpoint_value: float,
-) -> tuple[ZoneRuntimeState, int, str, float, float | None]:
+    target_temp_step: object | None,
+) -> tuple[ZoneRuntimeState, int | float, str, float, float | None]:
     candidate_zones: list[ZoneRuntimeState] = []
     for zone_key in predicted_open_zones:
         candidate_zones.append(snapshot.zones[zone_key])
 
     anchor_zone = min(candidate_zones, key=lambda zone: (zone.current_temp, zone.key))
     target_gap = current_setpoint_value - anchor_zone.current_temp
-    normalized_current_setpoint = normalize_heat_setpoint(current_setpoint_value)
+    normalized_current_setpoint = normalize_heat_setpoint(current_setpoint_value, target_temp_step)
     if target_gap <= INITIAL_IDLE_HEAT_GAP_THRESHOLD:
         return anchor_zone, normalized_current_setpoint, "entry_hold", target_gap, None
 
     midpoint_raw = anchor_zone.current_temp + (target_gap * INITIAL_IDLE_HEAT_BLEND_FACTOR)
-    selected_setpoint = min(normalized_current_setpoint, normalize_heat_setpoint(midpoint_raw))
+    selected_setpoint = min(normalized_current_setpoint, normalize_heat_setpoint(midpoint_raw, target_temp_step))
     return anchor_zone, selected_setpoint, "entry_midpoint", target_gap, midpoint_raw
 
 
@@ -139,6 +160,7 @@ def _current_active_heat_step(
     *,
     current_hvac_mode: str | None,
     idle_heat_step: int | None,
+    target_temp_step: object | None,
 ) -> int | None:
     if (current_hvac_mode or "").lower() != HVAC_HEAT:
         return None
@@ -149,7 +171,11 @@ def _current_active_heat_step(
         candidate_steps.append(tracked_step)
 
     current_setpoint_value = parse_float(current_setpoint)
-    inferred_step = _infer_idle_heat_step(snapshot, current_setpoint_value) if current_setpoint_value is not None else None
+    inferred_step = (
+        _infer_idle_heat_step(snapshot, current_setpoint_value, target_temp_step)
+        if current_setpoint_value is not None
+        else None
+    )
     if inferred_step is not None:
         candidate_steps.append(inferred_step)
 
@@ -163,12 +189,14 @@ def _requested_maintain_heat_raw(
     primary_zone: ZoneRuntimeState | None,
     current_hvac_mode: str | None,
     idle_heat_step: int | None,
+    target_temp_step: object | None,
 ) -> tuple[float, int]:
     active_step = _current_active_heat_step(
         snapshot,
         current_setpoint,
         current_hvac_mode=current_hvac_mode,
         idle_heat_step=idle_heat_step,
+        target_temp_step=target_temp_step,
     )
     minimum_step = _minimum_idle_heat_step(primary_zone) if primary_zone is not None else -1
     if active_step is not None and active_step < 0:
@@ -186,6 +214,7 @@ def _requested_setpoint_raw(
     current_setpoint: object | None = None,
     current_hvac_mode: str | None = None,
     idle_heat_step: int | None = None,
+    target_temp_step: object | None = 1.0,
 ) -> float:
     if demand.cool_requested:
         if demand.requested_by_zones:
@@ -211,6 +240,7 @@ def _requested_setpoint_raw(
             primary_zone=primary_zone,
             current_hvac_mode=current_hvac_mode,
             idle_heat_step=idle_heat_step,
+            target_temp_step=target_temp_step,
         )
         return raw_requested_setpoint
 
@@ -225,7 +255,8 @@ def _requested_setpoint(
     current_setpoint: object | None = None,
     current_hvac_mode: str | None = None,
     idle_heat_step: int | None = None,
-) -> int:
+    target_temp_step: object | None = 1.0,
+) -> int | float:
     raw_requested_setpoint = _requested_setpoint_raw(
         snapshot,
         demand,
@@ -233,11 +264,12 @@ def _requested_setpoint(
         current_setpoint=current_setpoint,
         current_hvac_mode=current_hvac_mode,
         idle_heat_step=idle_heat_step,
+        target_temp_step=target_temp_step,
     )
     normalize_requested_setpoint = (
         normalize_cool_setpoint if demand.cool_requested or demand.maintain_cool_mode else normalize_heat_setpoint
     )
-    normalized_setpoint = normalize_requested_setpoint(raw_requested_setpoint)
+    normalized_setpoint = normalize_requested_setpoint(raw_requested_setpoint, target_temp_step)
 
     if demand.cool_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
@@ -282,6 +314,7 @@ def _requested_setpoint(
             primary_zone=primary_zone,
             current_hvac_mode=current_hvac_mode,
             idle_heat_step=idle_heat_step,
+            target_temp_step=target_temp_step,
         )
         LOGGER.info(
             "SETPOINT: inlet_temp=%.1f mode=maintain_heat zones=%s step=%s raw=%.1f normalized=%s",
@@ -346,19 +379,31 @@ def _idle_heat_raw_setpoint_for_step(snapshot: DemandSnapshot, current_setpoint_
     return snapshot.inlet_temp - _idle_heat_delta_for_step(step)
 
 
-def _infer_idle_heat_step(snapshot: DemandSnapshot, current_setpoint_value: float) -> int | None:
-    normalized_current_setpoint = normalize_heat_setpoint(current_setpoint_value)
+def _infer_idle_heat_step(
+    snapshot: DemandSnapshot,
+    current_setpoint_value: float,
+    target_temp_step: object | None,
+) -> int | None:
+    normalized_current_setpoint = normalize_heat_setpoint(current_setpoint_value, target_temp_step)
     for step in (-11, -7, -6, -5, -4, -3, -2, -1):
         raw_setpoint = _idle_heat_raw_setpoint_for_step(snapshot, current_setpoint_value, step)
         if raw_setpoint <= MIN_HEAT_SETPOINT:
             continue
-        if normalize_heat_setpoint(raw_setpoint) == normalized_current_setpoint:
+        if normalize_heat_setpoint(raw_setpoint, target_temp_step) == normalized_current_setpoint:
             return step
     return None
 
 
-def _idle_heat_setpoint_for_step(snapshot: DemandSnapshot, current_setpoint_value: float, step: int) -> int:
-    return normalize_heat_setpoint(_idle_heat_raw_setpoint_for_step(snapshot, current_setpoint_value, step))
+def _idle_heat_setpoint_for_step(
+    snapshot: DemandSnapshot,
+    current_setpoint_value: float,
+    step: int,
+    target_temp_step: object | None,
+) -> int | float:
+    return normalize_heat_setpoint(
+        _idle_heat_raw_setpoint_for_step(snapshot, current_setpoint_value, step),
+        target_temp_step,
+    )
 
 
 def _resolve_idle_heat_step(
@@ -370,13 +415,14 @@ def _resolve_idle_heat_step(
     idle_heat_step_changed_at: datetime | None,
     idle_heat_zone_key: str | None,
     now: datetime | None,
-) -> tuple[int | None, int | None, bool, bool]:
+    target_temp_step: object | None,
+) -> tuple[int | float | None, int | None, bool, bool]:
     current_setpoint_value = parse_float(current_setpoint)
     if current_setpoint_value is None:
         LOGGER.info("SETPOINT: idle_heat stage=hold zones=none reason=missing_current_setpoint")
         return None, None, False, False
 
-    normalized_setpoint = normalize_heat_setpoint(current_setpoint_value)
+    normalized_setpoint = normalize_heat_setpoint(current_setpoint_value, target_temp_step)
     normalized_idle_started_at = _normalize_timestamp(idle_started_at)
     normalized_now = _normalize_timestamp(now)
     if not predicted_open_zones:
@@ -393,6 +439,7 @@ def _resolve_idle_heat_step(
             snapshot,
             predicted_open_zones,
             current_setpoint_value,
+            target_temp_step,
         )
         LOGGER.info(
             "SETPOINT: inlet_temp=%.1f stage=%s zone=%s room_temp=%.1f current_setpoint=%.1f gap=%.1f midpoint_raw=%s normalized=%s threshold=%.1f",
@@ -421,7 +468,7 @@ def _resolve_idle_heat_step(
     minimum_step = _minimum_idle_heat_step(zone)
     idle_seconds = (normalized_now - normalized_idle_started_at).total_seconds()
     tracked_step = idle_heat_step if idle_heat_step in IDLE_HEAT_ALLOWED_STEPS else None
-    inferred_step = _infer_idle_heat_step(snapshot, current_setpoint_value)
+    inferred_step = _infer_idle_heat_step(snapshot, current_setpoint_value, target_temp_step)
     if idle_heat_zone_key != zone.key:
         tracked_step = inferred_step if inferred_step in IDLE_HEAT_ALLOWED_STEPS else 0
         tracked_changed_at = None
@@ -480,7 +527,12 @@ def _resolve_idle_heat_step(
             stage = "hold"
 
     step_changed = timer_reset or selected_step != tracked_step
-    selected_setpoint = _idle_heat_setpoint_for_step(snapshot, current_setpoint_value, selected_step)
+    selected_setpoint = _idle_heat_setpoint_for_step(
+        snapshot,
+        current_setpoint_value,
+        selected_step,
+        target_temp_step,
+    )
     minimum_setpoint_reached = (
         selected_step is not None
         and selected_step < 0
@@ -514,7 +566,8 @@ def _requested_idle_heat_setpoint(
     idle_heat_step_changed_at: datetime | None,
     idle_heat_zone_key: str | None,
     now: datetime | None,
-) -> tuple[int | None, int | None, bool, bool]:
+    target_temp_step: object | None,
+) -> tuple[int | float | None, int | None, bool, bool]:
     selected_setpoint, selected_step, step_changed, minimum_setpoint_reached = _resolve_idle_heat_step(
         snapshot,
         predicted_open_zones,
@@ -524,6 +577,7 @@ def _requested_idle_heat_setpoint(
         idle_heat_step_changed_at,
         idle_heat_zone_key,
         now,
+        target_temp_step,
     )
     if selected_setpoint is None:
         LOGGER.info(
@@ -697,6 +751,7 @@ def build_dispatch_plan(
     current_hvac_mode: str | None,
     current_fan_mode: str | None,
     current_setpoint: object | None = None,
+    target_temp_step: object | None = 1.0,
     idle_started_at: datetime | None = None,
     idle_heat_step: int | None = None,
     idle_heat_step_changed_at: datetime | None = None,
@@ -736,6 +791,7 @@ def build_dispatch_plan(
                 current_setpoint=current_setpoint,
                 current_hvac_mode=current_hvac_mode,
                 idle_heat_step=idle_heat_step,
+                target_temp_step=target_temp_step,
             ),
             open_zones=predicted_open_zones,
             reason=demand.reason,
@@ -749,6 +805,7 @@ def build_dispatch_plan(
             current_setpoint=current_setpoint,
             current_hvac_mode=current_hvac_mode,
             idle_heat_step=idle_heat_step,
+            target_temp_step=target_temp_step,
         )
         if raw_requested_setpoint < MIN_HEAT_SETPOINT:
             return DispatchPlan(
@@ -766,6 +823,7 @@ def build_dispatch_plan(
             current_setpoint=current_setpoint,
             current_hvac_mode=current_hvac_mode,
             idle_heat_step=idle_heat_step,
+            target_temp_step=target_temp_step,
         )
         restart_step = _resolve_idle_heat_restart_step(
             snapshot,
@@ -779,7 +837,10 @@ def build_dispatch_plan(
         )
         selected_setpoint = requested_setpoint
         if restart_step is not None:
-            restart_setpoint = normalize_heat_setpoint(snapshot.inlet_temp - _idle_heat_delta_for_step(restart_step))
+            restart_setpoint = normalize_heat_setpoint(
+                snapshot.inlet_temp - _idle_heat_delta_for_step(restart_step),
+                target_temp_step,
+            )
             selected_setpoint = min(requested_setpoint, restart_setpoint)
             LOGGER.info(
                 "SETPOINT: idle_heat_restart zone=%s remembered_step=%s off_seconds=%.0f restart_step=%s requested=%s selected=%s",
@@ -822,6 +883,7 @@ def build_dispatch_plan(
                 current_setpoint=current_setpoint,
                 current_hvac_mode=current_hvac_mode,
                 idle_heat_step=idle_heat_step,
+                target_temp_step=target_temp_step,
             ),
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
@@ -845,6 +907,7 @@ def build_dispatch_plan(
                 current_setpoint=current_setpoint,
                 current_hvac_mode=current_hvac_mode,
                 idle_heat_step=idle_heat_step,
+                target_temp_step=target_temp_step,
             ),
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
@@ -876,6 +939,7 @@ def build_dispatch_plan(
                 idle_heat_step_changed_at,
                 idle_heat_zone_key,
                 now,
+                target_temp_step,
             )
             if minimum_setpoint_reached:
                 return DispatchPlan(
@@ -887,7 +951,11 @@ def build_dispatch_plan(
                 )
         else:
             normalized_current_setpoint = parse_float(current_setpoint)
-            idle_setpoint = normalize_cool_setpoint(normalized_current_setpoint) if normalized_current_setpoint is not None else None
+            idle_setpoint = (
+                normalize_cool_setpoint(normalized_current_setpoint, target_temp_step)
+                if normalized_current_setpoint is not None
+                else None
+            )
             resolved_idle_heat_step = None
             idle_heat_step_changed = False
         return DispatchPlan(
@@ -945,5 +1013,10 @@ def apply_dispatch_plan(
     if plan.fan_mode and (current_fan_mode or "").lower() != plan.fan_mode:
         controller.call_service("climate", "set_fan_mode", entity_id=entity_id, fan_mode=plan.fan_mode)
 
-    if plan.setpoint is not None and normalized_setpoint != float(plan.setpoint):
+    planned_setpoint = parse_float(plan.setpoint)
+    if plan.setpoint is not None and (
+        normalized_setpoint is None
+        or planned_setpoint is None
+        or not math.isclose(normalized_setpoint, planned_setpoint, abs_tol=1e-6)
+    ):
         controller.call_service("climate", "set_temperature", entity_id=entity_id, temperature=plan.setpoint)
