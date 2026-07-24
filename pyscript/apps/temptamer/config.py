@@ -5,6 +5,7 @@ from .constants import (
     COMFORT_MODE_OFF,
     COMFORT_MODE_NIGHT,
     COMFORT_MODE_OFFICE,
+    COMFORT_MODE_POWER_DAY,
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
@@ -12,7 +13,10 @@ from .constants import (
     SCHEME_NIGHT,
     SCHEME_OFF,
 )
+from .comfort_modes import DefaultComfortMode, PowerComfortMode
 from .models import ControlScheme, SystemConfig, ZoneConfig
+
+GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
 
 DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
@@ -95,30 +99,41 @@ DEFAULT_ZONES = {
     ),
 }
 
-_comfort_mode_off_mapping: dict[str, str] = {}
+DEFAULT_COMFORT_MODE_OFF_MAPPING: dict[str, str] = {}
 for zone_key in DEFAULT_ZONES:
-    _comfort_mode_off_mapping[zone_key] = SCHEME_OFF
+    DEFAULT_COMFORT_MODE_OFF_MAPPING[zone_key] = SCHEME_OFF
+
+DEFAULT_COMFORT_MODE_NIGHT_MAPPING = {
+    "office": SCHEME_NIGHT,
+    "dining": SCHEME_NIGHT,
+    "bedroom_1_2": SCHEME_NIGHT,
+    "bedroom_3_4": SCHEME_NIGHT,
+}
+
+DEFAULT_COMFORT_MODE_DAY_MAPPING = {
+    "office": SCHEME_DAY_LIVING,
+    "dining": SCHEME_DAY_LIVING,
+    "bedroom_1_2": SCHEME_BEDROOM,
+    "bedroom_3_4": SCHEME_BEDROOM,
+}
+
+DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
+    "office": SCHEME_DAY_LIVING,
+    "dining": SCHEME_DINING_BASIC,
+    "bedroom_1_2": SCHEME_BEDROOM,
+    "bedroom_3_4": SCHEME_BEDROOM,
+}
 
 DEFAULT_COMFORT_MODES = {
-    COMFORT_MODE_OFF: _comfort_mode_off_mapping,
-    COMFORT_MODE_NIGHT: {
-        "office": SCHEME_NIGHT,
-        "dining": SCHEME_NIGHT,
-        "bedroom_1_2": SCHEME_NIGHT,
-        "bedroom_3_4": SCHEME_NIGHT,
-    },
-    COMFORT_MODE_DAY: {
-        "office": SCHEME_DAY_LIVING,
-        "dining": SCHEME_DAY_LIVING,
-        "bedroom_1_2": SCHEME_BEDROOM,
-        "bedroom_3_4": SCHEME_BEDROOM,
-    },
-    COMFORT_MODE_OFFICE: {
-        "office": SCHEME_DAY_LIVING,
-        "dining": SCHEME_DINING_BASIC,
-        "bedroom_1_2": SCHEME_BEDROOM,
-        "bedroom_3_4": SCHEME_BEDROOM,
-    },
+    COMFORT_MODE_OFF: DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING),
+    COMFORT_MODE_NIGHT: DefaultComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING),
+    COMFORT_MODE_DAY: DefaultComfortMode(name=COMFORT_MODE_DAY, zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING),
+    COMFORT_MODE_OFFICE: DefaultComfortMode(name=COMFORT_MODE_OFFICE, zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING),
+    COMFORT_MODE_POWER_DAY: PowerComfortMode(
+        name=COMFORT_MODE_POWER_DAY,
+        zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+        power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+    ),
 }
 
 DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
@@ -159,10 +174,20 @@ for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
 
 TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 
-_mode_trigger_entities = [
-    DEFAULT_SYSTEM_CONFIG.comfort_mode_entity,
-    DEFAULT_SYSTEM_CONFIG.hvac_mode_entity,
-    *DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values(),
-]
+_mode_trigger_entities: list[str] = []
+
+
+def _add_mode_trigger_entity(entity_id: str | None) -> None:
+    if entity_id and entity_id not in _mode_trigger_entities:
+        _mode_trigger_entities.append(entity_id)
+
+
+_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
+_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity)
+for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values():
+    _add_mode_trigger_entity(entity_id)
+for comfort_mode in DEFAULT_SYSTEM_CONFIG.comfort_modes.values():
+    for entity_id in comfort_mode.trigger_entity_ids:
+        _add_mode_trigger_entity(entity_id)
 
 MODE_TRIGGER_ENTITIES = tuple(_mode_trigger_entities)

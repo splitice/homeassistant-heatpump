@@ -88,12 +88,12 @@ def _opening_reason(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_al
 
 
 def _closing_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
+    if not zone.is_enabled_by_mode:
+        return f"mode disabled by scheme {zone.scheme.name}"
     if operation_mode == HVAC_COOL:
         return f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
     if operation_mode == HVAC_HEAT:
         return f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
-    if not zone.is_enabled_by_mode:
-        return f"startup reconcile closes mode-disabled zone for scheme {zone.scheme.name}"
     return "startup reconcile requires zone to be closed"
 
 
@@ -178,17 +178,7 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
             enabled_zones.append(zone)
 
     if not enabled_zones:
-        open_zones: list[ZoneRuntimeState] = []
-        for zone in snapshot.zones.values():
-            if zone.switch_is_on:
-                open_zones.append(zone)
-        if not open_zones:
-            return None
-        ranked_open_zones: list[tuple[timedelta, ZoneRuntimeState]] = []
-        for zone in open_zones:
-            ranked_open_zones.append((_recent_change_rank(zone), zone))
-        open_zones = _sorted_by_rank(ranked_open_zones)
-        return open_zones[0].key
+        return None
 
     continue_zones: list[ZoneRuntimeState] = []
     for zone in enabled_zones:
@@ -325,6 +315,18 @@ def resolve_zone_actions(
 
     discretionary_used = 0
 
+    for zone in snapshot.zones.values():
+        if zone.switch_is_on and not zone.is_enabled_by_mode:
+            predicted_open.discard(zone.key)
+            actions.append(
+                ZoneAction(
+                    zone_key=zone.key,
+                    turn_on=False,
+                    reason=_closing_reason(zone, operation_mode),
+                    discretionary=False,
+                )
+            )
+
     opening_candidates: list[ZoneRuntimeState] = []
     for zone in snapshot.zones.values():
         if zone.is_enabled_by_mode and not zone.switch_is_on and _zone_should_open(
@@ -372,11 +374,11 @@ def resolve_zone_actions(
             ZoneAction(
                 zone_key=zone.key,
                 turn_on=False,
-                    reason=(
-                        f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
-                    ),
+                reason=(
+                    f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+                    if operation_mode == HVAC_COOL
+                    else f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
+                ),
             )
         )
         if not reconcile_all:

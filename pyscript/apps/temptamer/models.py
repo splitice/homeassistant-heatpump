@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .comfort_modes import ComfortMode
+
 
 @dataclass(frozen=True)
 class ControlScheme:
@@ -32,7 +34,7 @@ class SystemConfig:
     climate_entity: str
     zones: dict[str, ZoneConfig]
     zone_comfort_mode_entities: dict[str, str]
-    comfort_modes: dict[str, dict[str, str]]
+    comfort_modes: dict[str, ComfortMode]
     heat_control_schemes: dict[str, ControlScheme]
     cool_control_schemes: dict[str, ControlScheme]
 

@@ -139,6 +139,26 @@ def _is_supported_override_scheme(config: SystemConfig, scheme_name: str) -> boo
     return scheme_name in config.heat_control_schemes and scheme_name in config.cool_control_schemes
 
 
+def _resolve_comfort_mode(raw_mode: object | None, config: SystemConfig) -> str:
+    comfort_mode = str(raw_mode) if raw_mode is not None else ""
+    return comfort_mode if comfort_mode in config.comfort_modes else COMFORT_MODE_OFF
+
+
+def _resolve_comfort_mode_scheme_name(
+    reader: StateReader,
+    config: SystemConfig,
+    comfort_mode: str,
+    zone_key: str,
+) -> str:
+    comfort_mode_behavior = config.comfort_modes[comfort_mode]
+    scheme_for_zone = getattr(comfort_mode_behavior, "scheme_for_zone", None)
+    if callable(scheme_for_zone):
+        return scheme_for_zone(zone_key, reader)
+    if isinstance(comfort_mode_behavior, Mapping):
+        return comfort_mode_behavior.get(zone_key, SCHEME_OFF)
+    return SCHEME_OFF
+
+
 def _resolve_house_temperature(reader: StateReader, config: SystemConfig) -> float:
     raw_house_temp = reader.get_state(config.house_temperature_sensor)
     house_temp = parse_float(raw_house_temp)
@@ -181,7 +201,7 @@ def build_snapshot(
     last_switch_changes = last_switch_changes or {}
     pending_switch_states = pending_switch_states or {}
     raw_mode = reader.get_state(config.comfort_mode_entity)
-    comfort_mode = str(raw_mode) if raw_mode in config.comfort_modes else COMFORT_MODE_OFF
+    comfort_mode = _resolve_comfort_mode(raw_mode, config)
     raw_hvac_mode = reader.get_state(config.hvac_mode_entity)
     selected_hvac_mode = str(raw_hvac_mode) if raw_hvac_mode in VALID_HVAC_MODES else CONTROL_HVAC_MODE_HEAT
 
@@ -204,8 +224,7 @@ def build_snapshot(
             scheme_name = override_mode
         else:
             applied_comfort_mode = comfort_mode
-            comfort_mapping = config.comfort_modes[applied_comfort_mode]
-            scheme_name = comfort_mapping.get(zone_key, SCHEME_OFF)
+            scheme_name = _resolve_comfort_mode_scheme_name(reader, config, applied_comfort_mode, zone_key)
         scheme = config.heat_control_schemes[scheme_name]
         cool_scheme = config.cool_control_schemes[scheme_name]
         temperature_sensor_entity_id = zone.scheme_sensor_entity_ids.get(scheme_name, zone.sensor_entity_id)

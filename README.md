@@ -37,13 +37,14 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 	 If you already keep `pyscript` configuration in `config/pyscript/config.yaml`, add the same `apps.temptamer` entry there instead.
 4. Update `pyscript/apps/temptamer/config.py` so the zone sensor and switch entity IDs match your Home Assistant entities.
 5. Ensure these helper entities exist, or adjust `pyscript/apps/temptamer/config.py` to match your setup:
-   - `input_select.temptamer_comfort_mode`
+   - `input_select.temptamer_comfort_mode` with `Off`, `Night`, `Day`, `Office`, and `PowerDay`
    - `input_select.temptamer_hvac_mode` with `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`
    - `input_select.temptamer_comfort_mode_office` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
    - `input_select.temptamer_comfort_mode_dining` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
    - `input_select.temptamer_comfort_mode_bed12` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, and `Bedroom`
    - `input_select.temptamer_comfort_mode_bed34` with `Auto`, `Off`, `Night`, `DayLiving`, `DiningBasic`, `Bedroom`, and `Bathroom`
    - `sensor.home_temperature`
+   - `sensor.entry_goodwe_inverter_current_electricity_price`
    - `climate.wt32_hpctrl_e8dbd0_heatpump`
 6. Reload `pyscript`.
 
@@ -57,6 +58,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - The runtime calls `task.unique(...)` for each control pass so overlapping periodic, startup, and comfort-mode triggers do not pile up across reloads or rapid state changes.
 - Comfort-mode changes still trigger an immediate reconciliation pass whenever TempTamer is enabled.
 - HVAC selection supports `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`. `Manual` leaves both the zone switches and heatpump untouched, while `HeatCool` enforces a one-hour anti-flap delay before changing between heating and cooling.
+- `PowerDay` follows the `Office` comfort mapping normally. When `sensor.entry_goodwe_inverter_current_electricity_price` reports `0`, dining and bedroom zones using `DiningBasic` or `Bedroom` are upgraded to `DayLiving` so the house can heat soak during free power.
 - In `Heat` mode, any enabled zone below `enable_outside` starts heating and heating continues until every enabled zone reaches `continue_until`. In `Cool` mode, any enabled zone above `enable_outside` starts cooling and cooling continues until every enabled zone drops to `ideal_target` or lower.
 - When there is no remaining active demand but the heatpump is still running, TempTamer enters an idle dispatch state that keeps the current HVAC mode. On the first heating-idle pass, it preserves the current target unless that target is more than `2.0C` above the coldest predicted-open room; in that case it starts idle from the midpoint between the room temperature and the inherited target. After entry, the existing idle backoff ladder remains in effect before escalating to `turn_off` after one hour. If the heatpump still reports `heat` or `cool`, TempTamer keeps retrying the shutdown path instead of starting a fresh idle hour.
 - Each zone can override the global comfort mode with its own `input_select.temptamer_comfort_mode_*` entity. Use `Auto` to follow the global comfort mode, or choose one of the configured control scheme names (`Off`, `Night`, `DayLiving`, `DiningBasic`, or `Bedroom`) to apply that scheme directly. Bedroom 3&4 also supports a `Bathroom` override that uses `sensor.bathroom_motion_temperature` for that zone's temperature decisions while keeping the same thresholds as the bedroom scheme. Omitting the override entity or providing an unrecognized value keeps the global comfort mode in effect for that zone.

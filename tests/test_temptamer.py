@@ -4,8 +4,14 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock, call
 
-from pyscript.apps.temptamer.config import DEFAULT_SYSTEM_CONFIG
+from pyscript.apps.temptamer.comfort_modes import DefaultComfortMode, PowerComfortMode
+from pyscript.apps.temptamer.config import (
+    DEFAULT_SYSTEM_CONFIG,
+    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+    MODE_TRIGGER_ENTITIES,
+)
 from pyscript.apps.temptamer.constants import (
+    COMFORT_MODE_POWER_DAY,
     FAN_LOW,
     HVAC_COOL,
     HVAC_FAN_ONLY,
@@ -63,6 +69,7 @@ def base_state_map(**overrides):
         "sensor.average_bed1_2_zone_temp": "18.0",
         "sensor.average_bed3_4_zone_temp": "18.0",
         "sensor.bathroom_motion_temperature": "18.0",
+        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
         "switch.wt32_hpctrl_e8dbd0_office": "off",
         "switch.wt32_hpctrl_e8dbd0_dining": "off",
         "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
@@ -84,9 +91,9 @@ def base_attr_map(current_temperature="19.0", temperature=None, target_temp_step
 
 TEST_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
+    SCHEME_NIGHT: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_NIGHT],
     SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=20.0, continue_until=22.0, ideal_target=21.0),
-    SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=14.0, continue_until=17.0, ideal_target=15.0),
+    SCHEME_DINING_BASIC: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DINING_BASIC],
     SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
     SCHEME_BATHROOM: ControlScheme(name=SCHEME_BATHROOM, enable_outside=14.0, continue_until=16.0, ideal_target=14.0),
 }
@@ -184,6 +191,49 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "DiningBasic")
 
+    def test_default_comfort_modes_are_mode_objects(self):
+        self.assertIsInstance(DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"], DefaultComfortMode)
+        self.assertIsInstance(DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY], PowerComfortMode)
+        self.assertIn(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR, MODE_TRIGGER_ENTITIES)
+
+    def test_powerday_uses_office_mapping_when_power_is_not_free(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        self.assertEqual(snapshot.comfort_mode, COMFORT_MODE_POWER_DAY)
+        self.assertEqual(snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DINING_BASIC)
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_BEDROOM)
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_BEDROOM)
+
+    def test_powerday_heat_soaks_dining_and_bedrooms_when_power_is_free(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        self.assertEqual(snapshot.comfort_mode, COMFORT_MODE_POWER_DAY)
+        self.assertEqual(snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
+
     def test_unrecognized_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
             FakeReader(
@@ -251,6 +301,68 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(demand.heat_requested)
         self.assertEqual(demand.requested_by_zones, ("bedroom_3_4",))
 
+    def test_zone_off_override_closes_already_open_bedroom_3_4(self):
+        now = datetime(2026, 7, 4, 17, 24, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "input_select.temptamer_comfort_mode_bed34": SCHEME_OFF,
+                        "sensor.office_average_temperature": "19.8",
+                        "sensor.average_dining_zone_temp": "21.0",
+                        "sensor.average_bed1_2_zone_temp": "21.0",
+                        "sensor.average_bed3_4_zone_temp": "18.2",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "on",
+                    }
+                ),
+                base_attr_map("21.5", temperature="18.0"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_HEAT)
+
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_OFF)
+        self.assertFalse(snapshot.zones["bedroom_3_4"].is_enabled_by_mode)
+        self.assertIn(
+            ("bedroom_3_4", False, "mode disabled by scheme Off"),
+            [(action.zone_key, action.turn_on, action.reason) for action in actions],
+        )
+        self.assertEqual(predicted_open, ("office",))
+
+        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_HEAT)
+        self.assertEqual(demand.requested_by_zones, ("office",))
+        self.assertNotIn("bedroom_3_4", predicted_open)
+
+    def test_zone_off_override_is_not_reopened_for_safety(self):
+        now = datetime(2026, 7, 4, 17, 24, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "input_select.temptamer_comfort_mode_office": SCHEME_OFF,
+                        "input_select.temptamer_comfort_mode_dining": SCHEME_OFF,
+                        "input_select.temptamer_comfort_mode_bed12": SCHEME_OFF,
+                        "input_select.temptamer_comfort_mode_bed34": SCHEME_OFF,
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "on",
+                    }
+                ),
+                base_attr_map("21.5"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_HEAT)
+
+        self.assertEqual(
+            [(action.zone_key, action.turn_on) for action in actions],
+            [("bedroom_3_4", False)],
+        )
+        self.assertEqual(predicted_open, ())
+
     def test_default_zone_setpoint_deltas_are_configured_per_zone(self):
         self.assertEqual(DEFAULT_SYSTEM_CONFIG.zones["office"].setpoint_delta_from_inlet, -2.0)
         self.assertEqual(DEFAULT_SYSTEM_CONFIG.zones["dining"].setpoint_delta_from_inlet, -1.0)
@@ -274,7 +386,7 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_comfort_mode": "Night",
                         "sensor.home_temperature": "unknown",
                         "sensor.office_average_temperature": "unavailable",
-                        "sensor.average_dining_zone_temp": "17.0",
+                        "sensor.average_dining_zone_temp": "16.5",
                         "sensor.average_bed1_2_zone_temp": "16.5",
                         "sensor.average_bed3_4_zone_temp": "unknown",
                         "switch.wt32_hpctrl_e8dbd0_dining": "on",
@@ -594,7 +706,7 @@ class TempTamerTests(unittest.TestCase):
                     **{
                         "input_select.temptamer_comfort_mode": "Night",
                         "sensor.office_average_temperature": "18.0",
-                        "sensor.average_dining_zone_temp": "16.5",
+                        "sensor.average_dining_zone_temp": "17.0",
                         "switch.wt32_hpctrl_e8dbd0_office": "on",
                     }
                 ),
