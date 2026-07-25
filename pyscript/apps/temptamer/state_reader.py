@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from .comfort_modes import ComfortModeSnapshotData
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_AUTO,
@@ -216,6 +217,13 @@ def build_snapshot(
         CLIMATE_CURRENT_TEMPERATURE_ATTR,
         house_temp,
     )
+    snapshot_data = ComfortModeSnapshotData(
+        comfort_mode=comfort_mode,
+        selected_hvac_mode=selected_hvac_mode,
+        inlet_temp=inlet_temp,
+        free_power_available=free_power_available,
+        now=now,
+    )
 
     zones: dict[str, ZoneRuntimeState] = {}
     for zone_key, zone in config.zones.items():
@@ -234,7 +242,7 @@ def build_snapshot(
         current_temp = _resolve_temperature(reader, temperature_sensor_entity_id, house_temp)
         min_temp = _resolve_optional_sensor(reader, zone.min_sensor_entity_id)
         max_temp = _resolve_optional_sensor(reader, zone.max_sensor_entity_id)
-        zones[zone_key] = ZoneRuntimeState(
+        zone_state = ZoneRuntimeState(
             key=zone_key,
             current_temp=current_temp,
             min_temp=min_temp,
@@ -253,6 +261,9 @@ def build_snapshot(
             ),
             last_switch_change=_normalize_timestamp(last_switch_changes.get(zone_key)),
         )
+        if applied_comfort_mode == comfort_mode:
+            zone_state = comfort_mode_behavior.adjust_zone(zone_state, snapshot_data)
+        zones[zone_key] = zone_state
 
     enabled_zones: dict[str, ZoneRuntimeState] = {}
     heat_calling_list: list[str] = []

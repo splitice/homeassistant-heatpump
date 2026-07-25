@@ -225,6 +225,14 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DINING_BASIC)
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_BEDROOM)
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_BEDROOM)
+        self.assertEqual(
+            snapshot.zones["office"].scheme.continue_until,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until,
+        )
+        self.assertEqual(
+            snapshot.zones["office"].scheme.ideal_target,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].ideal_target,
+        )
         self.assertFalse(snapshot.free_power_available)
         self.assertEqual(
             snapshot.comfort_mode_behavior.fan_speed_level(
@@ -237,6 +245,7 @@ class TempTamerTests(unittest.TestCase):
         )
 
     def test_powerday_heat_soaks_dining_and_bedrooms_when_power_is_free(self):
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -246,7 +255,8 @@ class TempTamerTests(unittest.TestCase):
                     }
                 ),
                 base_attr_map("21.0"),
-            )
+            ),
+            now=datetime(2026, 7, 25, 12, 59, tzinfo=timezone.utc),
         )
 
         self.assertEqual(snapshot.comfort_mode, COMFORT_MODE_POWER_DAY)
@@ -254,6 +264,12 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
+        base_day_living_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
+        adjusted_continue_until = base_day_living_scheme.continue_until + power_mode.free_power_initial_suppliment
+        for zone_key in ("office", "dining", "bedroom_1_2", "bedroom_3_4"):
+            self.assertEqual(snapshot.zones[zone_key].scheme.continue_until, adjusted_continue_until)
+            self.assertEqual(snapshot.zones[zone_key].scheme.enable_outside, adjusted_continue_until - 0.75)
+            self.assertEqual(snapshot.zones[zone_key].scheme.ideal_target, adjusted_continue_until - 0.5)
         self.assertTrue(snapshot.free_power_available)
         self.assertEqual(
             snapshot.comfort_mode_behavior.fan_speed_level(
@@ -264,6 +280,27 @@ class TempTamerTests(unittest.TestCase):
             ),
             2,
         )
+
+    def test_powerday_uses_later_heat_supplement_after_1pm_when_power_is_free(self):
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            now=datetime(2026, 7, 25, 13, 1, tzinfo=timezone.utc),
+        )
+
+        base_day_living_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
+        adjusted_continue_until = base_day_living_scheme.continue_until + power_mode.free_power_later
+        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
+        self.assertEqual(snapshot.zones["office"].scheme.enable_outside, adjusted_continue_until - 0.75)
+        self.assertEqual(snapshot.zones["office"].scheme.ideal_target, adjusted_continue_until - 0.5)
 
     def test_unrecognized_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
@@ -995,7 +1032,8 @@ class TempTamerTests(unittest.TestCase):
                     }
                 ),
                 base_attr_map("21.5", target_temp_step=0.5),
-            )
+            ),
+            now=datetime(2026, 7, 25, 13, 1, tzinfo=timezone.utc),
         )
 
         demand = resolve_equipment_demand(snapshot, ("bedroom_1_2",), operation_mode=HVAC_HEAT)
@@ -1012,7 +1050,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertGreater(plan.setpoint, snapshot.inlet_temp)
-        self.assertEqual(plan.setpoint, 24.5)
+        self.assertEqual(plan.setpoint, 25)
 
     def test_equipment_demand_excludes_guarded_min_sensor_heat_request(self):
         snapshot = build_behavior_snapshot(

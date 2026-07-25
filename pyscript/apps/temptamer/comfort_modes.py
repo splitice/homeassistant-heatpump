@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, time
 from typing import ClassVar, Protocol
 
 from .constants import SCHEME_BEDROOM, SCHEME_DAY_LIVING, SCHEME_DINING_BASIC, SCHEME_OFF
@@ -12,11 +13,23 @@ class StateReaderLike(Protocol):
 
 
 @dataclass(frozen=True)
+class ComfortModeSnapshotData:
+    comfort_mode: str
+    selected_hvac_mode: str
+    inlet_temp: float
+    free_power_available: bool
+    now: datetime | None = None
+
+
+@dataclass(frozen=True)
 class ComfortMode:
     name: str
 
     def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
         raise NotImplementedError
+
+    def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
+        return zone
 
 
 @dataclass(frozen=True)
@@ -98,6 +111,9 @@ class PowerComfortMode(DefaultComfortMode):
     free_power_heat_start_medium_fan_differential: ClassVar[float] = 1.5
     free_power_low_to_medium_fan_differential: ClassVar[float] = 2.5
     free_power_medium_to_low_fan_differential: ClassVar[float] = 1.25
+    free_power_initial_suppliment: ClassVar[float] = 1.25
+    free_power_later: ClassVar[float] = 3.0
+    free_power_later_start: ClassVar[time] = time(13, 0)
 
     power_price_entity_id: str = ""
     free_power_state: str = "0"
@@ -109,6 +125,23 @@ class PowerComfortMode(DefaultComfortMode):
         if scheme_name in self.heat_soak_source_schemes and self._free_power_is_available(reader):
             return self.heat_soak_scheme
         return scheme_name
+
+    def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
+        if not snapshot_data.free_power_available or zone.scheme.name == SCHEME_OFF:
+            return zone
+        adjusted_continue_until = zone.scheme.continue_until + self._free_power_heating_supplement(snapshot_data)
+        adjusted_scheme = replace(
+            zone.scheme,
+            continue_until=adjusted_continue_until,
+            enable_outside=adjusted_continue_until - 0.75,
+            ideal_target=adjusted_continue_until - 0.5,
+        )
+        return replace(zone, scheme=adjusted_scheme)
+
+    def _free_power_heating_supplement(self, snapshot_data: ComfortModeSnapshotData) -> float:
+        if snapshot_data.now is not None and snapshot_data.now.time() > self.free_power_later_start:
+            return self.free_power_later
+        return self.free_power_initial_suppliment
 
     def fan_speed_level(
         self,
