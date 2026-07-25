@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from .constants import SCHEME_BEDROOM, SCHEME_DAY_LIVING, SCHEME_DINING_BASIC, SCHEME_OFF
 
@@ -21,11 +21,57 @@ class ComfortMode:
 
 @dataclass(frozen=True)
 class DefaultComfortMode(ComfortMode):
+    heat_start_medium_fan_differential: ClassVar[float] = 2.5
+    low_to_medium_fan_differential: ClassVar[float] = 3.0
+    medium_to_low_fan_differential: ClassVar[float] = 1.25
+
     zone_schemes: Mapping[str, str]
     trigger_entity_ids: tuple[str, ...] = ()
 
     def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
         return self.zone_schemes.get(zone_key, SCHEME_OFF)
+
+    def fan_speed_level(
+        self,
+        temperature_differential: float,
+        open_zone_count: int,
+        *,
+        current_speed_level: int | None = None,
+        starting: bool = False,
+        free_power_available: bool = False,
+    ) -> int:
+        return self._fan_speed_level_from_thresholds(
+            temperature_differential,
+            open_zone_count,
+            current_speed_level=current_speed_level,
+            starting=starting,
+            heat_start_medium_fan_differential=self.heat_start_medium_fan_differential,
+            low_to_medium_fan_differential=self.low_to_medium_fan_differential,
+            medium_to_low_fan_differential=self.medium_to_low_fan_differential,
+        )
+
+    @staticmethod
+    def _fan_speed_level_from_thresholds(
+        temperature_differential: float,
+        open_zone_count: int,
+        *,
+        current_speed_level: int | None,
+        starting: bool,
+        heat_start_medium_fan_differential: float,
+        low_to_medium_fan_differential: float,
+        medium_to_low_fan_differential: float,
+    ) -> int:
+        current_base_level = 2 if current_speed_level is not None and current_speed_level >= 2 else 1
+        if starting or current_speed_level is None:
+            base_level = 2 if temperature_differential > heat_start_medium_fan_differential else 1
+        elif current_base_level >= 2:
+            base_level = 1 if temperature_differential < medium_to_low_fan_differential else 2
+        else:
+            base_level = 2 if temperature_differential > low_to_medium_fan_differential else 1
+
+        if open_zone_count >= 3:
+            return base_level * 2
+        return base_level
 
     def get(self, zone_key: str, default: str | None = None) -> str | None:
         return self.zone_schemes.get(zone_key, default)
@@ -41,7 +87,18 @@ class DefaultComfortMode(ComfortMode):
 
 
 @dataclass(frozen=True)
+class NightComfortMode(DefaultComfortMode):
+    heat_start_medium_fan_differential: ClassVar[float] = 2.5
+    low_to_medium_fan_differential: ClassVar[float] = 6.0
+    medium_to_low_fan_differential: ClassVar[float] = 3.0
+
+
+@dataclass(frozen=True)
 class PowerComfortMode(DefaultComfortMode):
+    free_power_heat_start_medium_fan_differential: ClassVar[float] = 1.5
+    free_power_low_to_medium_fan_differential: ClassVar[float] = 2.5
+    free_power_medium_to_low_fan_differential: ClassVar[float] = 1.25
+
     power_price_entity_id: str = ""
     free_power_state: str = "0"
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
@@ -52,6 +109,36 @@ class PowerComfortMode(DefaultComfortMode):
         if scheme_name in self.heat_soak_source_schemes and self._free_power_is_available(reader):
             return self.heat_soak_scheme
         return scheme_name
+
+    def fan_speed_level(
+        self,
+        temperature_differential: float,
+        open_zone_count: int,
+        *,
+        current_speed_level: int | None = None,
+        starting: bool = False,
+        free_power_available: bool = False,
+    ) -> int:
+        if not free_power_available:
+            return super().fan_speed_level(
+                temperature_differential,
+                open_zone_count,
+                current_speed_level=current_speed_level,
+                starting=starting,
+                free_power_available=free_power_available,
+            )
+        return self._fan_speed_level_from_thresholds(
+            temperature_differential,
+            open_zone_count,
+            current_speed_level=current_speed_level,
+            starting=starting,
+            heat_start_medium_fan_differential=self.free_power_heat_start_medium_fan_differential,
+            low_to_medium_fan_differential=self.free_power_low_to_medium_fan_differential,
+            medium_to_low_fan_differential=self.free_power_medium_to_low_fan_differential,
+        )
+
+    def free_power_is_available(self, reader: StateReaderLike) -> bool:
+        return self._free_power_is_available(reader)
 
     def _free_power_is_available(self, reader: StateReaderLike) -> bool:
         price_state = reader.get_state(self.power_price_entity_id)

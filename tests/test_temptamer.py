@@ -4,20 +4,20 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock, call
 
-from pyscript.apps.temptamer.comfort_modes import DefaultComfortMode, PowerComfortMode
+from pyscript.apps.temptamer.comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode
 from pyscript.apps.temptamer.config import (
     DEFAULT_SYSTEM_CONFIG,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     MODE_TRIGGER_ENTITIES,
 )
 from pyscript.apps.temptamer.constants import (
+    COMFORT_MODE_NIGHT,
     COMFORT_MODE_POWER_DAY,
     FAN_LOW,
     HVAC_COOL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
     IDLE_HEAT_UNWIND_SECONDS,
-    LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
@@ -192,8 +192,19 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, "DiningBasic")
 
     def test_default_comfort_modes_are_mode_objects(self):
-        self.assertIsInstance(DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"], DefaultComfortMode)
-        self.assertIsInstance(DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY], PowerComfortMode)
+        day_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"]
+        night_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_NIGHT]
+        power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+
+        self.assertIsInstance(day_mode, DefaultComfortMode)
+        self.assertIsInstance(night_mode, NightComfortMode)
+        self.assertIsInstance(power_mode, PowerComfortMode)
+        self.assertEqual(day_mode.fan_speed_level(2.6, 1, current_speed_level=1), 1)
+        self.assertEqual(day_mode.fan_speed_level(2.6, 1, current_speed_level=1, starting=True), 2)
+        self.assertEqual(night_mode.fan_speed_level(4.1, 1, current_speed_level=1), 1)
+        self.assertEqual(night_mode.fan_speed_level(6.1, 1, current_speed_level=1), 2)
+        self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1), 1)
+        self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1, free_power_available=True), 2)
         self.assertIn(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR, MODE_TRIGGER_ENTITIES)
 
     def test_powerday_uses_office_mapping_when_power_is_not_free(self):
@@ -214,6 +225,16 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DINING_BASIC)
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_BEDROOM)
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_BEDROOM)
+        self.assertFalse(snapshot.free_power_available)
+        self.assertEqual(
+            snapshot.comfort_mode_behavior.fan_speed_level(
+                2.6,
+                1,
+                current_speed_level=1,
+                free_power_available=snapshot.free_power_available,
+            ),
+            1,
+        )
 
     def test_powerday_heat_soaks_dining_and_bedrooms_when_power_is_free(self):
         snapshot = build_behavior_snapshot(
@@ -233,6 +254,16 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertTrue(snapshot.free_power_available)
+        self.assertEqual(
+            snapshot.comfort_mode_behavior.fan_speed_level(
+                2.6,
+                1,
+                current_speed_level=1,
+                free_power_available=snapshot.free_power_available,
+            ),
+            2,
+        )
 
     def test_unrecognized_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
@@ -3250,7 +3281,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=LOW_TO_MEDIUM_FAN_DIFFERENTIAL),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=3.0),
             ),
             "medium",
         )
@@ -3263,6 +3294,27 @@ class TempTamerTests(unittest.TestCase):
             "low",
         )
         self.assertEqual(normalize_setpoint(25.1), 25)
+
+    def test_fan_uses_start_threshold_when_comfort_mode_changes(self):
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=2.6)
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                demand,
+            ),
+            "low",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                demand,
+                comfort_mode_changed=True,
+            ),
+            "medium",
+        )
 
     def test_fan_hysteresis_prefers_supported_level_modes(self):
         supported_fan_modes = ("Level 1", "Level 2", "Level 3")
@@ -3293,6 +3345,201 @@ class TempTamerTests(unittest.TestCase):
                 supported_fan_modes=supported_fan_modes,
             ),
             "Level 1",
+        )
+
+    def test_fan_speed_level_doubles_when_three_or_more_zones_are_open(self):
+        supported_fan_modes = ("Level 1", "Level 2", "Level 3")
+
+        self.assertEqual(
+            DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"].fan_speed_level(
+                1.0,
+                3,
+                current_speed_level=1,
+            ),
+            2,
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.0),
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 2",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=4.1),
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 3",
+        )
+
+    def test_night_comfort_mode_uses_quieter_fan_thresholds(self):
+        night_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_NIGHT]
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=4.1),
+                comfort_mode=night_mode,
+            ),
+            "low",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=6.1),
+                comfort_mode=night_mode,
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "medium",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=2.9),
+                comfort_mode=night_mode,
+            ),
+            "low",
+        )
+
+    def test_dispatch_plan_uses_selected_comfort_mode_fan_thresholds(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_NIGHT,
+                        "sensor.office_average_temperature": "12.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("16.0"),
+            )
+        )
+        demand = EquipmentDemand(
+            heat_requested=True,
+            requested_by_zones=("office",),
+            max_temperature_deficit=4.1,
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(plan.fan_mode, "low")
+
+    def test_dispatch_plan_uses_start_fan_threshold_when_comfort_mode_changes(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                        "sensor.office_average_temperature": "17.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("18.0"),
+            )
+        )
+        demand = EquipmentDemand(
+            heat_requested=True,
+            requested_by_zones=("office",),
+            max_temperature_deficit=1.6,
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            comfort_mode_changed=True,
+        )
+
+        self.assertEqual(plan.fan_mode, "medium")
+
+    def test_dispatch_plan_powerday_without_free_power_uses_default_fan_thresholds(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                        "sensor.office_average_temperature": "17.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("18.0"),
+            )
+        )
+        demand = EquipmentDemand(
+            heat_requested=True,
+            requested_by_zones=("office",),
+            max_temperature_deficit=2.6,
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertEqual(plan.fan_mode, "low")
+
+    def test_power_comfort_mode_uses_more_aggressive_fan_levels_when_power_is_free(self):
+        power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=2.6),
+                comfort_mode=power_mode,
+                free_power_available=True,
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=2.6),
+                comfort_mode=power_mode,
+                free_power_available=False,
+            ),
+            "low",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "off",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.6),
+                comfort_mode=power_mode,
+                free_power_available=True,
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "off",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.6),
+            ),
+            "low",
         )
 
 

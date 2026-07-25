@@ -202,6 +202,9 @@ def build_snapshot(
     pending_switch_states = pending_switch_states or {}
     raw_mode = reader.get_state(config.comfort_mode_entity)
     comfort_mode = _resolve_comfort_mode(raw_mode, config)
+    comfort_mode_behavior = config.comfort_modes[comfort_mode]
+    free_power_is_available = getattr(comfort_mode_behavior, "free_power_is_available", None)
+    free_power_available = free_power_is_available(reader) if callable(free_power_is_available) else False
     raw_hvac_mode = reader.get_state(config.hvac_mode_entity)
     selected_hvac_mode = str(raw_hvac_mode) if raw_hvac_mode in VALID_HVAC_MODES else CONTROL_HVAC_MODE_HEAT
 
@@ -306,8 +309,10 @@ def build_snapshot(
 
     return DemandSnapshot(
         comfort_mode=comfort_mode,
+        comfort_mode_behavior=comfort_mode_behavior,
         selected_hvac_mode=selected_hvac_mode,
         inlet_temp=inlet_temp,
+        free_power_available=free_power_available,
         zones=zones,
         heat_calling_zones=heat_calling,
         continue_heating_zones=continue_heating,

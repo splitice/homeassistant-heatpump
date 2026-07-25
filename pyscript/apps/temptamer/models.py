@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .comfort_modes import ComfortMode
+from .comfort_modes import ComfortMode, DefaultComfortMode
 
 
 @dataclass(frozen=True)
@@ -57,8 +57,10 @@ class ZoneRuntimeState:
 @dataclass(frozen=True)
 class DemandSnapshot:
     comfort_mode: str
+    comfort_mode_behavior: DefaultComfortMode
     selected_hvac_mode: str
     inlet_temp: float
+    free_power_available: bool
     zones: dict[str, ZoneRuntimeState]
     heat_calling_zones: tuple[str, ...]
     continue_heating_zones: tuple[str, ...]

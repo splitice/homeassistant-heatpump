@@ -13,7 +13,7 @@ from .constants import (
     SCHEME_NIGHT,
     SCHEME_OFF,
 )
-from .comfort_modes import DefaultComfortMode, PowerComfortMode
+from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
 GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
@@ -126,7 +126,7 @@ DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
 
 DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_OFF: DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING),
-    COMFORT_MODE_NIGHT: DefaultComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING),
+    COMFORT_MODE_NIGHT: NightComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING),
     COMFORT_MODE_DAY: DefaultComfortMode(name=COMFORT_MODE_DAY, zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING),
     COMFORT_MODE_OFFICE: DefaultComfortMode(name=COMFORT_MODE_OFFICE, zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING),
     COMFORT_MODE_POWER_DAY: PowerComfortMode(

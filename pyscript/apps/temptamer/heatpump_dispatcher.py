@@ -7,13 +7,13 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from .comfort_modes import DefaultComfortMode
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_OFF,
     CONTROL_HVAC_MODE_OFF,
     FAN_LOW,
     FAN_MEDIUM,
-    HEAT_START_MEDIUM_FAN_DIFFERENTIAL,
     HVAC_COOL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
@@ -37,10 +37,8 @@ from .constants import (
     INITIAL_IDLE_HEAT_BLEND_FACTOR,
     INITIAL_IDLE_HEAT_GAP_THRESHOLD,
     MIN_IDLE_SECONDS,
-    LOW_TO_MEDIUM_FAN_DIFFERENTIAL,
     LOGGER_NAME,
     MAX_HEAT_SETPOINT,
-    MEDIUM_TO_LOW_FAN_DIFFERENTIAL,
     MIN_HEAT_SETPOINT,
 )
 from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig, ZoneRuntimeState
@@ -51,6 +49,7 @@ LOGGER = logging.getLogger(LOGGER_NAME)
 IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7, -11)
 IDLE_HEAT_UNWIND_LADDER = (-11, -7, -6, -5, -4, -3, -2, -1)
 LEVEL_FAN_MODE_PATTERN = re.compile(r"^level\s+([1-9]\d*)$", re.IGNORECASE)
+DEFAULT_FAN_COMFORT_MODE = DefaultComfortMode(name="default", zone_schemes={})
 
 
 class ServiceController(Protocol):
@@ -687,28 +686,28 @@ def _supported_named_fan_mode(logical_fan_mode: str, supported_fan_modes: Iterab
     return None
 
 
-def _actual_fan_mode(logical_fan_mode: str, supported_fan_modes: Iterable[object] | None) -> str:
+def _actual_fan_mode_for_level(fan_speed_level: int, supported_fan_modes: Iterable[object] | None) -> str:
+    selected_level = max(1, int(fan_speed_level))
     level_fan_modes = _supported_level_fan_modes(supported_fan_modes)
     if level_fan_modes:
-        if logical_fan_mode == FAN_LOW:
-            return level_fan_modes[0]
-        if logical_fan_mode == FAN_MEDIUM:
-            return level_fan_modes[min(1, len(level_fan_modes) - 1)]
+        return level_fan_modes[min(selected_level - 1, len(level_fan_modes) - 1)]
 
+    logical_fan_mode = FAN_LOW if selected_level <= 1 else FAN_MEDIUM
     supported_named_mode = _supported_named_fan_mode(logical_fan_mode, supported_fan_modes)
     return supported_named_mode or logical_fan_mode
 
 
-def _canonical_fan_mode(fan_mode: str | None) -> str:
+def _current_fan_speed_level(fan_mode: str | None) -> int | None:
     normalized_fan_mode = (fan_mode or "").strip().lower()
-    if normalized_fan_mode in {FAN_LOW, FAN_MEDIUM}:
-        return normalized_fan_mode
+    if normalized_fan_mode == FAN_LOW:
+        return 1
+    if normalized_fan_mode == FAN_MEDIUM:
+        return 2
 
     match = LEVEL_FAN_MODE_PATTERN.match((fan_mode or "").strip())
     if match is None:
-        return normalized_fan_mode
-    level_number = int(match.group(1))
-    return FAN_LOW if level_number <= 1 else FAN_MEDIUM
+        return None
+    return int(match.group(1))
 
 
 def resolve_fan_mode(
@@ -716,44 +715,34 @@ def resolve_fan_mode(
     current_hvac_mode: str | None,
     demand: EquipmentDemand,
     *,
+    comfort_mode: DefaultComfortMode | None = None,
+    comfort_mode_changed: bool = False,
+    free_power_available: bool = False,
+    open_zone_count: int = 1,
     supported_fan_modes: Iterable[object] | None = None,
 ) -> str | None:
     if demand.fan_only_requested:
-        return _actual_fan_mode(FAN_LOW, supported_fan_modes)
+        return _actual_fan_mode_for_level(1, supported_fan_modes)
 
     if not (demand.heat_requested or demand.maintain_heat_mode or demand.cool_requested or demand.maintain_cool_mode):
         return None
 
-    current_fan = _canonical_fan_mode(current_fan_mode)
-    differential = demand.max_temperature_deficit
+    current_speed_level = _current_fan_speed_level(current_fan_mode)
+    comfort_mode_behavior = comfort_mode or DEFAULT_FAN_COMFORT_MODE
     currently_heating = (current_hvac_mode or "").lower() == HVAC_HEAT
     currently_cooling = (current_hvac_mode or "").lower() == HVAC_COOL
+    cooling = demand.cool_requested or demand.maintain_cool_mode
+    currently_active = currently_cooling if cooling else currently_heating
+    starting = comfort_mode_changed or not currently_active
 
-    if demand.cool_requested or demand.maintain_cool_mode:
-        if not currently_cooling:
-            logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-        if current_fan == FAN_MEDIUM:
-            logical_fan_mode = FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
-            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-        if current_fan == FAN_LOW:
-            logical_fan_mode = FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-            return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-        logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-
-    if not currently_heating:
-        logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-
-    if current_fan == FAN_MEDIUM:
-        logical_fan_mode = FAN_LOW if differential < MEDIUM_TO_LOW_FAN_DIFFERENTIAL else FAN_MEDIUM
-        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-    if current_fan == FAN_LOW:
-        logical_fan_mode = FAN_MEDIUM if differential > LOW_TO_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-        return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
-    logical_fan_mode = FAN_MEDIUM if differential > HEAT_START_MEDIUM_FAN_DIFFERENTIAL else FAN_LOW
-    return _actual_fan_mode(logical_fan_mode, supported_fan_modes)
+    fan_speed_level = comfort_mode_behavior.fan_speed_level(
+        demand.max_temperature_deficit,
+        open_zone_count,
+        current_speed_level=current_speed_level,
+        starting=starting,
+        free_power_available=free_power_available,
+    )
+    return _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes)
 
 
 def build_dispatch_plan(
@@ -765,6 +754,7 @@ def build_dispatch_plan(
     current_fan_mode: str | None,
     current_setpoint: object | None = None,
     target_temp_step: object | None = 1.0,
+    comfort_mode_changed: bool = False,
     idle_started_at: datetime | None = None,
     idle_heat_step: int | None = None,
     idle_heat_step_changed_at: datetime | None = None,
@@ -795,6 +785,10 @@ def build_dispatch_plan(
                 current_fan_mode,
                 current_hvac_mode,
                 demand,
+                comfort_mode_changed=comfort_mode_changed,
+                comfort_mode=snapshot.comfort_mode_behavior,
+                free_power_available=snapshot.free_power_available,
+                open_zone_count=len(predicted_open_zones),
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
@@ -824,7 +818,7 @@ def build_dispatch_plan(
             return DispatchPlan(
                 turn_off=False,
                 hvac_mode=HVAC_FAN_ONLY,
-                fan_mode=_actual_fan_mode(FAN_LOW, supported_fan_modes),
+                fan_mode=_actual_fan_mode_for_level(1, supported_fan_modes),
                 requested_by_zones=demand.requested_by_zones,
                 open_zones=predicted_open_zones,
                 reason="maintain_heat: " + demand.reason,
@@ -871,6 +865,10 @@ def build_dispatch_plan(
                 current_fan_mode,
                 current_hvac_mode,
                 demand,
+                comfort_mode_changed=comfort_mode_changed,
+                comfort_mode=snapshot.comfort_mode_behavior,
+                free_power_available=snapshot.free_power_available,
+                open_zone_count=len(predicted_open_zones),
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=selected_setpoint,
@@ -887,6 +885,10 @@ def build_dispatch_plan(
                 current_fan_mode,
                 current_hvac_mode,
                 demand,
+                comfort_mode_changed=comfort_mode_changed,
+                comfort_mode=snapshot.comfort_mode_behavior,
+                free_power_available=snapshot.free_power_available,
+                open_zone_count=len(predicted_open_zones),
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
@@ -911,6 +913,10 @@ def build_dispatch_plan(
                 current_fan_mode,
                 current_hvac_mode,
                 demand,
+                comfort_mode_changed=comfort_mode_changed,
+                comfort_mode=snapshot.comfort_mode_behavior,
+                free_power_available=snapshot.free_power_available,
+                open_zone_count=len(predicted_open_zones),
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
