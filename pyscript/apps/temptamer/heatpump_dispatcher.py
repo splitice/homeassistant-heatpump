@@ -745,6 +745,22 @@ def resolve_fan_mode(
     return _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes)
 
 
+def _reported_open_zone_count(snapshot: DemandSnapshot) -> int:
+    count = 0
+    for zone in snapshot.zones.values():
+        if zone.switch_is_on:
+            count += 1
+    return count
+
+
+def _resolved_idle_hvac_mode(current_mode: str, operation_mode: str | None) -> str | None:
+    if operation_mode in {HVAC_HEAT, HVAC_COOL} and current_mode in {HVAC_HEAT, HVAC_COOL}:
+        return operation_mode
+    if current_mode in {HVAC_HEAT, HVAC_COOL}:
+        return current_mode
+    return None
+
+
 def build_dispatch_plan(
     snapshot: DemandSnapshot,
     demand: EquipmentDemand,
@@ -754,6 +770,7 @@ def build_dispatch_plan(
     current_fan_mode: str | None,
     current_setpoint: object | None = None,
     target_temp_step: object | None = 1.0,
+    operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
     idle_started_at: datetime | None = None,
     idle_heat_step: int | None = None,
@@ -777,6 +794,8 @@ def build_dispatch_plan(
     ):
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="no zones open for safe dispatch")
 
+    reported_open_zone_count = _reported_open_zone_count(snapshot)
+
     if demand.fan_only_requested:
         return DispatchPlan(
             turn_off=False,
@@ -788,7 +807,7 @@ def build_dispatch_plan(
                 comfort_mode_changed=comfort_mode_changed,
                 comfort_mode=snapshot.comfort_mode_behavior,
                 free_power_available=snapshot.free_power_available,
-                open_zone_count=len(predicted_open_zones),
+                open_zone_count=reported_open_zone_count,
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
@@ -868,7 +887,7 @@ def build_dispatch_plan(
                 comfort_mode_changed=comfort_mode_changed,
                 comfort_mode=snapshot.comfort_mode_behavior,
                 free_power_available=snapshot.free_power_available,
-                open_zone_count=len(predicted_open_zones),
+                open_zone_count=reported_open_zone_count,
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=selected_setpoint,
@@ -888,7 +907,7 @@ def build_dispatch_plan(
                 comfort_mode_changed=comfort_mode_changed,
                 comfort_mode=snapshot.comfort_mode_behavior,
                 free_power_available=snapshot.free_power_available,
-                open_zone_count=len(predicted_open_zones),
+                open_zone_count=reported_open_zone_count,
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
@@ -916,7 +935,7 @@ def build_dispatch_plan(
                 comfort_mode_changed=comfort_mode_changed,
                 comfort_mode=snapshot.comfort_mode_behavior,
                 free_power_available=snapshot.free_power_available,
-                open_zone_count=len(predicted_open_zones),
+                open_zone_count=reported_open_zone_count,
                 supported_fan_modes=supported_fan_modes,
             ),
             setpoint=_requested_setpoint(
@@ -932,23 +951,28 @@ def build_dispatch_plan(
             open_zones=predicted_open_zones,
             reason=demand.reason,
         )
-      
+
     current_mode = (current_hvac_mode or "").lower()
-    if current_mode in {HVAC_HEAT, HVAC_COOL}:
+    idle_hvac_mode = _resolved_idle_hvac_mode(
+        current_mode=current_mode,
+        operation_mode=operation_mode,
+    )
+    if idle_hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         normalized_now = _normalize_timestamp(now)
         normalized_idle_started_at = _normalize_timestamp(idle_started_at)
         if (
-            normalized_now is not None
+            current_mode == idle_hvac_mode
+            and normalized_now is not None
             and normalized_idle_started_at is not None
             and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
         ):
             return DispatchPlan(
                 turn_off=True,
-                idle_shutdown=current_mode == HVAC_HEAT,
+                idle_shutdown=idle_hvac_mode == HVAC_HEAT,
                 open_zones=predicted_open_zones,
                 reason=demand.reason,
             )
-        if current_mode == HVAC_HEAT:
+        if idle_hvac_mode == HVAC_HEAT:
             idle_setpoint, resolved_idle_heat_step, idle_heat_step_changed, minimum_setpoint_reached = _requested_idle_heat_setpoint(
                 snapshot,
                 predicted_open_zones,
@@ -979,10 +1003,10 @@ def build_dispatch_plan(
             idle_heat_step_changed = False
         return DispatchPlan(
             idle=True,
-            hvac_mode=current_mode,
+            hvac_mode=idle_hvac_mode,
             setpoint=idle_setpoint,
-            idle_heat_step=resolved_idle_heat_step if current_mode == HVAC_HEAT else None,
-            idle_heat_step_changed=idle_heat_step_changed if current_mode == HVAC_HEAT else False,
+            idle_heat_step=resolved_idle_heat_step if idle_hvac_mode == HVAC_HEAT else None,
+            idle_heat_step_changed=idle_heat_step_changed if idle_hvac_mode == HVAC_HEAT else False,
             open_zones=predicted_open_zones,
             reason="idle: " + demand.reason,
         )

@@ -1504,6 +1504,72 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.setpoint, 17)
 
+    def test_heat_idle_switches_stale_cooling_hvac_mode_to_heat(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Heat",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "19.0",
+                        "sensor.average_bed1_2_zone_temp": "18.0",
+                        "sensor.average_bed3_4_zone_temp": "18.0",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                ),
+                base_attr_map("23.0", temperature="17.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("dining",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("dining",),
+            current_hvac_mode="cool",
+            current_fan_mode="Level 1",
+            current_setpoint="17.0",
+            operation_mode=HVAC_HEAT,
+        )
+
+        self.assertEqual(demand.reason, "all enabled zones are at or above continue-until threshold")
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.hvac_mode, "heat")
+        self.assertEqual(plan.setpoint, 17)
+
+    def test_heat_idle_does_not_start_from_off_without_heat_demand(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Heat",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "22.5",
+                        "sensor.average_dining_zone_temp": "19.0",
+                        "sensor.average_bed1_2_zone_temp": "18.0",
+                        "sensor.average_bed3_4_zone_temp": "18.0",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                ),
+                base_attr_map("23.0", temperature="17.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("dining",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("dining",),
+            current_hvac_mode="off",
+            current_fan_mode="Level 1",
+            current_setpoint="17.0",
+            operation_mode=HVAC_HEAT,
+        )
+
+        self.assertTrue(plan.turn_off)
+        self.assertFalse(plan.idle)
+
     def test_initial_heating_idle_with_large_stale_target_clamps_to_midpoint(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -3416,6 +3482,41 @@ class TempTamerTests(unittest.TestCase):
             ),
             "Level 3",
         )
+
+    def test_dispatch_plan_fan_multiplier_uses_reported_open_zones_not_new_predictions(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "sensor.office_average_temperature": "21.2",
+                        "sensor.average_dining_zone_temp": "19.0",
+                        "sensor.average_bed1_2_zone_temp": "18.9",
+                        "sensor.average_bed3_4_zone_temp": "18.2",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    }
+                ),
+                base_attr_map("23.0"),
+            )
+        )
+        demand = EquipmentDemand(
+            cool_requested=True,
+            requested_by_zones=("bedroom_1_2",),
+            max_temperature_deficit=2.9,
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("bedroom_1_2", "bedroom_3_4", "dining", "office"),
+            current_hvac_mode="off",
+            current_fan_mode="Level 1",
+            supported_fan_modes=("Level 1", "Level 2", "Level 3", "Level 4", "Level 5"),
+        )
+
+        self.assertEqual(plan.open_zones, ("bedroom_1_2", "bedroom_3_4", "dining", "office"))
+        self.assertEqual(plan.fan_mode, "Level 2")
 
     def test_night_comfort_mode_uses_quieter_fan_thresholds(self):
         night_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_NIGHT]

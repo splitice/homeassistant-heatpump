@@ -417,6 +417,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
         current_setpoint=current_setpoint,
         target_temp_step=target_temp_step,
+        operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
         idle_started_at=RUNTIME_STATE["idle_started_at"],
         idle_heat_step=RUNTIME_STATE["idle_heat_step"],

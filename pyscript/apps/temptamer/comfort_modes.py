@@ -153,7 +153,8 @@ class PowerComfortMode(DefaultComfortMode):
         free_power_available: bool = False,
     ) -> int:
         if not free_power_available:
-            return super().fan_speed_level(
+            return DefaultComfortMode.fan_speed_level(
+                self,
                 temperature_differential,
                 open_zone_count,
                 current_speed_level=current_speed_level,
