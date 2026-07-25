@@ -206,6 +206,19 @@ def _requested_maintain_heat_raw(
     return snapshot.inlet_temp - _idle_heat_delta_for_step(selected_step), selected_step
 
 
+def _requested_active_heat_raw(
+    snapshot: DemandSnapshot,
+    zone: ZoneRuntimeState,
+    target_temp_step: object | None,
+) -> float:
+    minimum_room_target = zone.scheme.enable_outside
+    inlet_offset_target = snapshot.inlet_temp + zone.setpoint_delta_from_inlet
+    room_target = min(minimum_room_target, inlet_offset_target)
+    room_deficit = max(0.0, zone.scheme.enable_outside - zone.current_temp)
+    boost_delta = max(_target_temp_step_value(target_temp_step), room_deficit)
+    return max(room_target, snapshot.inlet_temp + boost_delta)
+
+
 def _requested_setpoint_raw(
     snapshot: DemandSnapshot,
     demand: EquipmentDemand,
@@ -228,9 +241,7 @@ def _requested_setpoint_raw(
 
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
-        minimum_room_target = zone.scheme.enable_outside
-        inlet_offset_target = snapshot.inlet_temp + zone.setpoint_delta_from_inlet
-        return min(minimum_room_target, inlet_offset_target)
+        return _requested_active_heat_raw(snapshot, zone, target_temp_step)
 
     if demand.maintain_heat_mode:
         primary_zone = snapshot.zones[demand.requested_by_zones[0]] if demand.requested_by_zones else None
@@ -297,10 +308,12 @@ def _requested_setpoint(
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f room_temp=%.1f deficit=%.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             zone.scheme.enable_outside,
+            zone.current_temp,
+            max(0.0, zone.scheme.enable_outside - zone.current_temp),
             raw_requested_setpoint,
             normalized_setpoint,
         )

@@ -132,6 +132,7 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_POWER_DAY: PowerComfortMode(
         name=COMFORT_MODE_POWER_DAY,
         zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+        trigger_entity_ids=(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,),
         power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     ),
 }

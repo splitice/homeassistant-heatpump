@@ -881,10 +881,10 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.requested_by_zones, ("office",))
-        self.assertEqual(plan.setpoint, 17)
-        self.assertEqual(plan.fan_mode, "low")
+        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.fan_mode, "medium")
 
-    def test_non_office_heat_request_uses_zone_setpoint_delta_from_inlet_and_rounds_down(self):
+    def test_non_office_heat_request_stays_above_inlet_and_rounds_down(self):
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -915,7 +915,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("dining",))
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertEqual(plan.requested_by_zones, ("dining",))
-        self.assertEqual(plan.setpoint, 17)
+        self.assertEqual(plan.setpoint, 20)
 
     def test_heat_request_uses_half_degree_target_temp_step(self):
         snapshot = build_behavior_snapshot(
@@ -947,7 +947,41 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertTrue(demand.heat_requested)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 17.5)
+        self.assertEqual(plan.setpoint, 22.5)
+
+    def test_heat_request_raises_setpoint_above_hot_inlet_for_powerday_heat_soak(self):
+        snapshot = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                        "sensor.office_average_temperature": "15.8",
+                        "sensor.average_dining_zone_temp": "15.4",
+                        "sensor.average_bed1_2_zone_temp": "15.6",
+                        "sensor.average_bed3_4_zone_temp": "15.3",
+                        "switch.wt32_hpctrl_e8dbd0_bed_12": "on",
+                    }
+                ),
+                base_attr_map("21.5", target_temp_step=0.5),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("bedroom_1_2",), operation_mode=HVAC_HEAT)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("bedroom_1_2",),
+            current_hvac_mode="heat",
+            current_fan_mode="Level 1",
+            target_temp_step=0.5,
+        )
+
+        self.assertTrue(demand.heat_requested)
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(plan.hvac_mode, "heat")
+        self.assertGreater(plan.setpoint, snapshot.inlet_temp)
+        self.assertEqual(plan.setpoint, 24.5)
 
     def test_equipment_demand_excludes_guarded_min_sensor_heat_request(self):
         snapshot = build_behavior_snapshot(
@@ -1030,7 +1064,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "SETPOINT: inlet_temp=14.0 zone=office enable_outside=20.0" in message
-                and "raw=12.0" in message
+                and "raw=17.0" in message
                 and "normalized=17" in message
                 for message in captured.output
             )
@@ -2478,7 +2512,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertTrue(demand.heat_requested)
         self.assertEqual(plan.hvac_mode, "heat")
-        self.assertEqual(plan.setpoint, 17)
+        self.assertEqual(plan.setpoint, 19)
 
     def test_idle_shutdown_runtime_state_is_captured_and_cleared_on_restart(self):
         now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -2733,7 +2767,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(demand.requested_by_zones, ("office", "dining"))
         self.assertEqual(plan.requested_by_zones, ("office", "dining"))
-        self.assertEqual(plan.setpoint, 17)
+        self.assertEqual(plan.setpoint, 19)
 
     def test_heatcool_mode_holds_current_mode_during_antiflap_window(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
@@ -2881,7 +2915,14 @@ class TempTamerTests(unittest.TestCase):
                     blocking=True,
                     entity_id=TEST_CLIMATE_ENTITY,
                     fan_mode="Level 2",
-                )
+                ),
+                call(
+                    "climate",
+                    "set_temperature",
+                    blocking=True,
+                    entity_id=TEST_CLIMATE_ENTITY,
+                    temperature=24,
+                ),
             ],
         )
 
@@ -3217,7 +3258,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "medium",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.9),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.2),
             ),
             "low",
         )
@@ -3239,7 +3280,7 @@ class TempTamerTests(unittest.TestCase):
             resolve_fan_mode(
                 "Level 2",
                 "heat",
-                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.9),
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.2),
                 supported_fan_modes=supported_fan_modes,
             ),
             "Level 1",

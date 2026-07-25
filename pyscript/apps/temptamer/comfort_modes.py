@@ -15,10 +15,6 @@ class StateReaderLike(Protocol):
 class ComfortMode:
     name: str
 
-    @property
-    def trigger_entity_ids(self) -> tuple[str, ...]:
-        return ()
-
     def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
         raise NotImplementedError
 
@@ -26,6 +22,7 @@ class ComfortMode:
 @dataclass(frozen=True)
 class DefaultComfortMode(ComfortMode):
     zone_schemes: Mapping[str, str]
+    trigger_entity_ids: tuple[str, ...] = ()
 
     def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
         return self.zone_schemes.get(zone_key, SCHEME_OFF)
@@ -45,17 +42,13 @@ class DefaultComfortMode(ComfortMode):
 
 @dataclass(frozen=True)
 class PowerComfortMode(DefaultComfortMode):
-    power_price_entity_id: str
+    power_price_entity_id: str = ""
     free_power_state: str = "0"
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
     heat_soak_scheme: str = SCHEME_DAY_LIVING
 
-    @property
-    def trigger_entity_ids(self) -> tuple[str, ...]:
-        return (self.power_price_entity_id,)
-
     def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
-        scheme_name = super().scheme_for_zone(zone_key, reader)
+        scheme_name = self.zone_schemes.get(zone_key, SCHEME_OFF)
         if scheme_name in self.heat_soak_source_schemes and self._free_power_is_available(reader):
             return self.heat_soak_scheme
         return scheme_name
