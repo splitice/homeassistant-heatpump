@@ -61,6 +61,8 @@ class DemandSnapshot:
     selected_hvac_mode: str
     inlet_temp: float
     free_power_available: bool
+    heat_sink_available: bool
+    free_power_later_available: bool
     zones: dict[str, ZoneRuntimeState]
     heat_calling_zones: tuple[str, ...]
     continue_heating_zones: tuple[str, ...]

@@ -4,9 +4,24 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .config import DEFAULT_SYSTEM_CONFIG, MODE_TRIGGER_ENTITIES
+from .config import (
+    DEFAULT_SYSTEM_CONFIG,
+    EAGLE_200_POWER_DEMAND_SENSOR,
+    GOODWE_BATTERY_REMAINING_SENSOR,
+    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+    GOODWE_PV_POWER_SENSOR,
+    MODE_TRIGGER_ENTITIES,
+    POWERDAY_BATTERY_THRESHOLD,
+    POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
+    POWERDAY_EXPORT_POWER_THRESHOLD,
+    POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
+    POWERDAY_FREE_POWER_PV_POWER_THRESHOLD,
+    POWERDAY_FREE_POWER_START_TIME,
+    POWERDAY_HEAT_SINK_MIN_SECONDS,
+)
 from .constants import (
     APP_NAME,
+    COMFORT_MODE_POWER_DAY,
     CONTROL_HVAC_MODE_MANUAL,
     CONTROL_INTERVAL_SECONDS,
     HVAC_COOL,
@@ -16,7 +31,7 @@ from .constants import (
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
 from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan, resolve_idle_started_at
-from .state_reader import build_snapshot, is_switch_on
+from .state_reader import build_snapshot, is_switch_on, parse_float
 from .zone_control import describe_zone_predictions, resolve_zone_actions
 
 USING_PYTHON_IMPORTS = __name__.startswith("pyscript.") or __name__ == "__main__"
@@ -144,6 +159,18 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
     "last_trigger": None,
+    "powerday_export_power_samples": [],
+    "powerday_export_average": None,
+    "powerday_battery_remaining": None,
+    "powerday_heat_sink_started_at": None,
+    "powerday_heat_sink_hold_until": None,
+    "powerday_heat_sink_active": False,
+    "powerday_heat_sink_reason": None,
+    "powerday_pv_power_samples": [],
+    "powerday_pv_power_average": None,
+    "powerday_free_power_later_started_at": None,
+    "powerday_free_power_later_active": False,
+    "powerday_free_power_later_reason": None,
 }
 
 
@@ -250,6 +277,18 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
+            "powerday_export_average": RUNTIME_STATE.get("powerday_export_average"),
+            "powerday_battery_remaining": RUNTIME_STATE.get("powerday_battery_remaining"),
+            "powerday_heat_sink_started_at": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_started_at")),
+            "powerday_heat_sink_hold_until": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_hold_until")),
+            "powerday_heat_sink_active": RUNTIME_STATE.get("powerday_heat_sink_active"),
+            "powerday_heat_sink_reason": RUNTIME_STATE.get("powerday_heat_sink_reason"),
+            "powerday_pv_power_average": RUNTIME_STATE.get("powerday_pv_power_average"),
+            "powerday_free_power_later_started_at": _isoformat(
+                RUNTIME_STATE.get("powerday_free_power_later_started_at")
+            ),
+            "powerday_free_power_later_active": RUNTIME_STATE.get("powerday_free_power_later_active"),
+            "powerday_free_power_later_reason": RUNTIME_STATE.get("powerday_free_power_later_reason"),
             "last_error": RUNTIME_STATE["last_error"],
         },
     )
@@ -320,6 +359,348 @@ def _update_idle_shutdown_runtime_state(plan, now: datetime, *, current_hvac_mod
         _clear_idle_shutdown_runtime_state()
 
 
+def _normalize_runtime_datetime(value: object | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _is_free_power_price_state(value: object | None) -> bool:
+    value_text = str(value).strip()
+    if value_text == "0":
+        return True
+
+    parsed_value = parse_float(value)
+    return parsed_value is not None and parsed_value == 0.0
+
+
+def _runtime_numeric_samples(sample_key: str) -> list[tuple[datetime, float]]:
+    samples = RUNTIME_STATE.setdefault(sample_key, [])
+    if not isinstance(samples, list):
+        samples = []
+        RUNTIME_STATE[sample_key] = samples
+    return samples
+
+
+def _normalized_runtime_numeric_samples(sample_key: str, now: datetime) -> list[tuple[datetime, float]]:
+    normalized_samples: list[tuple[datetime, float]] = []
+    for sample in _runtime_numeric_samples(sample_key):
+        if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+            continue
+        sample_time = _normalize_runtime_datetime(sample[0])
+        sample_value = parse_float(sample[1])
+        if sample_time is None or sample_value is None or sample_time > now:
+            continue
+        normalized_samples.append((sample_time, sample_value))
+
+    normalized_samples.sort(key=lambda sample: sample[0])
+    return normalized_samples
+
+
+def _prune_runtime_numeric_samples(sample_key: str, now: datetime, window_seconds: int) -> list[tuple[datetime, float]]:
+    window_start = now - timedelta(seconds=window_seconds)
+    previous_sample: tuple[datetime, float] | None = None
+    kept_samples: list[tuple[datetime, float]] = []
+
+    for sample in _normalized_runtime_numeric_samples(sample_key, now):
+        if sample[0] <= window_start:
+            previous_sample = sample
+        else:
+            kept_samples.append(sample)
+
+    if previous_sample is not None:
+        kept_samples.insert(0, previous_sample)
+
+    RUNTIME_STATE[sample_key] = kept_samples
+    return kept_samples
+
+
+def _record_runtime_numeric_sample(
+    sample_key: str,
+    now: datetime,
+    value: float | None,
+    window_seconds: int,
+) -> list[tuple[datetime, float]]:
+    samples = _normalized_runtime_numeric_samples(sample_key, now)
+    if value is not None:
+        if samples and now < samples[-1][0]:
+            samples = []
+        if samples and now == samples[-1][0]:
+            samples[-1] = (now, value)
+        else:
+            samples.append((now, value))
+        RUNTIME_STATE[sample_key] = samples
+
+    return _prune_runtime_numeric_samples(sample_key, now, window_seconds)
+
+
+def _time_weighted_runtime_average(
+    samples: list[tuple[datetime, float]],
+    now: datetime,
+    window_seconds: int,
+) -> float | None:
+    if window_seconds <= 0:
+        return None
+
+    window_start = now - timedelta(seconds=window_seconds)
+    anchor_sample: tuple[datetime, float] | None = None
+    window_samples: list[tuple[datetime, float]] = []
+    for sample_time, sample_value in samples:
+        if sample_time <= window_start:
+            anchor_sample = (sample_time, sample_value)
+        elif sample_time <= now:
+            window_samples.append((sample_time, sample_value))
+
+    if anchor_sample is None:
+        return None
+
+    cursor = window_start
+    current_value = anchor_sample[1]
+    weighted_total = 0.0
+    for sample_time, sample_value in window_samples:
+        if sample_time > cursor:
+            weighted_total += current_value * (sample_time - cursor).total_seconds()
+            cursor = sample_time
+        current_value = sample_value
+
+    if now > cursor:
+        weighted_total += current_value * (now - cursor).total_seconds()
+
+    return weighted_total / window_seconds
+
+
+def _record_powerday_export_power_sample(now: datetime, export_power: float | None) -> list[tuple[datetime, float]]:
+    return _record_runtime_numeric_sample(
+        "powerday_export_power_samples",
+        now,
+        export_power,
+        POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
+    )
+
+
+def _time_weighted_powerday_export_average(samples: list[tuple[datetime, float]], now: datetime) -> float | None:
+    return _time_weighted_runtime_average(samples, now, POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS)
+
+
+def _powerday_eligibility_reason(
+    *,
+    battery_remaining: float | None,
+    export_power: float | None,
+    export_average: float | None,
+) -> str:
+    if battery_remaining is None:
+        return "missing battery remaining"
+    if battery_remaining <= POWERDAY_BATTERY_THRESHOLD:
+        return f"battery {battery_remaining:.1f} <= {POWERDAY_BATTERY_THRESHOLD:.1f}"
+    if export_power is None:
+        return "missing export power"
+    if export_average is None:
+        return f"export average lacks {POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS // 60}-minute coverage"
+    if export_average >= POWERDAY_EXPORT_POWER_THRESHOLD:
+        return f"export average {export_average:.2f} >= {POWERDAY_EXPORT_POWER_THRESHOLD:.2f}"
+    return f"battery {battery_remaining:.1f} and export average {export_average:.2f}"
+
+
+def _set_powerday_heat_sink_runtime_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    hold_until: datetime | None,
+    reason: str,
+) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("powerday_heat_sink_active"))
+    RUNTIME_STATE["powerday_heat_sink_started_at"] = started_at
+    RUNTIME_STATE["powerday_heat_sink_hold_until"] = hold_until
+    RUNTIME_STATE["powerday_heat_sink_active"] = active
+    RUNTIME_STATE["powerday_heat_sink_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "POWERDAY: export_heat_sink_active=%s battery=%s export_average=%s hold_until=%s reason=%s",
+            active,
+            RUNTIME_STATE.get("powerday_battery_remaining"),
+            RUNTIME_STATE.get("powerday_export_average"),
+            _isoformat(hold_until),
+            reason,
+        )
+
+    return active
+
+
+def _update_powerday_heat_sink_runtime_state(controller: PyscriptController, now: datetime) -> bool:
+    normalized_now = _normalize_runtime_datetime(now) or datetime.now(timezone.utc)
+    export_power = parse_float(controller.get_state(EAGLE_200_POWER_DEMAND_SENSOR))
+    battery_remaining = parse_float(controller.get_state(GOODWE_BATTERY_REMAINING_SENSOR))
+    samples = _record_powerday_export_power_sample(normalized_now, export_power)
+    export_average = _time_weighted_powerday_export_average(samples, normalized_now)
+
+    RUNTIME_STATE["powerday_export_average"] = export_average
+    RUNTIME_STATE["powerday_battery_remaining"] = battery_remaining
+
+    selected_comfort_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity) or "")
+    if selected_comfort_mode != COMFORT_MODE_POWER_DAY:
+        return _set_powerday_heat_sink_runtime_state(
+            active=False,
+            started_at=None,
+            hold_until=None,
+            reason="comfort mode is not PowerDay",
+        )
+
+    if _is_free_power_price_state(controller.get_state(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR)):
+        return _set_powerday_heat_sink_runtime_state(
+            active=False,
+            started_at=None,
+            hold_until=None,
+            reason="free power is already available",
+        )
+
+    eligibility_reason = _powerday_eligibility_reason(
+        battery_remaining=battery_remaining,
+        export_power=export_power,
+        export_average=export_average,
+    )
+    eligible = (
+        battery_remaining is not None
+        and battery_remaining > POWERDAY_BATTERY_THRESHOLD
+        and export_power is not None
+        and export_average is not None
+        and export_average < POWERDAY_EXPORT_POWER_THRESHOLD
+    )
+
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_heat_sink_started_at"))
+    hold_until = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_heat_sink_hold_until"))
+    if eligible:
+        if started_at is None:
+            started_at = normalized_now
+        hold_until = started_at + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS)
+        return _set_powerday_heat_sink_runtime_state(
+            active=True,
+            started_at=started_at,
+            hold_until=hold_until,
+            reason=eligibility_reason,
+        )
+
+    if started_at is not None:
+        hold_until = hold_until or started_at + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS)
+        if normalized_now < hold_until:
+            return _set_powerday_heat_sink_runtime_state(
+                active=True,
+                started_at=started_at,
+                hold_until=hold_until,
+                reason=f"minimum hold until {hold_until.isoformat()}; {eligibility_reason}",
+            )
+
+    return _set_powerday_heat_sink_runtime_state(
+        active=False,
+        started_at=None,
+        hold_until=None,
+        reason=eligibility_reason,
+    )
+
+
+def _record_powerday_pv_power_sample(now: datetime, pv_power: float | None) -> list[tuple[datetime, float]]:
+    return _record_runtime_numeric_sample(
+        "powerday_pv_power_samples",
+        now,
+        pv_power,
+        POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
+    )
+
+
+def _time_weighted_powerday_pv_power_average(samples: list[tuple[datetime, float]], now: datetime) -> float | None:
+    return _time_weighted_runtime_average(samples, now, POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS)
+
+
+def _set_powerday_free_power_later_runtime_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    reason: str,
+) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("powerday_free_power_later_active"))
+    RUNTIME_STATE["powerday_free_power_later_started_at"] = started_at
+    RUNTIME_STATE["powerday_free_power_later_active"] = active
+    RUNTIME_STATE["powerday_free_power_later_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "POWERDAY: free_power_later_active=%s pv_average=%s started_at=%s reason=%s",
+            active,
+            RUNTIME_STATE.get("powerday_pv_power_average"),
+            _isoformat(started_at),
+            reason,
+        )
+
+    return active
+
+
+def _update_powerday_free_power_later_runtime_state(controller: PyscriptController, now: datetime) -> bool:
+    normalized_now = _normalize_runtime_datetime(now) or datetime.now(timezone.utc)
+    pv_power = parse_float(controller.get_state(GOODWE_PV_POWER_SENSOR))
+    samples = _record_powerday_pv_power_sample(normalized_now, pv_power)
+    pv_average = _time_weighted_powerday_pv_power_average(samples, normalized_now)
+    RUNTIME_STATE["powerday_pv_power_average"] = pv_average
+
+    selected_comfort_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity) or "")
+    if selected_comfort_mode != COMFORT_MODE_POWER_DAY:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason="comfort mode is not PowerDay",
+        )
+
+    if not _is_free_power_price_state(controller.get_state(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR)):
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason="free power is not available",
+        )
+
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_free_power_later_started_at"))
+    if started_at is not None:
+        return _set_powerday_free_power_later_runtime_state(
+            active=True,
+            started_at=started_at,
+            reason="already started; holding until free power ends",
+        )
+
+    if normalized_now.time() < POWERDAY_FREE_POWER_START_TIME:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason=f"before free power start {POWERDAY_FREE_POWER_START_TIME.isoformat(timespec='minutes')}",
+        )
+
+    if pv_power is None:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason="missing PV power",
+        )
+
+    if pv_average is None:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason=f"PV average lacks {POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS // 60}-minute coverage",
+        )
+
+    if pv_average <= POWERDAY_FREE_POWER_PV_POWER_THRESHOLD:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason=f"PV average {pv_average:.2f} <= {POWERDAY_FREE_POWER_PV_POWER_THRESHOLD:.2f}",
+        )
+
+    return _set_powerday_free_power_later_runtime_state(
+        active=True,
+        started_at=normalized_now,
+        reason=f"PV average {pv_average:.2f} > {POWERDAY_FREE_POWER_PV_POWER_THRESHOLD:.2f}",
+    )
+
+
 def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None:
     task.unique(CONTROL_PASS_TASK_NAME)
 
@@ -334,12 +715,16 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
     RUNTIME_STATE["last_trigger"] = reason
     _reconcile_pending_zone_state(controller, now)
+    powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
+    powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(controller, now)
 
     snapshot = build_snapshot(
         controller,
         config=DEFAULT_SYSTEM_CONFIG,
         last_switch_changes=RUNTIME_STATE["last_zone_change"],
         pending_switch_states=RUNTIME_STATE["pending_zone_state"],
+        heat_sink_available=powerday_heat_sink_active,
+        free_power_later_available=powerday_free_power_later_active,
         now=now,
     )
 

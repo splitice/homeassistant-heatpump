@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import time
+
 from .constants import (
     COMFORT_MODE_DAY,
     COMFORT_MODE_OFF,
@@ -17,6 +19,16 @@ from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMod
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
 GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
+GOODWE_BATTERY_REMAINING_SENSOR = "sensor.goodwe_actual_battery_remaining"
+GOODWE_PV_POWER_SENSOR = "sensor.goodwe_pv_power"
+EAGLE_200_POWER_DEMAND_SENSOR = "sensor.eagle_200_power_demand"
+POWERDAY_BATTERY_THRESHOLD = 95.0
+POWERDAY_EXPORT_POWER_THRESHOLD = -1.0
+POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS = 10 * 60
+POWERDAY_HEAT_SINK_MIN_SECONDS = 15 * 60
+POWERDAY_FREE_POWER_START_TIME = time(11, 0)
+POWERDAY_FREE_POWER_PV_POWER_THRESHOLD = 6.0
+POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS = 15 * 60
 
 DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
@@ -132,7 +144,12 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_POWER_DAY: PowerComfortMode(
         name=COMFORT_MODE_POWER_DAY,
         zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
-        trigger_entity_ids=(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,),
+        trigger_entity_ids=(
+            GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+            GOODWE_BATTERY_REMAINING_SENSOR,
+            GOODWE_PV_POWER_SENSOR,
+            EAGLE_200_POWER_DEMAND_SENSOR,
+        ),
         power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     ),
 }

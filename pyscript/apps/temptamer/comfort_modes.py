@@ -18,6 +18,8 @@ class ComfortModeSnapshotData:
     selected_hvac_mode: str
     inlet_temp: float
     free_power_available: bool
+    heat_sink_available: bool
+    free_power_later_available: bool = False
     now: datetime | None = None
 
 
@@ -25,7 +27,12 @@ class ComfortModeSnapshotData:
 class ComfortMode:
     name: str
 
-    def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
+    def scheme_for_zone(
+        self,
+        zone_key: str,
+        reader: StateReaderLike,
+        snapshot_data: ComfortModeSnapshotData | None = None,
+    ) -> str:
         raise NotImplementedError
 
     def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
@@ -41,7 +48,12 @@ class DefaultComfortMode(ComfortMode):
     zone_schemes: Mapping[str, str]
     trigger_entity_ids: tuple[str, ...] = ()
 
-    def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
+    def scheme_for_zone(
+        self,
+        zone_key: str,
+        reader: StateReaderLike,
+        snapshot_data: ComfortModeSnapshotData | None = None,
+    ) -> str:
         return self.zone_schemes.get(zone_key, SCHEME_OFF)
 
     def fan_speed_level(
@@ -120,14 +132,22 @@ class PowerComfortMode(DefaultComfortMode):
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
     heat_soak_scheme: str = SCHEME_DAY_LIVING
 
-    def scheme_for_zone(self, zone_key: str, reader: StateReaderLike) -> str:
+    def scheme_for_zone(
+        self,
+        zone_key: str,
+        reader: StateReaderLike,
+        snapshot_data: ComfortModeSnapshotData | None = None,
+    ) -> str:
         scheme_name = self.zone_schemes.get(zone_key, SCHEME_OFF)
-        if scheme_name in self.heat_soak_source_schemes and self._free_power_is_available(reader):
+        heat_sink_available = (
+            snapshot_data.heat_sink_available if snapshot_data is not None else self._free_power_is_available(reader)
+        )
+        if scheme_name in self.heat_soak_source_schemes and heat_sink_available:
             return self.heat_soak_scheme
         return scheme_name
 
     def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
-        if not snapshot_data.free_power_available or zone.scheme.name == SCHEME_OFF:
+        if not snapshot_data.heat_sink_available or zone.scheme.name == SCHEME_OFF:
             return zone
         adjusted_continue_until = zone.scheme.continue_until + self._free_power_heating_supplement(snapshot_data)
         adjusted_scheme = replace(
@@ -139,6 +159,8 @@ class PowerComfortMode(DefaultComfortMode):
         return replace(zone, scheme=adjusted_scheme)
 
     def _free_power_heating_supplement(self, snapshot_data: ComfortModeSnapshotData) -> float:
+        if snapshot_data.free_power_later_available:
+            return self.free_power_later
         if snapshot_data.now is not None and snapshot_data.now.time() > self.free_power_later_start:
             return self.free_power_later
         return self.free_power_initial_suppliment

@@ -150,11 +150,12 @@ def _resolve_comfort_mode_scheme_name(
     config: SystemConfig,
     comfort_mode: str,
     zone_key: str,
+    snapshot_data: ComfortModeSnapshotData,
 ) -> str:
     comfort_mode_behavior = config.comfort_modes[comfort_mode]
     scheme_for_zone = getattr(comfort_mode_behavior, "scheme_for_zone", None)
     if callable(scheme_for_zone):
-        return scheme_for_zone(zone_key, reader)
+        return scheme_for_zone(zone_key, reader, snapshot_data)
     if isinstance(comfort_mode_behavior, Mapping):
         return comfort_mode_behavior.get(zone_key, SCHEME_OFF)
     return SCHEME_OFF
@@ -197,6 +198,8 @@ def build_snapshot(
     config: SystemConfig = DEFAULT_SYSTEM_CONFIG,
     last_switch_changes: Mapping[str, object] | None = None,
     pending_switch_states: Mapping[str, object] | None = None,
+    heat_sink_available: bool = False,
+    free_power_later_available: bool = False,
     now: datetime | None = None,
 ) -> DemandSnapshot:
     last_switch_changes = last_switch_changes or {}
@@ -206,6 +209,8 @@ def build_snapshot(
     comfort_mode_behavior = config.comfort_modes[comfort_mode]
     free_power_is_available = getattr(comfort_mode_behavior, "free_power_is_available", None)
     free_power_available = free_power_is_available(reader) if callable(free_power_is_available) else False
+    resolved_heat_sink_available = free_power_available or bool(heat_sink_available)
+    resolved_free_power_later_available = free_power_available and bool(free_power_later_available)
     raw_hvac_mode = reader.get_state(config.hvac_mode_entity)
     selected_hvac_mode = str(raw_hvac_mode) if raw_hvac_mode in VALID_HVAC_MODES else CONTROL_HVAC_MODE_HEAT
 
@@ -222,6 +227,8 @@ def build_snapshot(
         selected_hvac_mode=selected_hvac_mode,
         inlet_temp=inlet_temp,
         free_power_available=free_power_available,
+        heat_sink_available=resolved_heat_sink_available,
+        free_power_later_available=resolved_free_power_later_available,
         now=now,
     )
 
@@ -235,7 +242,13 @@ def build_snapshot(
             scheme_name = override_mode
         else:
             applied_comfort_mode = comfort_mode
-            scheme_name = _resolve_comfort_mode_scheme_name(reader, config, applied_comfort_mode, zone_key)
+            scheme_name = _resolve_comfort_mode_scheme_name(
+                reader,
+                config,
+                applied_comfort_mode,
+                zone_key,
+                snapshot_data,
+            )
         scheme = config.heat_control_schemes[scheme_name]
         cool_scheme = config.cool_control_schemes[scheme_name]
         temperature_sensor_entity_id = zone.scheme_sensor_entity_ids.get(scheme_name, zone.sensor_entity_id)
@@ -324,6 +337,8 @@ def build_snapshot(
         selected_hvac_mode=selected_hvac_mode,
         inlet_temp=inlet_temp,
         free_power_available=free_power_available,
+        heat_sink_available=resolved_heat_sink_available,
+        free_power_later_available=resolved_free_power_later_available,
         zones=zones,
         heat_calling_zones=heat_calling,
         continue_heating_zones=continue_heating,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock, call
@@ -7,8 +8,14 @@ from unittest.mock import Mock, call
 from pyscript.apps.temptamer.comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode
 from pyscript.apps.temptamer.config import (
     DEFAULT_SYSTEM_CONFIG,
+    EAGLE_200_POWER_DEMAND_SENSOR,
+    GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+    GOODWE_PV_POWER_SENSOR,
     MODE_TRIGGER_ENTITIES,
+    POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
+    POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
+    POWERDAY_HEAT_SINK_MIN_SECONDS,
 )
 from pyscript.apps.temptamer.constants import (
     COMFORT_MODE_NIGHT,
@@ -70,6 +77,9 @@ def base_state_map(**overrides):
         "sensor.average_bed3_4_zone_temp": "18.0",
         "sensor.bathroom_motion_temperature": "18.0",
         GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+        GOODWE_BATTERY_REMAINING_SENSOR: "50",
+        GOODWE_PV_POWER_SENSOR: "0",
+        EAGLE_200_POWER_DEMAND_SENSOR: "0",
         "switch.wt32_hpctrl_e8dbd0_office": "off",
         "switch.wt32_hpctrl_e8dbd0_dining": "off",
         "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
@@ -120,12 +130,22 @@ TEST_SYSTEM_CONFIG = SystemConfig(
 )
 
 
-def build_behavior_snapshot(reader, *, last_switch_changes=None, pending_switch_states=None, now=None):
+def build_behavior_snapshot(
+    reader,
+    *,
+    last_switch_changes=None,
+    pending_switch_states=None,
+    heat_sink_available=False,
+    free_power_later_available=False,
+    now=None,
+):
     return build_snapshot(
         reader,
         config=TEST_SYSTEM_CONFIG,
         last_switch_changes=last_switch_changes,
         pending_switch_states=pending_switch_states,
+        heat_sink_available=heat_sink_available,
+        free_power_later_available=free_power_later_available,
         now=now,
     )
 
@@ -133,8 +153,8 @@ def build_behavior_snapshot(reader, *, last_switch_changes=None, pending_switch_
 class TempTamerTests(unittest.TestCase):
     def setUp(self):
         self.original_state_values = dict(temptamer_main.state._values)
-        self.original_state_attrs = dict(temptamer_main.state._attrs)
-        self.original_runtime_state = dict(temptamer_main.RUNTIME_STATE)
+        self.original_state_attrs = deepcopy(temptamer_main.state._attrs)
+        self.original_runtime_state = deepcopy(temptamer_main.RUNTIME_STATE)
         self.original_service_call = temptamer_main.service.call
 
     def tearDown(self):
@@ -206,6 +226,9 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1), 1)
         self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1, free_power_available=True), 2)
         self.assertIn(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR, MODE_TRIGGER_ENTITIES)
+        self.assertIn(GOODWE_BATTERY_REMAINING_SENSOR, MODE_TRIGGER_ENTITIES)
+        self.assertIn(GOODWE_PV_POWER_SENSOR, MODE_TRIGGER_ENTITIES)
+        self.assertIn(EAGLE_200_POWER_DEMAND_SENSOR, MODE_TRIGGER_ENTITIES)
 
     def test_powerday_uses_office_mapping_when_power_is_not_free(self):
         snapshot = build_behavior_snapshot(
@@ -234,12 +257,13 @@ class TempTamerTests(unittest.TestCase):
             TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].ideal_target,
         )
         self.assertFalse(snapshot.free_power_available)
+        self.assertFalse(snapshot.heat_sink_available)
         self.assertEqual(
             snapshot.comfort_mode_behavior.fan_speed_level(
                 2.6,
                 1,
                 current_speed_level=1,
-                free_power_available=snapshot.free_power_available,
+                free_power_available=snapshot.heat_sink_available,
             ),
             1,
         )
@@ -271,12 +295,13 @@ class TempTamerTests(unittest.TestCase):
             self.assertEqual(snapshot.zones[zone_key].scheme.enable_outside, adjusted_continue_until - 0.75)
             self.assertEqual(snapshot.zones[zone_key].scheme.ideal_target, adjusted_continue_until - 0.5)
         self.assertTrue(snapshot.free_power_available)
+        self.assertTrue(snapshot.heat_sink_available)
         self.assertEqual(
             snapshot.comfort_mode_behavior.fan_speed_level(
                 2.6,
                 1,
                 current_speed_level=1,
-                free_power_available=snapshot.free_power_available,
+                free_power_available=snapshot.heat_sink_available,
             ),
             2,
         )
@@ -301,6 +326,374 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
         self.assertEqual(snapshot.zones["office"].scheme.enable_outside, adjusted_continue_until - 0.75)
         self.assertEqual(snapshot.zones["office"].scheme.ideal_target, adjusted_continue_until - 0.5)
+
+    def test_powerday_uses_later_heat_supplement_early_when_pv_average_is_high(self):
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
+        snapshot = build_behavior_snapshot(
+            reader,
+            free_power_later_available=later_active,
+            now=now,
+        )
+
+        adjusted_continue_until = (
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
+            + power_mode.free_power_later
+        )
+        self.assertTrue(later_active)
+        self.assertTrue(snapshot.free_power_later_available)
+        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
+        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"], 6.5)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"], now)
+
+    def test_powerday_pv_early_later_supplement_does_not_start_before_11am(self):
+        now = datetime(2026, 7, 25, 10, 59, tzinfo=timezone.utc)
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
+        snapshot = build_behavior_snapshot(
+            reader,
+            free_power_later_available=later_active,
+            now=now,
+        )
+
+        adjusted_continue_until = (
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
+            + power_mode.free_power_initial_suppliment
+        )
+        self.assertFalse(later_active)
+        self.assertFalse(snapshot.free_power_later_available)
+        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
+        self.assertIn("before free power start", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+    def test_powerday_pv_early_later_supplement_requires_average_above_threshold(self):
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.0)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.0",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
+
+        self.assertFalse(later_active)
+        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"], 6.0)
+        self.assertIn("PV average 6.00 <= 6.00", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+    def test_powerday_pv_early_later_supplement_requires_full_sample_coverage(self):
+        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [(now - timedelta(minutes=14), 6.5)]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
+
+        self.assertFalse(later_active)
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"])
+        self.assertIn("lacks 15-minute coverage", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+    def test_powerday_pv_early_later_supplement_holds_until_free_power_ends(self):
+        start = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
+            (start - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
+        ]
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_free_power_later_runtime_state(active_reader, start))
+
+        lower_pv_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "0",
+                }
+            )
+        )
+        still_active = temptamer_main._update_powerday_free_power_later_runtime_state(
+            lower_pv_reader,
+            start + timedelta(minutes=10),
+        )
+
+        self.assertTrue(still_active)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"], start)
+        self.assertIn("holding until free power ends", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+        paid_power_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_PV_POWER_SENSOR: "0",
+                }
+            )
+        )
+        cleared = temptamer_main._update_powerday_free_power_later_runtime_state(
+            paid_power_reader,
+            start + timedelta(minutes=20),
+        )
+
+        self.assertFalse(cleared)
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"])
+        self.assertIn("free power is not available", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+    def test_powerday_heat_soaks_when_battery_export_heat_sink_is_active(self):
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            heat_sink_available=True,
+            now=datetime(2026, 7, 25, 12, 59, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(snapshot.free_power_available)
+        self.assertTrue(snapshot.heat_sink_available)
+        self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
+        adjusted_continue_until = (
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
+            + power_mode.free_power_initial_suppliment
+        )
+        self.assertEqual(snapshot.zones["dining"].scheme.continue_until, adjusted_continue_until)
+        self.assertEqual(
+            snapshot.comfort_mode_behavior.fan_speed_level(
+                2.6,
+                1,
+                current_speed_level=1,
+                free_power_available=snapshot.heat_sink_available,
+            ),
+            2,
+        )
+
+    def test_powerday_battery_export_heat_sink_activates_outside_free_period(self):
+        now = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS), -1.2)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.2",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(reader, now)
+        snapshot = build_behavior_snapshot(reader, heat_sink_available=active, now=now)
+
+        self.assertTrue(active)
+        self.assertFalse(snapshot.free_power_available)
+        self.assertTrue(snapshot.heat_sink_available)
+        self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_export_average"], -1.2)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_heat_sink_started_at"], now)
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["powerday_heat_sink_hold_until"],
+            now + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS),
+        )
+
+    def test_powerday_battery_export_heat_sink_requires_battery_above_threshold(self):
+        now = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS), -1.2)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "95",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.2",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(reader, now)
+
+        self.assertFalse(active)
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_heat_sink_started_at"])
+        self.assertIn("battery 95.0 <= 95.0", temptamer_main.RUNTIME_STATE["powerday_heat_sink_reason"])
+
+    def test_powerday_battery_export_heat_sink_requires_export_average_below_threshold(self):
+        now = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [
+            (now - timedelta(seconds=POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS), -1.0)
+        ]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.0",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(reader, now)
+
+        self.assertFalse(active)
+        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_export_average"], -1.0)
+        self.assertIn("export average -1.00 >= -1.00", temptamer_main.RUNTIME_STATE["powerday_heat_sink_reason"])
+
+    def test_powerday_battery_export_heat_sink_requires_full_sample_coverage(self):
+        now = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [(now - timedelta(minutes=9), -1.2)]
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.2",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(reader, now)
+
+        self.assertFalse(active)
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_export_average"])
+        self.assertIn("lacks 10-minute coverage", temptamer_main.RUNTIME_STATE["powerday_heat_sink_reason"])
+
+    def test_powerday_battery_export_heat_sink_holds_for_minimum_duration_when_eligibility_drops(self):
+        start = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [
+            (start - timedelta(seconds=POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS), -1.2)
+        ]
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.2",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_heat_sink_runtime_state(active_reader, start))
+
+        hold_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "unknown",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "unavailable",
+                }
+            )
+        )
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(hold_reader, start + timedelta(minutes=5))
+
+        self.assertTrue(active)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_heat_sink_started_at"], start)
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["powerday_heat_sink_hold_until"],
+            start + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS),
+        )
+        self.assertIn("minimum hold until", temptamer_main.RUNTIME_STATE["powerday_heat_sink_reason"])
+
+    def test_powerday_battery_export_heat_sink_clears_after_minimum_duration_when_eligibility_is_false(self):
+        start = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)
+        temptamer_main.RUNTIME_STATE["powerday_export_power_samples"] = [
+            (start - timedelta(seconds=POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS), -1.2)
+        ]
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "-1.2",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_heat_sink_runtime_state(active_reader, start))
+
+        inactive_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "unknown",
+                    EAGLE_200_POWER_DEMAND_SENSOR: "unavailable",
+                }
+            )
+        )
+        active = temptamer_main._update_powerday_heat_sink_runtime_state(
+            inactive_reader,
+            start + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS),
+        )
+
+        self.assertFalse(active)
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_heat_sink_started_at"])
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_heat_sink_hold_until"])
 
     def test_unrecognized_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
@@ -3638,6 +4031,39 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.fan_mode, "low")
+
+    def test_dispatch_plan_powerday_heat_sink_uses_aggressive_fan_thresholds(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                        "sensor.office_average_temperature": "17.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("18.0"),
+            ),
+            heat_sink_available=True,
+        )
+        demand = EquipmentDemand(
+            heat_requested=True,
+            requested_by_zones=("office",),
+            max_temperature_deficit=2.6,
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertFalse(snapshot.free_power_available)
+        self.assertTrue(snapshot.heat_sink_available)
+        self.assertEqual(plan.fan_mode, "medium")
 
     def test_power_comfort_mode_uses_more_aggressive_fan_levels_when_power_is_free(self):
         power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
