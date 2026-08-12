@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time
 from typing import ClassVar, Protocol
 
@@ -94,6 +94,8 @@ class DefaultComfortMode(ComfortMode):
         else:
             base_level = 2 if temperature_differential > low_to_medium_fan_differential else 1
 
+        if open_zone_count >= 4:
+            return base_level * 3
         if open_zone_count >= 3:
             return base_level * 2
         return base_level
@@ -116,6 +118,27 @@ class NightComfortMode(DefaultComfortMode):
     heat_start_medium_fan_differential: ClassVar[float] = 2.5
     low_to_medium_fan_differential: ClassVar[float] = 6.0
     medium_to_low_fan_differential: ClassVar[float] = 3.0
+
+
+@dataclass(frozen=True)
+class ScheduledComfortMode(DefaultComfortMode):
+    scheduled_zone_schemes: Mapping[str, tuple[tuple[time, str], ...]] = field(default_factory=dict)
+
+    def scheme_for_zone(
+        self,
+        zone_key: str,
+        reader: StateReaderLike,
+        snapshot_data: ComfortModeSnapshotData | None = None,
+    ) -> str:
+        scheme_name = super().scheme_for_zone(zone_key, reader, snapshot_data)
+        if snapshot_data is None or snapshot_data.now is None:
+            return scheme_name
+
+        current_time = snapshot_data.now.time()
+        for start_time, scheduled_scheme_name in self.scheduled_zone_schemes.get(zone_key, ()):
+            if current_time >= start_time:
+                scheme_name = scheduled_scheme_name
+        return scheme_name
 
 
 @dataclass(frozen=True)

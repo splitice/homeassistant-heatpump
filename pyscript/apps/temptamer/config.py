@@ -15,7 +15,7 @@ from .constants import (
     SCHEME_NIGHT,
     SCHEME_OFF,
 )
-from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode
+from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode, ScheduledComfortMode
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
 GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
@@ -94,6 +94,12 @@ DEFAULT_ZONES = {
         sensor_entity_id="sensor.average_dining_zone_temp",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_dining",
     ),
+    "downstairs": ZoneConfig(
+        key="downstairs",
+        label="Downstairs",
+        sensor_entity_id="sensor.downstairs_zone_average_temperature",
+        switch_entity_id="switch.roof_wt32_hpctrl_e8dbd0_downstairs",
+    ),
     "bedroom_1_2": ZoneConfig(
         key="bedroom_1_2",
         label="Bedroom 1&2",
@@ -118,6 +124,7 @@ for zone_key in DEFAULT_ZONES:
 DEFAULT_COMFORT_MODE_NIGHT_MAPPING = {
     "office": SCHEME_NIGHT,
     "dining": SCHEME_NIGHT,
+    "downstairs": SCHEME_NIGHT,
     "bedroom_1_2": SCHEME_NIGHT,
     "bedroom_3_4": SCHEME_NIGHT,
 }
@@ -125,6 +132,7 @@ DEFAULT_COMFORT_MODE_NIGHT_MAPPING = {
 DEFAULT_COMFORT_MODE_DAY_MAPPING = {
     "office": SCHEME_DAY_LIVING,
     "dining": SCHEME_DAY_LIVING,
+    "downstairs": SCHEME_DINING_BASIC,
     "bedroom_1_2": SCHEME_BEDROOM,
     "bedroom_3_4": SCHEME_BEDROOM,
 }
@@ -132,6 +140,7 @@ DEFAULT_COMFORT_MODE_DAY_MAPPING = {
 DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
     "office": SCHEME_DAY_LIVING,
     "dining": SCHEME_DINING_BASIC,
+    "downstairs": SCHEME_DINING_BASIC,
     "bedroom_1_2": SCHEME_BEDROOM,
     "bedroom_3_4": SCHEME_BEDROOM,
 }
@@ -139,7 +148,13 @@ DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
 DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_OFF: DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING),
     COMFORT_MODE_NIGHT: NightComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING),
-    COMFORT_MODE_DAY: DefaultComfortMode(name=COMFORT_MODE_DAY, zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING),
+    COMFORT_MODE_DAY: ScheduledComfortMode(
+        name=COMFORT_MODE_DAY,
+        zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING,
+        scheduled_zone_schemes={
+            "downstairs": ((time(16, 0), SCHEME_DAY_LIVING),),
+        },
+    ),
     COMFORT_MODE_OFFICE: DefaultComfortMode(name=COMFORT_MODE_OFFICE, zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING),
     COMFORT_MODE_POWER_DAY: PowerComfortMode(
         name=COMFORT_MODE_POWER_DAY,
@@ -157,6 +172,7 @@ DEFAULT_COMFORT_MODES = {
 DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
     "office": "input_select.temptamer_comfort_mode_office",
     "dining": "input_select.temptamer_comfort_mode_dining",
+    "downstairs": "input_select.temptamer_comfort_mode_downstairs",
     "bedroom_1_2": "input_select.temptamer_comfort_mode_bed12",
     "bedroom_3_4": "input_select.temptamer_comfort_mode_bed34",
 }

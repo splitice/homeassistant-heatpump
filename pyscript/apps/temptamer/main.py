@@ -174,6 +174,10 @@ RUNTIME_STATE: dict[str, Any] = {
 }
 
 
+def _system_now() -> datetime:
+    return datetime.now().astimezone()
+
+
 class PyscriptController:
     def get_state(self, entity_id: str) -> object | None:
         try:
@@ -530,7 +534,7 @@ def _set_powerday_heat_sink_runtime_state(
 
 
 def _update_powerday_heat_sink_runtime_state(controller: PyscriptController, now: datetime) -> bool:
-    normalized_now = _normalize_runtime_datetime(now) or datetime.now(timezone.utc)
+    normalized_now = _normalize_runtime_datetime(now) or _system_now()
     export_power = parse_float(controller.get_state(EAGLE_200_POWER_DEMAND_SENSOR))
     battery_remaining = parse_float(controller.get_state(GOODWE_BATTERY_REMAINING_SENSOR))
     samples = _record_powerday_export_power_sample(normalized_now, export_power)
@@ -637,7 +641,7 @@ def _set_powerday_free_power_later_runtime_state(
 
 
 def _update_powerday_free_power_later_runtime_state(controller: PyscriptController, now: datetime) -> bool:
-    normalized_now = _normalize_runtime_datetime(now) or datetime.now(timezone.utc)
+    normalized_now = _normalize_runtime_datetime(now) or _system_now()
     pv_power = parse_float(controller.get_state(GOODWE_PV_POWER_SENSOR))
     samples = _record_powerday_pv_power_sample(normalized_now, pv_power)
     pv_average = _time_weighted_powerday_pv_power_average(samples, normalized_now)
@@ -705,7 +709,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     task.unique(CONTROL_PASS_TASK_NAME)
 
     controller = PyscriptController()
-    now = datetime.now(timezone.utc)
+    now = _system_now()
     startup_reconcile = RUNTIME_STATE["last_successful_control_pass"] is None and not comfort_mode_changed
     RUNTIME_STATE.setdefault("idle_heat_step", None)
     RUNTIME_STATE.setdefault("idle_heat_step_changed_at", None)

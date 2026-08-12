@@ -749,7 +749,7 @@ def _reported_open_zone_count(snapshot: DemandSnapshot) -> int:
     count = 0
     for zone in snapshot.zones.values():
         if zone.switch_is_on:
-            count += 1
+            count += 2 if zone.key == "downstairs" else 1
     return count
 
 

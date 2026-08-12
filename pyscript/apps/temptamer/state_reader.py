@@ -240,6 +240,15 @@ def build_snapshot(
         if raw_override_mode is not None and override_mode != COMFORT_MODE_AUTO and _is_supported_override_scheme(config, override_mode):
             applied_comfort_mode = override_mode
             scheme_name = override_mode
+        elif raw_override_mode is not None and override_mode != COMFORT_MODE_AUTO and override_mode in config.comfort_modes:
+            applied_comfort_mode = override_mode
+            scheme_name = _resolve_comfort_mode_scheme_name(
+                reader,
+                config,
+                applied_comfort_mode,
+                zone_key,
+                snapshot_data,
+            )
         else:
             applied_comfort_mode = comfort_mode
             scheme_name = _resolve_comfort_mode_scheme_name(
