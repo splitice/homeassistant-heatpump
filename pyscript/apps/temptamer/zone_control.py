@@ -199,6 +199,14 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
     return enabled_zones[0].key
 
 
+def _has_active_thermal_demand(snapshot: DemandSnapshot, operation_mode: str) -> bool:
+    if operation_mode == HVAC_COOL:
+        return bool(snapshot.cool_calling_zones or snapshot.continue_cooling_zones)
+    if operation_mode == HVAC_HEAT:
+        return bool(snapshot.heat_calling_zones or snapshot.continue_heating_zones)
+    return False
+
+
 def _zone_temperature_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
     if not zone.is_enabled_by_mode:
         return f"mode disabled by scheme {zone.scheme.name}"
@@ -314,6 +322,7 @@ def resolve_zone_actions(
         return actions, tuple(sorted(predicted_open))
 
     discretionary_used = 0
+    active_thermal_demand = _has_active_thermal_demand(snapshot, operation_mode)
 
     for zone in snapshot.zones.values():
         if zone.switch_is_on and not zone.is_enabled_by_mode:
@@ -363,7 +372,9 @@ def resolve_zone_actions(
             )
 
     for zone in closing_candidates:
-        if zone.key not in predicted_open or len(predicted_open) <= MIN_OPEN_ZONES:
+        is_last_open_zone = len(predicted_open) <= MIN_OPEN_ZONES
+        may_close_final_zone = comfort_mode_changed and not active_thermal_demand
+        if zone.key not in predicted_open or (is_last_open_zone and not may_close_final_zone):
             continue
         if not _can_toggle(zone, now, comfort_mode_changed):
             continue
@@ -400,7 +411,7 @@ def resolve_zone_actions(
             )
             discretionary_used += 1
 
-    if not predicted_open:
+    if not predicted_open and active_thermal_demand:
         safety_zone_key = _select_safety_open_zone(snapshot, operation_mode)
         if safety_zone_key:
             zone = snapshot.zones[safety_zone_key]

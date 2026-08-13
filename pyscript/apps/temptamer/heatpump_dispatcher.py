@@ -785,13 +785,21 @@ def build_dispatch_plan(
     if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="comfort mode is Off")
 
-    if not predicted_open_zones and (
+    has_active_equipment_demand = (
         demand.heat_requested
         or demand.maintain_heat_mode
         or demand.fan_only_requested
         or demand.cool_requested
         or demand.maintain_cool_mode
-    ):
+    )
+    if comfort_mode_changed and not has_active_equipment_demand:
+        return DispatchPlan(
+            turn_off=True,
+            open_zones=predicted_open_zones,
+            reason="mode change removed all heating and cooling demand: " + demand.reason,
+        )
+
+    if not predicted_open_zones and has_active_equipment_demand:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="no zones open for safe dispatch")
 
     reported_open_zone_count = _reported_open_zone_count(snapshot)

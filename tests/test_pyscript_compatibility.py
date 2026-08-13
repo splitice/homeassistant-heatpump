@@ -39,6 +39,16 @@ class _GeneratorUsageVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _StandaloneUnderscoreVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.violations: list[str] = []
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        if isinstance(node.value, ast.Name) and node.value.id == "_":
+            self.violations.append(f"line {node.lineno}: standalone '_' expression")
+        self.generic_visit(node)
+
+
 class PyScriptCompatibilityTests(unittest.TestCase):
     def test_temptamer_uses_no_generators(self):
         violations_by_file: list[str] = []
@@ -56,5 +66,24 @@ class PyScriptCompatibilityTests(unittest.TestCase):
             violations_by_file,
             [],
             "PyScript app files must not use generator expressions or yield semantics:\n"
+            + "\n".join(violations_by_file),
+        )
+
+    def test_temptamer_uses_no_standalone_underscore_expressions(self):
+        violations_by_file: list[str] = []
+
+        for path in sorted(TEMPTAMER_ROOT.glob("*.py")):
+            module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            visitor = _StandaloneUnderscoreVisitor()
+            visitor.visit(module)
+            if visitor.violations:
+                violations = ", ".join(visitor.violations)
+                relative_path = path.relative_to(REPOSITORY_ROOT)
+                violations_by_file.append(f"{relative_path}: {violations}")
+
+        self.assertEqual(
+            violations_by_file,
+            [],
+            "PyScript app files must not contain standalone '_' expressions:\n"
             + "\n".join(violations_by_file),
         )

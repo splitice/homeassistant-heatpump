@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import (
     DEFAULT_SYSTEM_CONFIG,
@@ -174,7 +175,33 @@ RUNTIME_STATE: dict[str, Any] = {
 }
 
 
+def _home_assistant_config_timezone() -> ZoneInfo | None:
+    try:
+        configured_time_zone = getattr(getattr(hass, "config", None), "time_zone", None)  # type: ignore[name-defined]
+    except NameError:
+        return None
+
+    if not configured_time_zone:
+        return None
+
+    try:
+        return ZoneInfo(str(configured_time_zone))
+    except ZoneInfoNotFoundError:
+        return None
+
+
 def _system_now() -> datetime:
+    try:
+        import homeassistant.util.dt as dt_util
+        hass_now = dt_util.now()
+        if isinstance(hass_now, datetime):
+            return hass_now
+    except (ImportError, AttributeError):
+        pass
+
+    configured_time_zone = _home_assistant_config_timezone()
+    if configured_time_zone is not None:
+        return datetime.now(configured_time_zone)
     return datetime.now().astimezone()
 
 
