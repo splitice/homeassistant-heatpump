@@ -31,7 +31,13 @@ from .constants import (
     SWITCH_STATE_SETTLE_SECONDS,
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
-from .heatpump_dispatcher import apply_dispatch_plan, apply_zone_actions, build_dispatch_plan, resolve_idle_started_at
+from .heatpump_dispatcher import (
+    apply_dispatch_plan,
+    apply_zone_actions,
+    build_dispatch_plan,
+    is_fan_speed_decrease,
+    resolve_idle_started_at,
+)
 from .state_reader import build_snapshot, is_switch_on, parse_float
 from .zone_control import describe_zone_predictions, resolve_zone_actions
 
@@ -159,6 +165,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_shutdown_at": None,
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
+    "last_fan_speed_decrease_at": None,
     "last_trigger": None,
     "powerday_export_power_samples": [],
     "powerday_export_average": None,
@@ -308,6 +315,7 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
+            "last_fan_speed_decrease_at": _isoformat(RUNTIME_STATE.get("last_fan_speed_decrease_at")),
             "powerday_export_average": RUNTIME_STATE.get("powerday_export_average"),
             "powerday_battery_remaining": RUNTIME_STATE.get("powerday_battery_remaining"),
             "powerday_heat_sink_started_at": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_started_at")),
@@ -744,6 +752,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_at", None)
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
+    RUNTIME_STATE.setdefault("last_fan_speed_decrease_at", None)
     RUNTIME_STATE["last_trigger"] = reason
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
@@ -843,6 +852,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         idle_shutdown_heat_step=RUNTIME_STATE["idle_shutdown_heat_step"],
         idle_shutdown_zone_key=RUNTIME_STATE["idle_shutdown_zone_key"],
         supported_fan_modes=supported_fan_modes,
+        fan_speed_decrease_at=RUNTIME_STATE["last_fan_speed_decrease_at"],
         now=now,
     )
 
@@ -854,6 +864,11 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
         current_setpoint=current_setpoint,
     )
+    if is_fan_speed_decrease(
+        str(current_fan_mode) if current_fan_mode is not None else None,
+        plan.fan_mode,
+    ):
+        RUNTIME_STATE["last_fan_speed_decrease_at"] = now
 
     previous_valid_mode = (current_hvac_mode_str or "").lower()
     if previous_valid_mode not in {HVAC_HEAT, HVAC_COOL}:

@@ -41,6 +41,7 @@ from pyscript.apps.temptamer.constants import (
 )
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand, resolve_operating_mode
 from pyscript.apps.temptamer.heatpump_dispatcher import (
+    apply_dispatch_plan,
     build_dispatch_plan,
     normalize_cool_setpoint,
     normalize_heat_setpoint,
@@ -48,7 +49,7 @@ from pyscript.apps.temptamer.heatpump_dispatcher import (
     resolve_fan_mode,
     resolve_idle_started_at,
 )
-from pyscript.apps.temptamer.models import ControlScheme, EquipmentDemand, SystemConfig
+from pyscript.apps.temptamer.models import ControlScheme, DispatchPlan, EquipmentDemand, SystemConfig
 import pyscript.apps.temptamer.main as temptamer_main
 from pyscript.apps.temptamer.state_reader import build_snapshot
 from pyscript.apps.temptamer.zone_control import describe_zone_predictions, resolve_zone_actions
@@ -3557,6 +3558,55 @@ class TempTamerTests(unittest.TestCase):
             ],
         )
 
+    def test_run_control_pass_records_each_fan_speed_reduction(self):
+        now = datetime(2026, 8, 17, 12, 16, 30, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "input_select.temptamer_hvac_mode": "Heat",
+                    "sensor.office_average_temperature": "14.5",
+                    "sensor.average_dining_zone_temp": "18.0",
+                    "sensor.average_bed1_2_zone_temp": "18.0",
+                    "sensor.average_bed3_4_zone_temp": "18.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    TEST_CLIMATE_ENTITY: "heat",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 6",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "temperature": 18,
+            "current_temperature": 20,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+        temptamer_main._system_now = lambda: now
+
+        try:
+            temptamer_main.run_control_pass(reason="fan decrease test")
+        finally:
+            temptamer_main._system_now = real_system_now
+
+        self.assertIn(
+            call(
+                "climate",
+                "set_fan_mode",
+                blocking=True,
+                entity_id=TEST_CLIMATE_ENTITY,
+                fan_mode="Level 5",
+            ),
+            service_call.call_args_list,
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["last_fan_speed_decrease_at"], now)
+
     def test_system_now_uses_home_assistant_local_time(self):
         expected_now = datetime(2026, 8, 12, 18, 11, 17, tzinfo=timezone(timedelta(hours=12)))
         homeassistant_module = ModuleType("homeassistant")
@@ -4060,6 +4110,47 @@ class TempTamerTests(unittest.TestCase):
             "Level 1",
         )
 
+    def test_fan_speed_decreases_by_one_level_every_three_minutes(self):
+        supported_fan_modes = tuple(f"Level {level}" for level in range(1, 7))
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=1.0)
+        now = datetime(2026, 8, 17, 12, 16, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 6",
+                "heat",
+                demand,
+                open_zone_count=2,
+                supported_fan_modes=supported_fan_modes,
+                now=now,
+            ),
+            "Level 5",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 5",
+                "heat",
+                demand,
+                open_zone_count=2,
+                supported_fan_modes=supported_fan_modes,
+                fan_speed_decrease_at=now - timedelta(minutes=2, seconds=59),
+                now=now,
+            ),
+            "Level 5",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 5",
+                "heat",
+                demand,
+                open_zone_count=2,
+                supported_fan_modes=supported_fan_modes,
+                fan_speed_decrease_at=now - timedelta(minutes=3),
+                now=now,
+            ),
+            "Level 4",
+        )
+
     def test_fan_speed_level_scales_with_effective_open_zone_count(self):
         supported_fan_modes = ("Level 1", "Level 2", "Level 3", "Level 4", "Level 5", "Level 6")
 
@@ -4119,6 +4210,44 @@ class TempTamerTests(unittest.TestCase):
             ),
             "Level 6",
         )
+
+    def test_fan_hysteresis_unscales_current_level_for_multiple_open_zones(self):
+        supported_fan_modes = ("Level 1", "Level 2", "Level 3", "Level 4")
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=1.3)
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 2",
+                "heat",
+                demand,
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 2",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 4",
+                "heat",
+                demand,
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+            ),
+            "Level 4",
+        )
+
+    def test_apply_dispatch_plan_does_not_reapply_an_unchanged_level_fan_mode(self):
+        controller = Mock()
+
+        apply_dispatch_plan(
+            controller,
+            DispatchPlan(turn_off=False, hvac_mode="heat", fan_mode="Level 2"),
+            current_hvac_mode="heat",
+            current_fan_mode="Level 2",
+            current_setpoint=None,
+        )
+
+        controller.call_service.assert_not_called()
 
     def test_dispatch_plan_counts_open_downstairs_as_two_zones_for_fan_multiplier(self):
         snapshot = build_behavior_snapshot(
