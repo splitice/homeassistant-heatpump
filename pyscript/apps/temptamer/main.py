@@ -14,6 +14,12 @@ from .config import (
     GOODWE_PV_POWER_SENSOR,
     MODE_TRIGGER_ENTITIES,
     POWERDAY_BATTERY_THRESHOLD,
+    POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP,
+    POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP,
+    POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
     POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
     POWERDAY_EXPORT_POWER_THRESHOLD,
     POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
@@ -190,6 +196,11 @@ RUNTIME_STATE: dict[str, Any] = {
     "powerday_free_power_later_started_at": None,
     "powerday_free_power_later_active": False,
     "powerday_free_power_later_reason": None,
+    "powerday_downstairs_priority_started_at": None,
+    "powerday_downstairs_priority_active": False,
+    "powerday_downstairs_priority_gap": None,
+    "powerday_downstairs_priority_upstairs_zones": (),
+    "powerday_downstairs_priority_reason": None,
     "poweroff_battery_remaining": None,
     "poweroff_pv_power": None,
     "poweroff_activation_started_at": None,
@@ -349,6 +360,15 @@ def _publish_runtime_state(status: str) -> None:
             ),
             "powerday_free_power_later_active": RUNTIME_STATE.get("powerday_free_power_later_active"),
             "powerday_free_power_later_reason": RUNTIME_STATE.get("powerday_free_power_later_reason"),
+            "powerday_downstairs_priority_started_at": _isoformat(
+                RUNTIME_STATE.get("powerday_downstairs_priority_started_at")
+            ),
+            "powerday_downstairs_priority_active": RUNTIME_STATE.get("powerday_downstairs_priority_active"),
+            "powerday_downstairs_priority_gap": RUNTIME_STATE.get("powerday_downstairs_priority_gap"),
+            "powerday_downstairs_priority_upstairs_zones": RUNTIME_STATE.get(
+                "powerday_downstairs_priority_upstairs_zones"
+            ),
+            "powerday_downstairs_priority_reason": RUNTIME_STATE.get("powerday_downstairs_priority_reason"),
             "poweroff_battery_remaining": RUNTIME_STATE.get("poweroff_battery_remaining"),
             "poweroff_pv_power": RUNTIME_STATE.get("poweroff_pv_power"),
             "poweroff_activation_started_at": _isoformat(RUNTIME_STATE.get("poweroff_activation_started_at")),
@@ -767,6 +787,181 @@ def _update_powerday_free_power_later_runtime_state(controller: PyscriptControll
     )
 
 
+def _powerday_downstairs_priority_base_eligibility(snapshot, operating_mode: str | None) -> tuple[bool, str]:
+    if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY:
+        return False, "comfort mode is not PowerDay"
+    if not snapshot.free_power_available:
+        return False, "free power is not available"
+    if operating_mode != HVAC_HEAT:
+        return False, "heating is not active"
+
+    downstairs_zone = snapshot.zones.get(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY)
+    if downstairs_zone is None or not downstairs_zone.is_enabled_by_mode:
+        return False, "downstairs zone is disabled"
+    if downstairs_zone.current_temp >= downstairs_zone.scheme.continue_until:
+        return False, "downstairs is at or above its continue-until target"
+    return True, "PowerDay free-power heat soak is eligible"
+
+
+def _powerday_downstairs_priority_entry_eligibility(snapshot, operating_mode: str | None) -> tuple[bool, float | None, tuple[str, ...], str]:
+    base_eligible, base_reason = _powerday_downstairs_priority_base_eligibility(snapshot, operating_mode)
+    if not base_eligible:
+        return False, None, (), base_reason
+
+    open_upstairs_zone_keys: list[str] = []
+    coldest_upstairs_temp: float | None = None
+    for zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS:
+        upstairs_zone = snapshot.zones.get(zone_key)
+        if upstairs_zone is None or not upstairs_zone.switch_is_on:
+            continue
+        if not upstairs_zone.is_enabled_by_mode:
+            return False, None, (), f"{zone_key} is disabled"
+        if upstairs_zone.current_temp <= upstairs_zone.scheme.enable_outside:
+            return (
+                False,
+                None,
+                (),
+                f"{zone_key} {upstairs_zone.current_temp:.1f}C <= enable threshold {upstairs_zone.scheme.enable_outside:.1f}C",
+            )
+        open_upstairs_zone_keys.append(zone_key)
+        if coldest_upstairs_temp is None or upstairs_zone.current_temp < coldest_upstairs_temp:
+            coldest_upstairs_temp = upstairs_zone.current_temp
+
+    if not open_upstairs_zone_keys or coldest_upstairs_temp is None:
+        return False, None, (), "no upstairs vents are open"
+
+    downstairs_temp = snapshot.zones[POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY].current_temp
+    temperature_gap = coldest_upstairs_temp - downstairs_temp
+    if temperature_gap < POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP:
+        return (
+            False,
+            temperature_gap,
+            tuple(open_upstairs_zone_keys),
+            f"upstairs/downstairs gap {temperature_gap:.1f}C < {POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP:.1f}C",
+        )
+    return (
+        True,
+        temperature_gap,
+        tuple(open_upstairs_zone_keys),
+        f"upstairs/downstairs gap {temperature_gap:.1f}C >= {POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP:.1f}C",
+    )
+
+
+def _set_powerday_downstairs_priority_runtime_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    temperature_gap: float | None,
+    upstairs_zone_keys: tuple[str, ...],
+    reason: str,
+) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("powerday_downstairs_priority_active"))
+    RUNTIME_STATE["powerday_downstairs_priority_started_at"] = started_at
+    RUNTIME_STATE["powerday_downstairs_priority_active"] = active
+    RUNTIME_STATE["powerday_downstairs_priority_gap"] = temperature_gap
+    RUNTIME_STATE["powerday_downstairs_priority_upstairs_zones"] = upstairs_zone_keys
+    RUNTIME_STATE["powerday_downstairs_priority_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "POWERDAY: downstairs_priority_active=%s gap=%s upstairs=%s reason=%s",
+            active,
+            temperature_gap,
+            ",".join(upstairs_zone_keys) if upstairs_zone_keys else "none",
+            reason,
+        )
+    return active
+
+
+def _update_powerday_downstairs_priority_runtime_state(snapshot, operating_mode: str | None, now: datetime) -> bool:
+    normalized_now = _normalize_runtime_datetime(now) or _system_now()
+    previously_active = bool(RUNTIME_STATE.get("powerday_downstairs_priority_active"))
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_downstairs_priority_started_at"))
+
+    if not previously_active or started_at is None:
+        eligible, temperature_gap, upstairs_zone_keys, reason = _powerday_downstairs_priority_entry_eligibility(
+            snapshot,
+            operating_mode,
+        )
+        if not eligible:
+            return _set_powerday_downstairs_priority_runtime_state(
+                active=False,
+                started_at=None,
+                temperature_gap=temperature_gap,
+                upstairs_zone_keys=(),
+                reason=reason,
+            )
+        return _set_powerday_downstairs_priority_runtime_state(
+            active=True,
+            started_at=normalized_now,
+            temperature_gap=temperature_gap,
+            upstairs_zone_keys=upstairs_zone_keys,
+            reason=f"started: {reason}",
+        )
+
+    base_eligible, base_reason = _powerday_downstairs_priority_base_eligibility(snapshot, operating_mode)
+    if not base_eligible:
+        return _set_powerday_downstairs_priority_runtime_state(
+            active=False,
+            started_at=None,
+            temperature_gap=None,
+            upstairs_zone_keys=(),
+            reason=base_reason,
+        )
+
+    stored_upstairs_zone_keys = RUNTIME_STATE.get("powerday_downstairs_priority_upstairs_zones", ())
+    if not isinstance(stored_upstairs_zone_keys, (list, tuple)):
+        stored_upstairs_zone_keys = ()
+
+    coldest_upstairs_temp: float | None = None
+    tracked_upstairs_zone_keys: list[str] = []
+    for zone_key in stored_upstairs_zone_keys:
+        upstairs_zone = snapshot.zones.get(str(zone_key))
+        if upstairs_zone is None:
+            continue
+        tracked_upstairs_zone_keys.append(str(zone_key))
+        if coldest_upstairs_temp is None or upstairs_zone.current_temp < coldest_upstairs_temp:
+            coldest_upstairs_temp = upstairs_zone.current_temp
+
+    if coldest_upstairs_temp is None:
+        return _set_powerday_downstairs_priority_runtime_state(
+            active=False,
+            started_at=None,
+            temperature_gap=None,
+            upstairs_zone_keys=(),
+            reason="tracked upstairs zones are unavailable",
+        )
+
+    downstairs_temp = snapshot.zones[POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY].current_temp
+    temperature_gap = coldest_upstairs_temp - downstairs_temp
+    hold_until = started_at + timedelta(seconds=POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS)
+    if normalized_now < hold_until:
+        return _set_powerday_downstairs_priority_runtime_state(
+            active=True,
+            started_at=started_at,
+            temperature_gap=temperature_gap,
+            upstairs_zone_keys=tuple(tracked_upstairs_zone_keys),
+            reason=f"minimum priority hold until {hold_until.isoformat()}; gap {temperature_gap:.1f}C",
+        )
+
+    if temperature_gap < POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:
+        return _set_powerday_downstairs_priority_runtime_state(
+            active=False,
+            started_at=None,
+            temperature_gap=temperature_gap,
+            upstairs_zone_keys=(),
+            reason=f"upstairs/downstairs gap {temperature_gap:.1f}C < {POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:.1f}C",
+        )
+
+    return _set_powerday_downstairs_priority_runtime_state(
+        active=True,
+        started_at=started_at,
+        temperature_gap=temperature_gap,
+        upstairs_zone_keys=tuple(tracked_upstairs_zone_keys),
+        reason=f"holding priority; gap {temperature_gap:.1f}C >= {POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:.1f}C",
+    )
+
+
 def _set_poweroff_runtime_state(
     *,
     active: bool,
@@ -911,6 +1106,11 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("last_heat_demand_fan_boost_at", None)
     RUNTIME_STATE.setdefault("max_power_demand_5m_kw", None)
     RUNTIME_STATE.setdefault("heat_demand_fan_boost_reason", None)
+    RUNTIME_STATE.setdefault("powerday_downstairs_priority_started_at", None)
+    RUNTIME_STATE.setdefault("powerday_downstairs_priority_active", False)
+    RUNTIME_STATE.setdefault("powerday_downstairs_priority_gap", None)
+    RUNTIME_STATE.setdefault("powerday_downstairs_priority_upstairs_zones", ())
+    RUNTIME_STATE.setdefault("powerday_downstairs_priority_reason", None)
     RUNTIME_STATE.setdefault("poweroff_battery_remaining", None)
     RUNTIME_STATE.setdefault("poweroff_pv_power", None)
     RUNTIME_STATE.setdefault("poweroff_activation_started_at", None)
@@ -944,13 +1144,6 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     target_temp_step = controller.get_attr(climate_entity, "target_temp_step")
     current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
 
-    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
-        LOGGER.info("DISPATCH: manual mode selected; leaving zones and heatpump unchanged")
-        RUNTIME_STATE["last_error"] = None
-        RUNTIME_STATE["last_successful_control_pass"] = now
-        _publish_runtime_state("manual")
-        return
-
     operating_mode, operating_mode_reason = resolve_operating_mode(
         snapshot,
         current_hvac_mode=current_hvac_mode_str,
@@ -958,12 +1151,28 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         last_heatcool_transition=RUNTIME_STATE["last_heatcool_transition"],
         now=now,
     )
+    powerday_downstairs_priority_active = _update_powerday_downstairs_priority_runtime_state(
+        snapshot,
+        operating_mode,
+        now,
+    )
+
+    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        LOGGER.info("DISPATCH: manual mode selected; leaving zones and heatpump unchanged")
+        RUNTIME_STATE["last_error"] = None
+        RUNTIME_STATE["last_successful_control_pass"] = now
+        _publish_runtime_state("manual")
+        return
+
     zone_actions, predicted_open_zones = resolve_zone_actions(
         snapshot,
         now,
         operation_mode=operating_mode,
         comfort_mode_changed=comfort_mode_changed,
         startup_reconcile=startup_reconcile,
+        downstairs_priority_active=powerday_downstairs_priority_active,
+        downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
+        upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
     )
     zone_diagnostics = describe_zone_predictions(
         snapshot,
@@ -983,6 +1192,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         snapshot,
         predicted_open_zones,
         operation_mode=operating_mode,
+        allowed_zone_keys=(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,) if powerday_downstairs_priority_active else None,
     )
     max_power_demand_5m_kw = parse_float(controller.get_state(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR))
     (
@@ -1038,6 +1248,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         supported_fan_modes=supported_fan_modes,
         fan_speed_decrease_at=RUNTIME_STATE["last_fan_speed_decrease_at"],
         base_fan_boost=heat_demand_fan_boost_level,
+        additional_fan_levels=(
+            POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0
+        ),
         now=now,
     )
 

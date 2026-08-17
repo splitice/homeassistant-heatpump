@@ -166,6 +166,7 @@ def resolve_equipment_demand(
     predicted_open_zones: tuple[str, ...],
     *,
     operation_mode: str | None,
+    allowed_zone_keys: tuple[str, ...] | None = None,
 ) -> EquipmentDemand:
     if snapshot.comfort_mode == COMFORT_MODE_OFF:
         return EquipmentDemand(reason="comfort mode is Off")
@@ -179,8 +180,11 @@ def resolve_equipment_demand(
     if not predicted_open_zones:
         return EquipmentDemand(reason=f"no zones are predicted to be open for {operation_mode}")
 
+    effective_zone_keys = tuple(snapshot.zones) if allowed_zone_keys is None else allowed_zone_keys
+
     if operation_mode == HVAC_COOL:
-        requested_by_zone, max_excess = _max_excess(snapshot, snapshot.cool_calling_zones, lambda zone: zone.cool_scheme.enable_outside)
+        cool_calling_zones = _filter_zone_keys(snapshot.cool_calling_zones, effective_zone_keys)
+        requested_by_zone, max_excess = _max_excess(snapshot, cool_calling_zones, lambda zone: zone.cool_scheme.enable_outside)
         if requested_by_zone is not None:
             return EquipmentDemand(
                 cool_requested=True,
@@ -189,7 +193,10 @@ def resolve_equipment_demand(
                 reason=f"{requested_by_zone} is above enable threshold",
             )
 
-        predicted_open_above_ideal_zones = _filter_zone_keys(snapshot.above_ideal_zones, predicted_open_zones)
+        predicted_open_above_ideal_zones = _filter_zone_keys(
+            _filter_zone_keys(snapshot.above_ideal_zones, effective_zone_keys),
+            predicted_open_zones,
+        )
         continue_zone, continue_excess = _max_excess(
             snapshot,
             predicted_open_above_ideal_zones,
@@ -205,7 +212,8 @@ def resolve_equipment_demand(
 
         return EquipmentDemand(reason="all enabled zones are at or below ideal target")
 
-    requested_by_zones, max_deficit = _ranked_requesting_zones(snapshot, snapshot.heat_calling_zones, "enable_outside")
+    heat_calling_zones = _filter_zone_keys(snapshot.heat_calling_zones, effective_zone_keys)
+    requested_by_zones, max_deficit = _ranked_requesting_zones(snapshot, heat_calling_zones, "enable_outside")
     if requested_by_zones:
         primary_zone = requested_by_zones[0]
         return EquipmentDemand(
@@ -215,7 +223,10 @@ def resolve_equipment_demand(
             reason=f"{primary_zone} is below enable threshold",
         )
 
-    predicted_open_continue_zones = _filter_zone_keys(snapshot.continue_heating_zones, predicted_open_zones)
+    predicted_open_continue_zones = _filter_zone_keys(
+        _filter_zone_keys(snapshot.continue_heating_zones, effective_zone_keys),
+        predicted_open_zones,
+    )
     continue_zones, continue_deficit = _ranked_requesting_zones(
         snapshot,
         predicted_open_continue_zones,
@@ -230,16 +241,17 @@ def resolve_equipment_demand(
             reason=f"{primary_zone} is below continue-until threshold",
         )
 
-    open_zones = set(predicted_open_zones)
+    open_zones = set(_filter_zone_keys(predicted_open_zones, effective_zone_keys))
     open_at_ideal: list[str] = []
     all_open_zones_at_ideal = True
-    for zone_key in predicted_open_zones:
+    for zone_key in open_zones:
         if zone_key in snapshot.at_ideal_zones:
             open_at_ideal.append(zone_key)
         else:
             all_open_zones_at_ideal = False
 
-    if open_zones and open_at_ideal and snapshot.below_ideal_zones:
+    below_ideal_zones = _filter_zone_keys(snapshot.below_ideal_zones, effective_zone_keys)
+    if open_zones and open_at_ideal and below_ideal_zones:
         if all_open_zones_at_ideal:
             return EquipmentDemand(
                 fan_only_requested=True,

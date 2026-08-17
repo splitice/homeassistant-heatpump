@@ -777,6 +777,14 @@ def _bounded_fan_boost_level(value: object | None) -> int:
     return max(0, min(HEAT_DEMAND_FAN_BOOST_MAX_LEVEL, int(parsed_value)))
 
 
+def _additional_fan_levels(value: object | None) -> int:
+    """Return a non-negative number of physical fan levels to add after scaling."""
+    parsed_value = parse_float(value)
+    if parsed_value is None or not math.isfinite(parsed_value):
+        return 0
+    return max(0, int(parsed_value))
+
+
 def resolve_heat_demand_fan_boost(
     snapshot: DemandSnapshot,
     demand: EquipmentDemand,
@@ -878,6 +886,7 @@ def resolve_fan_mode(
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
+    additional_fan_levels: int = 0,
     now: datetime | None = None,
 ) -> str | None:
     if demand.fan_only_requested:
@@ -909,6 +918,7 @@ def resolve_fan_mode(
     )
     if not cooling:
         fan_speed_level += _bounded_fan_boost_level(base_fan_boost) * _fan_speed_multiplier(open_zone_count)
+        fan_speed_level += _additional_fan_levels(additional_fan_levels)
     return _limit_fan_speed_decrease(
         _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes),
         current_fan_mode,
@@ -955,6 +965,7 @@ def build_dispatch_plan(
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
+    additional_fan_levels: int = 0,
     now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.poweroff_forced_off:
@@ -998,6 +1009,7 @@ def build_dispatch_plan(
             supported_fan_modes=supported_fan_modes,
             fan_speed_decrease_at=fan_speed_decrease_at,
             base_fan_boost=base_fan_boost,
+            additional_fan_levels=additional_fan_levels,
             now=now,
         )
 

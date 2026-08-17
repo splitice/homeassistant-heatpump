@@ -295,6 +295,9 @@ def resolve_zone_actions(
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
     startup_reconcile: bool = False,
+    downstairs_priority_active: bool = False,
+    downstairs_zone_key: str | None = None,
+    upstairs_zone_keys: tuple[str, ...] = (),
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
     predicted_open: set[str] = set()
@@ -329,6 +332,33 @@ def resolve_zone_actions(
                 )
             )
         return actions, tuple()
+
+    if downstairs_priority_active and operation_mode == HVAC_HEAT and downstairs_zone_key in snapshot.zones:
+        downstairs_zone = snapshot.zones[downstairs_zone_key]
+        if downstairs_zone.is_enabled_by_mode and not downstairs_zone.switch_is_on:
+            actions.append(
+                ZoneAction(
+                    zone_key=downstairs_zone_key,
+                    turn_on=True,
+                    reason="PowerDay downstairs-priority heat soak",
+                    discretionary=False,
+                )
+            )
+
+        for zone_key in upstairs_zone_keys:
+            upstairs_zone = snapshot.zones.get(zone_key)
+            if upstairs_zone is None or not upstairs_zone.switch_is_on:
+                continue
+            actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=False,
+                    reason="PowerDay downstairs-priority heat soak",
+                    discretionary=False,
+                )
+            )
+
+        return actions, (downstairs_zone_key,)
 
     if operation_mode not in {HVAC_HEAT, HVAC_COOL}:
         return actions, tuple(sorted(predicted_open))

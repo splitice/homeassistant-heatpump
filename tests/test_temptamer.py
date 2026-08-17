@@ -23,6 +23,10 @@ from pyscript.apps.temptamer.config import (
     GOODWE_PV_POWER_SENSOR,
     MODE_TRIGGER_ENTITIES,
     POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+    POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
     POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
     POWEROFF_MIN_ACTIVATION_SECONDS,
@@ -35,6 +39,7 @@ from pyscript.apps.temptamer.constants import (
     HVAC_COOL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
+    HEAT_DEMAND_FAN_BOOST_MAX_LEVEL,
     IDLE_HEAT_UNWIND_SECONDS,
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
@@ -166,6 +171,27 @@ def build_behavior_snapshot(
         free_power_later_available=free_power_later_available,
         poweroff_active=poweroff_active,
         now=now,
+    )
+
+
+def powerday_downstairs_priority_state_map(**overrides):
+    return base_state_map(
+        **{
+            "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+            "input_select.temptamer_comfort_mode_downstairs": "Auto",
+            GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+            "sensor.office_average_temperature": "24.0",
+            "sensor.average_dining_zone_temp": "24.0",
+            "sensor.downstairs_zone_average_temperature": "18.0",
+            "sensor.average_bed1_2_zone_temp": "24.0",
+            "sensor.average_bed3_4_zone_temp": "24.0",
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+            "switch.wt32_hpctrl_e8dbd0_dining": "on",
+            "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "off",
+            "switch.wt32_hpctrl_e8dbd0_bed_12": "on",
+            "switch.wt32_hpctrl_e8dbd0_bed_34": "on",
+            **overrides,
+        }
     )
 
 
@@ -453,6 +479,265 @@ class TempTamerTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_powerday_downstairs_priority_starts_only_for_free_power_heat_soak(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map()),
+            now=now,
+        )
+
+        active = temptamer_main._update_powerday_downstairs_priority_runtime_state(snapshot, HVAC_HEAT, now)
+
+        self.assertTrue(active)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_started_at"], now)
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_upstairs_zones"],
+            POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_gap"], 6.0)
+
+        paid_snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map(**{GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1"})),
+            now=now,
+        )
+        self.assertFalse(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(paid_snapshot, HVAC_HEAT, now)
+        )
+        self.assertIn("free power", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
+
+        poweroff_snapshot = build_behavior_snapshot(
+            FakeReader(
+                powerday_downstairs_priority_state_map(
+                    **{"input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF}
+                )
+            ),
+            poweroff_active=True,
+            now=now,
+        )
+        self.assertFalse(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(poweroff_snapshot, HVAC_HEAT, now)
+        )
+        self.assertIn("not PowerDay", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
+
+        self.assertFalse(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(snapshot, HVAC_COOL, now)
+        )
+
+    def test_powerday_downstairs_priority_holds_for_ten_minutes_then_releases_below_two_degrees(self):
+        start = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        start_snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map()),
+            now=start,
+        )
+        self.assertTrue(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(start_snapshot, HVAC_HEAT, start)
+        )
+
+        balanced_snapshot = build_behavior_snapshot(
+            FakeReader(
+                powerday_downstairs_priority_state_map(
+                    **{
+                        "sensor.office_average_temperature": "19.5",
+                        "sensor.average_dining_zone_temp": "19.5",
+                        "sensor.average_bed1_2_zone_temp": "19.5",
+                        "sensor.average_bed3_4_zone_temp": "19.5",
+                        "switch.wt32_hpctrl_e8dbd0_office": "off",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "off",
+                        "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "off",
+                    }
+                )
+            ),
+            now=start + timedelta(minutes=9),
+        )
+        self.assertTrue(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(
+                balanced_snapshot,
+                HVAC_HEAT,
+                start + timedelta(minutes=9),
+            )
+        )
+        self.assertFalse(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(
+                balanced_snapshot,
+                HVAC_HEAT,
+                start + timedelta(seconds=POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS),
+            )
+        )
+        self.assertIn("gap 1.5C < 2.0C", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
+
+    def test_powerday_downstairs_priority_ends_immediately_when_downstairs_is_satisfied(self):
+        start = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        active_snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map()),
+            now=start,
+        )
+        self.assertTrue(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(active_snapshot, HVAC_HEAT, start)
+        )
+
+        satisfied_snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map(**{"sensor.downstairs_zone_average_temperature": "24.0"})),
+            now=start + timedelta(minutes=1),
+        )
+        self.assertFalse(
+            temptamer_main._update_powerday_downstairs_priority_runtime_state(
+                satisfied_snapshot,
+                HVAC_HEAT,
+                start + timedelta(minutes=1),
+            )
+        )
+        self.assertIn("downstairs is at or above", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
+
+    def test_powerday_downstairs_priority_forces_downstairs_open_and_closes_upstairs_together(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(powerday_downstairs_priority_state_map()),
+            last_switch_changes={zone_key: now for zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS},
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            now,
+            operation_mode=HVAC_HEAT,
+            downstairs_priority_active=True,
+            downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
+            upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        )
+
+        self.assertEqual(predicted_open, (POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,))
+        self.assertCountEqual(
+            [(action.zone_key, action.turn_on) for action in actions],
+            [(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY, True)]
+            + [(zone_key, False) for zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS],
+        )
+        self.assertTrue(all(not action.discretionary for action in actions))
+
+    def test_powerday_downstairs_priority_control_pass_publishes_state_and_dispatches_downstairs_only(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.state._values.update(
+            powerday_downstairs_priority_state_map(**{TEST_CLIMATE_ENTITY: "heat"})
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 1",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "temperature": 20,
+            "current_temperature": 20,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+        temptamer_main._system_now = lambda: now
+
+        try:
+            temptamer_main.run_control_pass(reason="PowerDay downstairs priority test")
+        finally:
+            temptamer_main._system_now = real_system_now
+
+        self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_active"])
+        status_attributes = temptamer_main.state.getattr(temptamer_main.STATUS_ENTITY_ID)
+        self.assertTrue(status_attributes["powerday_downstairs_priority_active"])
+        self.assertEqual(
+            status_attributes["powerday_downstairs_priority_upstairs_zones"],
+            POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        )
+        self.assertIn(
+            call(
+                "switch",
+                "turn_on",
+                blocking=True,
+                entity_id="switch.roof_wt32_hpctrl_e8dbd0_downstairs",
+            ),
+            service_call.call_args_list,
+        )
+        for zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS:
+            self.assertIn(
+                call(
+                    "switch",
+                    "turn_off",
+                    blocking=True,
+                    entity_id=DEFAULT_SYSTEM_CONFIG.zones[zone_key].switch_entity_id,
+                ),
+                service_call.call_args_list,
+            )
+        self.assertIn(
+            call(
+                "climate",
+                "set_fan_mode",
+                blocking=True,
+                entity_id=TEST_CLIMATE_ENTITY,
+                fan_mode="Level 6",
+            ),
+            service_call.call_args_list,
+        )
+
+    def test_powerday_downstairs_priority_adds_two_physical_fan_levels_after_existing_boost(self):
+        supported_fan_modes = tuple(f"Level {level}" for level in range(1, 10))
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=1.0)
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                demand,
+                open_zone_count=4,
+                supported_fan_modes=supported_fan_modes,
+                base_fan_boost=1,
+                additional_fan_levels=POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
+            ),
+            "Level 8",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                demand,
+                open_zone_count=4,
+                supported_fan_modes=supported_fan_modes[:7],
+                base_fan_boost=1,
+                additional_fan_levels=POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
+            ),
+            "Level 7",
+        )
+
+    def test_powerday_downstairs_priority_release_restores_upstairs_through_normal_antiflap(self):
+        changed_at = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                powerday_downstairs_priority_state_map(
+                    **{
+                        "sensor.office_average_temperature": "20.0",
+                        "sensor.average_dining_zone_temp": "20.0",
+                        "sensor.average_bed1_2_zone_temp": "20.0",
+                        "sensor.average_bed3_4_zone_temp": "20.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "off",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "off",
+                        "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "on",
+                        "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "off",
+                    }
+                )
+            ),
+            last_switch_changes={zone_key: changed_at for zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS},
+            now=changed_at + timedelta(minutes=5),
+        )
+
+        actions, _predicted_open = resolve_zone_actions(
+            snapshot,
+            changed_at + timedelta(minutes=5),
+            operation_mode=HVAC_HEAT,
+        )
+
+        opened_upstairs = [action for action in actions if action.zone_key in POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS]
+        self.assertEqual(len(opened_upstairs), 1)
+        self.assertTrue(opened_upstairs[0].turn_on)
 
     def test_powerday_heat_soaks_dining_downstairs_and_bedrooms_when_power_is_free(self):
         power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
@@ -4340,7 +4625,7 @@ class TempTamerTests(unittest.TestCase):
             (0, None),
         )
 
-    def test_heat_demand_fan_boost_ramps_once_every_fifteen_minutes_and_caps_at_three(self):
+    def test_heat_demand_fan_boost_ramps_once_every_fifteen_minutes_and_caps_at_configured_maximum(self):
         now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -4397,11 +4682,11 @@ class TempTamerTests(unittest.TestCase):
             demand,
             ("office",),
             13.5,
-            previous_boost_level=level,
-            last_boost_at=boosted_at,
+            previous_boost_level=HEAT_DEMAND_FAN_BOOST_MAX_LEVEL,
+            last_boost_at=now + timedelta(minutes=30),
             now=now + timedelta(minutes=45),
         )
-        self.assertEqual((level, boosted_at), (3, now + timedelta(minutes=30)))
+        self.assertEqual((level, boosted_at), (HEAT_DEMAND_FAN_BOOST_MAX_LEVEL, now + timedelta(minutes=30)))
 
     def test_heat_demand_fan_boost_is_added_before_zone_multiplier_and_never_applies_to_cooling(self):
         supported_fan_modes = tuple(f"Level {level}" for level in range(1, 7))
