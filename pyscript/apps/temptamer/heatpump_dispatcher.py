@@ -15,6 +15,10 @@ from .constants import (
     FAN_SPEED_DECREASE_INTERVAL_SECONDS,
     FAN_LOW,
     FAN_MEDIUM,
+    HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS,
+    HEAT_DEMAND_FAN_BOOST_MAX_LEVEL,
+    HEAT_DEMAND_FAN_BOOST_MAX_POWER_KW,
+    HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP,
     HVAC_COOL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
@@ -755,6 +759,92 @@ def _fan_speed_multiplier(open_zone_count: int) -> int:
     return 1
 
 
+def _heat_continue_until_gap(snapshot: DemandSnapshot, zone_keys: tuple[str, ...]) -> float:
+    """Return the largest heat continue-until deficit among planned-open zones."""
+    largest_gap = 0.0
+    for zone_key in zone_keys:
+        zone = snapshot.zones.get(zone_key)
+        if zone is None:
+            continue
+        largest_gap = max(largest_gap, zone.scheme.continue_until - zone.current_temp)
+    return largest_gap
+
+
+def _bounded_fan_boost_level(value: object | None) -> int:
+    parsed_value = parse_float(value)
+    if parsed_value is None or not math.isfinite(parsed_value):
+        return 0
+    return max(0, min(HEAT_DEMAND_FAN_BOOST_MAX_LEVEL, int(parsed_value)))
+
+
+def resolve_heat_demand_fan_boost(
+    snapshot: DemandSnapshot,
+    demand: EquipmentDemand,
+    predicted_open_zones: tuple[str, ...],
+    max_power_demand_kw: float | None,
+    *,
+    previous_boost_level: object | None = 0,
+    last_boost_at: datetime | None = None,
+    now: datetime | None = None,
+) -> tuple[int, datetime | None, str]:
+    """Resolve the heat-demand base-fan boost and its 15-minute ramp state.
+
+    The boost is deliberately calculated before fan multiplication: a boost of
+    one adds one base level, even when the heat pump later scales that level for
+    several open zones.
+    """
+    if not (demand.heat_requested or demand.maintain_heat_mode):
+        return 0, None, "no active heat demand"
+
+    if max_power_demand_kw is None or not math.isfinite(max_power_demand_kw):
+        return 0, None, "missing or invalid 5-minute max power demand"
+    if max_power_demand_kw >= HEAT_DEMAND_FAN_BOOST_MAX_POWER_KW:
+        return (
+            0,
+            None,
+            f"5-minute max demand {max_power_demand_kw:.2f} kW >= {HEAT_DEMAND_FAN_BOOST_MAX_POWER_KW:.2f} kW",
+        )
+
+    continue_until_gap = _heat_continue_until_gap(snapshot, predicted_open_zones)
+    if continue_until_gap < HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP:
+        return (
+            0,
+            None,
+            "largest open-zone continue-until gap "
+            f"{continue_until_gap:.1f}C < {HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP:.1f}C",
+        )
+
+    previous_level = _bounded_fan_boost_level(previous_boost_level)
+    normalized_now = _normalize_timestamp(now)
+    normalized_last_boost_at = _normalize_timestamp(last_boost_at)
+    if previous_level == 0:
+        return (
+            1,
+            normalized_now,
+            f"eligible: demand={max_power_demand_kw:.2f} kW gap={continue_until_gap:.1f}C boost=1",
+        )
+
+    if previous_level < HEAT_DEMAND_FAN_BOOST_MAX_LEVEL and (
+        normalized_last_boost_at is None
+        or (
+            normalized_now is not None
+            and normalized_now - normalized_last_boost_at >= timedelta(seconds=HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS)
+        )
+    ):
+        next_level = previous_level + 1
+        return (
+            next_level,
+            normalized_now,
+            f"eligible: demand={max_power_demand_kw:.2f} kW gap={continue_until_gap:.1f}C boost={next_level}",
+        )
+
+    return (
+        previous_level,
+        normalized_last_boost_at,
+        f"eligible: demand={max_power_demand_kw:.2f} kW gap={continue_until_gap:.1f}C boost={previous_level} held",
+    )
+
+
 def _current_fan_speed_level(fan_mode: str | None, *, open_zone_count: int = 1) -> int | None:
     """Return the base fan level used by comfort-mode hysteresis.
 
@@ -787,6 +877,7 @@ def resolve_fan_mode(
     open_zone_count: int = 1,
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
+    base_fan_boost: int = 0,
     now: datetime | None = None,
 ) -> str | None:
     if demand.fan_only_requested:
@@ -816,6 +907,8 @@ def resolve_fan_mode(
         starting=starting,
         free_power_available=free_power_available,
     )
+    if not cooling:
+        fan_speed_level += _bounded_fan_boost_level(base_fan_boost) * _fan_speed_multiplier(open_zone_count)
     return _limit_fan_speed_decrease(
         _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes),
         current_fan_mode,
@@ -861,6 +954,7 @@ def build_dispatch_plan(
     idle_shutdown_zone_key: str | None = None,
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
+    base_fan_boost: int = 0,
     now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
@@ -896,6 +990,7 @@ def build_dispatch_plan(
             open_zone_count=reported_open_zone_count,
             supported_fan_modes=supported_fan_modes,
             fan_speed_decrease_at=fan_speed_decrease_at,
+            base_fan_boost=base_fan_boost,
             now=now,
         )
 

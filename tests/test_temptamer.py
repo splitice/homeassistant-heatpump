@@ -15,6 +15,7 @@ from pyscript.apps.temptamer.comfort_modes import (
 )
 from pyscript.apps.temptamer.config import (
     DEFAULT_SYSTEM_CONFIG,
+    EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
     GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
@@ -47,6 +48,7 @@ from pyscript.apps.temptamer.heatpump_dispatcher import (
     normalize_heat_setpoint,
     normalize_setpoint,
     resolve_fan_mode,
+    resolve_heat_demand_fan_boost,
     resolve_idle_started_at,
 )
 from pyscript.apps.temptamer.models import ControlScheme, DispatchPlan, EquipmentDemand, SystemConfig
@@ -90,6 +92,7 @@ def base_state_map(**overrides):
         GOODWE_BATTERY_REMAINING_SENSOR: "50",
         GOODWE_PV_POWER_SENSOR: "0",
         EAGLE_200_POWER_DEMAND_SENSOR: "0",
+        EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR: "14.0",
         "switch.wt32_hpctrl_e8dbd0_office": "off",
         "switch.wt32_hpctrl_e8dbd0_dining": "off",
         "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "off",
@@ -279,6 +282,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertIn(GOODWE_BATTERY_REMAINING_SENSOR, MODE_TRIGGER_ENTITIES)
         self.assertIn(GOODWE_PV_POWER_SENSOR, MODE_TRIGGER_ENTITIES)
         self.assertIn(EAGLE_200_POWER_DEMAND_SENSOR, MODE_TRIGGER_ENTITIES)
+        self.assertIn(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR, MODE_TRIGGER_ENTITIES)
 
     def test_powerday_uses_office_mapping_when_power_is_not_free(self):
         snapshot = build_behavior_snapshot(
@@ -4150,6 +4154,212 @@ class TempTamerTests(unittest.TestCase):
             ),
             "Level 4",
         )
+
+    def test_heat_demand_fan_boost_requires_low_power_and_open_zone_continue_gap(self):
+        now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "18.1",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=0.5)
+
+        boost_level, boosted_at, reason = resolve_heat_demand_fan_boost(
+            snapshot,
+            demand,
+            ("office",),
+            13.99,
+            now=now,
+        )
+
+        self.assertEqual(boost_level, 1)
+        self.assertEqual(boosted_at, now)
+        self.assertIn("eligible", reason)
+
+        self.assertEqual(
+            resolve_heat_demand_fan_boost(snapshot, demand, ("office",), 14.0, now=now)[:2],
+            (0, None),
+        )
+        self.assertEqual(
+            resolve_heat_demand_fan_boost(snapshot, demand, ("dining",), 13.99, now=now)[:2],
+            (0, None),
+        )
+        self.assertEqual(
+            resolve_heat_demand_fan_boost(
+                snapshot,
+                EquipmentDemand(cool_requested=True, max_temperature_deficit=3.0),
+                ("office",),
+                13.99,
+                now=now,
+            )[:2],
+            (0, None),
+        )
+        self.assertEqual(
+            resolve_heat_demand_fan_boost(snapshot, demand, ("office",), None, now=now)[:2],
+            (0, None),
+        )
+        self.assertEqual(
+            resolve_heat_demand_fan_boost(snapshot, demand, ("office",), float("nan"), now=now)[:2],
+            (0, None),
+        )
+
+    def test_heat_demand_fan_boost_ramps_once_every_fifteen_minutes_and_caps_at_three(self):
+        now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "18.1",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("20.0"),
+            )
+        )
+        demand = EquipmentDemand(heat_requested=True, max_temperature_deficit=0.5)
+
+        level, boosted_at, _ = resolve_heat_demand_fan_boost(snapshot, demand, ("office",), 13.5, now=now)
+        self.assertEqual((level, boosted_at), (1, now))
+
+        level, next_boosted_at, _ = resolve_heat_demand_fan_boost(
+            snapshot,
+            demand,
+            ("office",),
+            13.5,
+            previous_boost_level=level,
+            last_boost_at=boosted_at,
+            now=now + timedelta(minutes=14, seconds=59),
+        )
+        self.assertEqual((level, next_boosted_at), (1, now))
+
+        level, boosted_at, _ = resolve_heat_demand_fan_boost(
+            snapshot,
+            demand,
+            ("office",),
+            13.5,
+            previous_boost_level=level,
+            last_boost_at=next_boosted_at,
+            now=now + timedelta(minutes=15),
+        )
+        self.assertEqual((level, boosted_at), (2, now + timedelta(minutes=15)))
+
+        level, boosted_at, _ = resolve_heat_demand_fan_boost(
+            snapshot,
+            demand,
+            ("office",),
+            13.5,
+            previous_boost_level=level,
+            last_boost_at=boosted_at,
+            now=now + timedelta(minutes=30),
+        )
+        self.assertEqual((level, boosted_at), (3, now + timedelta(minutes=30)))
+
+        level, boosted_at, _ = resolve_heat_demand_fan_boost(
+            snapshot,
+            demand,
+            ("office",),
+            13.5,
+            previous_boost_level=level,
+            last_boost_at=boosted_at,
+            now=now + timedelta(minutes=45),
+        )
+        self.assertEqual((level, boosted_at), (3, now + timedelta(minutes=30)))
+
+    def test_heat_demand_fan_boost_is_added_before_zone_multiplier_and_never_applies_to_cooling(self):
+        supported_fan_modes = tuple(f"Level {level}" for level in range(1, 7))
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.0),
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+                base_fan_boost=1,
+            ),
+            "Level 4",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "heat",
+                EquipmentDemand(heat_requested=True, max_temperature_deficit=1.0),
+                open_zone_count=4,
+                supported_fan_modes=supported_fan_modes,
+                base_fan_boost=3,
+            ),
+            "Level 6",
+        )
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 1",
+                "cool",
+                EquipmentDemand(cool_requested=True, max_temperature_deficit=1.0),
+                supported_fan_modes=supported_fan_modes,
+                base_fan_boost=3,
+            ),
+            "Level 1",
+        )
+
+    def test_run_control_pass_records_heat_demand_fan_boost_runtime_state(self):
+        now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "input_select.temptamer_hvac_mode": "Heat",
+                    "sensor.office_average_temperature": "18.1",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR: "13.9",
+                    TEST_CLIMATE_ENTITY: "heat",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 1",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "temperature": 20,
+            "current_temperature": 20,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+        temptamer_main._system_now = lambda: now
+
+        try:
+            temptamer_main.run_control_pass(reason="heat demand fan boost test")
+        finally:
+            temptamer_main._system_now = real_system_now
+
+        self.assertIn(
+            call(
+                "climate",
+                "set_fan_mode",
+                blocking=True,
+                entity_id=TEST_CLIMATE_ENTITY,
+                fan_mode="Level 2",
+            ),
+            service_call.call_args_list,
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["heat_demand_fan_boost_level"], 1)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["last_heat_demand_fan_boost_at"], now)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["max_power_demand_5m_kw"], 13.9)
+        self.assertIn("eligible", temptamer_main.RUNTIME_STATE["heat_demand_fan_boost_reason"])
+        status_attributes = temptamer_main.state.getattr(temptamer_main.STATUS_ENTITY_ID)
+        self.assertEqual(status_attributes["heat_demand_fan_boost_level"], 1)
 
     def test_fan_speed_level_scales_with_effective_open_zone_count(self):
         supported_fan_modes = ("Level 1", "Level 2", "Level 3", "Level 4", "Level 5", "Level 6")

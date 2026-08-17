@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import (
     DEFAULT_SYSTEM_CONFIG,
+    EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
     GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
@@ -36,6 +37,7 @@ from .heatpump_dispatcher import (
     apply_zone_actions,
     build_dispatch_plan,
     is_fan_speed_decrease,
+    resolve_heat_demand_fan_boost,
     resolve_idle_started_at,
 )
 from .state_reader import build_snapshot, is_switch_on, parse_float
@@ -166,6 +168,10 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
     "last_fan_speed_decrease_at": None,
+    "heat_demand_fan_boost_level": 0,
+    "last_heat_demand_fan_boost_at": None,
+    "max_power_demand_5m_kw": None,
+    "heat_demand_fan_boost_reason": None,
     "last_trigger": None,
     "powerday_export_power_samples": [],
     "powerday_export_average": None,
@@ -316,6 +322,10 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
             "last_fan_speed_decrease_at": _isoformat(RUNTIME_STATE.get("last_fan_speed_decrease_at")),
+            "heat_demand_fan_boost_level": RUNTIME_STATE.get("heat_demand_fan_boost_level", 0),
+            "last_heat_demand_fan_boost_at": _isoformat(RUNTIME_STATE.get("last_heat_demand_fan_boost_at")),
+            "max_power_demand_5m_kw": RUNTIME_STATE.get("max_power_demand_5m_kw"),
+            "heat_demand_fan_boost_reason": RUNTIME_STATE.get("heat_demand_fan_boost_reason"),
             "powerday_export_average": RUNTIME_STATE.get("powerday_export_average"),
             "powerday_battery_remaining": RUNTIME_STATE.get("powerday_battery_remaining"),
             "powerday_heat_sink_started_at": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_started_at")),
@@ -753,6 +763,10 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
     RUNTIME_STATE.setdefault("last_fan_speed_decrease_at", None)
+    RUNTIME_STATE.setdefault("heat_demand_fan_boost_level", 0)
+    RUNTIME_STATE.setdefault("last_heat_demand_fan_boost_at", None)
+    RUNTIME_STATE.setdefault("max_power_demand_5m_kw", None)
+    RUNTIME_STATE.setdefault("heat_demand_fan_boost_reason", None)
     RUNTIME_STATE["last_trigger"] = reason
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
@@ -818,6 +832,24 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         operation_mode=operating_mode,
     )
+    max_power_demand_5m_kw = parse_float(controller.get_state(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR))
+    (
+        heat_demand_fan_boost_level,
+        last_heat_demand_fan_boost_at,
+        heat_demand_fan_boost_reason,
+    ) = resolve_heat_demand_fan_boost(
+        snapshot,
+        demand,
+        predicted_open_zones,
+        max_power_demand_5m_kw,
+        previous_boost_level=RUNTIME_STATE["heat_demand_fan_boost_level"],
+        last_boost_at=RUNTIME_STATE["last_heat_demand_fan_boost_at"],
+        now=now,
+    )
+    RUNTIME_STATE["heat_demand_fan_boost_level"] = heat_demand_fan_boost_level
+    RUNTIME_STATE["last_heat_demand_fan_boost_at"] = last_heat_demand_fan_boost_at
+    RUNTIME_STATE["max_power_demand_5m_kw"] = max_power_demand_5m_kw
+    RUNTIME_STATE["heat_demand_fan_boost_reason"] = heat_demand_fan_boost_reason
 
     if zone_actions:
         apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
@@ -853,6 +885,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         idle_shutdown_zone_key=RUNTIME_STATE["idle_shutdown_zone_key"],
         supported_fan_modes=supported_fan_modes,
         fan_speed_decrease_at=RUNTIME_STATE["last_fan_speed_decrease_at"],
+        base_fan_boost=heat_demand_fan_boost_level,
         now=now,
     )
 
@@ -887,7 +920,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _update_idle_heat_runtime_state(plan, now)
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s setpoint=%s open_zones=%s temp=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -896,6 +929,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         plan.hvac_mode or "off",
         plan.idle,
         plan.fan_mode,
+        heat_demand_fan_boost_level,
         plan.setpoint,
         _describe_open_zones(plan.open_zones),
         _format_zone_temps(snapshot, plan),

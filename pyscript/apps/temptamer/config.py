@@ -22,6 +22,9 @@ GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_
 GOODWE_BATTERY_REMAINING_SENSOR = "sensor.goodwe_actual_battery_remaining"
 GOODWE_PV_POWER_SENSOR = "sensor.goodwe_pv_power"
 EAGLE_200_POWER_DEMAND_SENSOR = "sensor.eagle_200_power_demand"
+# This must be a kW-valued, rolling five-minute maximum-demand sensor.  Change
+# the entity ID to match the helper configured in Home Assistant.
+EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR = "sensor.eagle_200_max_power_demand_5m"
 POWERDAY_BATTERY_THRESHOLD = 95.0
 POWERDAY_EXPORT_POWER_THRESHOLD = -1.0
 POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS = 10 * 60
@@ -218,6 +221,7 @@ def _add_mode_trigger_entity(entity_id: str | None) -> None:
 
 _add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
 _add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity)
+_add_mode_trigger_entity(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR)
 for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values():
     _add_mode_trigger_entity(entity_id)
 for comfort_mode in DEFAULT_SYSTEM_CONFIG.comfort_modes.values():
