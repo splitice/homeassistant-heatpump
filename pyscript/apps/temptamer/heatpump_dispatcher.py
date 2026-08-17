@@ -957,6 +957,13 @@ def build_dispatch_plan(
     base_fan_boost: int = 0,
     now: datetime | None = None,
 ) -> DispatchPlan:
+    if snapshot.poweroff_forced_off:
+        return DispatchPlan(
+            turn_off=True,
+            open_zones=predicted_open_zones,
+            reason="PowerOff is waiting for its activation conditions",
+        )
+
     if snapshot.comfort_mode == COMFORT_MODE_OFF or snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="comfort mode is Off")
 

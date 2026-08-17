@@ -72,6 +72,7 @@ class DemandSnapshot:
     continue_cooling_zones: tuple[str, ...]
     above_ideal_zones: tuple[str, ...]
     at_or_below_ideal_zones: tuple[str, ...]
+    poweroff_forced_off: bool = False
 
 
 @dataclass(frozen=True)

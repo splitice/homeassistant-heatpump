@@ -8,6 +8,7 @@ from .constants import (
     COMFORT_MODE_NIGHT,
     COMFORT_MODE_OFFICE,
     COMFORT_MODE_POWER_DAY,
+    COMFORT_MODE_POWER_OFF,
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
@@ -15,7 +16,7 @@ from .constants import (
     SCHEME_NIGHT,
     SCHEME_OFF,
 )
-from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode, ScheduledComfortMode
+from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode, PowerOffComfortMode, ScheduledComfortMode
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
 GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
@@ -32,6 +33,12 @@ POWERDAY_HEAT_SINK_MIN_SECONDS = 15 * 60
 POWERDAY_FREE_POWER_START_TIME = time(11, 0)
 POWERDAY_FREE_POWER_PV_POWER_THRESHOLD = 6.0
 POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS = 15 * 60
+POWEROFF_ACTIVATION_BATTERY_THRESHOLD = 95.0
+POWEROFF_DEACTIVATION_BATTERY_THRESHOLD = 90.0
+POWEROFF_PV_POWER_THRESHOLD = 1.0
+POWEROFF_MIN_ACTIVATION_SECONDS = 15 * 60
+POWEROFF_DAY_START_TIME = time(8, 0)
+POWEROFF_DAY_END_TIME = time(22, 0)
 
 DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
@@ -148,9 +155,23 @@ DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
     "bedroom_3_4": SCHEME_BEDROOM,
 }
 
+DEFAULT_COMFORT_MODE_OFF = DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING)
+DEFAULT_COMFORT_MODE_NIGHT = NightComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING)
+DEFAULT_COMFORT_MODE_POWER_DAY = PowerComfortMode(
+    name=COMFORT_MODE_POWER_DAY,
+    zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+    trigger_entity_ids=(
+        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+        GOODWE_BATTERY_REMAINING_SENSOR,
+        GOODWE_PV_POWER_SENSOR,
+        EAGLE_200_POWER_DEMAND_SENSOR,
+    ),
+    power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
+)
+
 DEFAULT_COMFORT_MODES = {
-    COMFORT_MODE_OFF: DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING),
-    COMFORT_MODE_NIGHT: NightComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING),
+    COMFORT_MODE_OFF: DEFAULT_COMFORT_MODE_OFF,
+    COMFORT_MODE_NIGHT: DEFAULT_COMFORT_MODE_NIGHT,
     COMFORT_MODE_DAY: ScheduledComfortMode(
         name=COMFORT_MODE_DAY,
         zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING,
@@ -159,16 +180,21 @@ DEFAULT_COMFORT_MODES = {
         },
     ),
     COMFORT_MODE_OFFICE: DefaultComfortMode(name=COMFORT_MODE_OFFICE, zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING),
-    COMFORT_MODE_POWER_DAY: PowerComfortMode(
-        name=COMFORT_MODE_POWER_DAY,
-        zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+    COMFORT_MODE_POWER_DAY: DEFAULT_COMFORT_MODE_POWER_DAY,
+    COMFORT_MODE_POWER_OFF: PowerOffComfortMode(
+        name=COMFORT_MODE_POWER_OFF,
+        zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING,
+        power_day_mode=DEFAULT_COMFORT_MODE_POWER_DAY,
+        night_mode=DEFAULT_COMFORT_MODE_NIGHT,
+        off_mode=DEFAULT_COMFORT_MODE_OFF,
+        day_start_time=POWEROFF_DAY_START_TIME,
+        day_end_time=POWEROFF_DAY_END_TIME,
         trigger_entity_ids=(
             GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
             GOODWE_BATTERY_REMAINING_SENSOR,
             GOODWE_PV_POWER_SENSOR,
             EAGLE_200_POWER_DEMAND_SENSOR,
         ),
-        power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     ),
 }
 

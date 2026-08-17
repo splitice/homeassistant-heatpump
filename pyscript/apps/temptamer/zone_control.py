@@ -306,6 +306,18 @@ def resolve_zone_actions(
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
         return actions, tuple(sorted(predicted_open))
 
+    if snapshot.poweroff_forced_off:
+        for key in tuple(sorted(predicted_open)):
+            actions.append(
+                ZoneAction(
+                    zone_key=key,
+                    turn_on=False,
+                    reason="PowerOff is waiting for its activation conditions",
+                    discretionary=False,
+                )
+            )
+        return actions, tuple()
+
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
         for key in tuple(sorted(predicted_open)):
             actions.append(

@@ -20,10 +20,15 @@ from .config import (
     POWERDAY_FREE_POWER_PV_POWER_THRESHOLD,
     POWERDAY_FREE_POWER_START_TIME,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
+    POWEROFF_ACTIVATION_BATTERY_THRESHOLD,
+    POWEROFF_DEACTIVATION_BATTERY_THRESHOLD,
+    POWEROFF_MIN_ACTIVATION_SECONDS,
+    POWEROFF_PV_POWER_THRESHOLD,
 )
 from .constants import (
     APP_NAME,
     COMFORT_MODE_POWER_DAY,
+    COMFORT_MODE_POWER_OFF,
     CONTROL_HVAC_MODE_MANUAL,
     CONTROL_INTERVAL_SECONDS,
     HVAC_COOL,
@@ -185,6 +190,12 @@ RUNTIME_STATE: dict[str, Any] = {
     "powerday_free_power_later_started_at": None,
     "powerday_free_power_later_active": False,
     "powerday_free_power_later_reason": None,
+    "poweroff_battery_remaining": None,
+    "poweroff_pv_power": None,
+    "poweroff_activation_started_at": None,
+    "poweroff_activation_hold_until": None,
+    "poweroff_active": False,
+    "poweroff_reason": None,
 }
 
 
@@ -338,6 +349,12 @@ def _publish_runtime_state(status: str) -> None:
             ),
             "powerday_free_power_later_active": RUNTIME_STATE.get("powerday_free_power_later_active"),
             "powerday_free_power_later_reason": RUNTIME_STATE.get("powerday_free_power_later_reason"),
+            "poweroff_battery_remaining": RUNTIME_STATE.get("poweroff_battery_remaining"),
+            "poweroff_pv_power": RUNTIME_STATE.get("poweroff_pv_power"),
+            "poweroff_activation_started_at": _isoformat(RUNTIME_STATE.get("poweroff_activation_started_at")),
+            "poweroff_activation_hold_until": _isoformat(RUNTIME_STATE.get("poweroff_activation_hold_until")),
+            "poweroff_active": RUNTIME_STATE.get("poweroff_active"),
+            "poweroff_reason": RUNTIME_STATE.get("poweroff_reason"),
             "last_error": RUNTIME_STATE["last_error"],
         },
     )
@@ -750,6 +767,133 @@ def _update_powerday_free_power_later_runtime_state(controller: PyscriptControll
     )
 
 
+def _set_poweroff_runtime_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    hold_until: datetime | None,
+    reason: str,
+) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("poweroff_active"))
+    RUNTIME_STATE["poweroff_activation_started_at"] = started_at
+    RUNTIME_STATE["poweroff_activation_hold_until"] = hold_until
+    RUNTIME_STATE["poweroff_active"] = active
+    RUNTIME_STATE["poweroff_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "POWEROFF: active=%s battery=%s pv_power=%s hold_until=%s reason=%s",
+            active,
+            RUNTIME_STATE.get("poweroff_battery_remaining"),
+            RUNTIME_STATE.get("poweroff_pv_power"),
+            _isoformat(hold_until),
+            reason,
+        )
+
+    return active
+
+
+def _update_poweroff_runtime_state(controller: PyscriptController, now: datetime) -> bool:
+    normalized_now = _normalize_runtime_datetime(now) or _system_now()
+    selected_comfort_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity) or "")
+    battery_remaining = parse_float(controller.get_state(GOODWE_BATTERY_REMAINING_SENSOR))
+    pv_power = parse_float(controller.get_state(GOODWE_PV_POWER_SENSOR))
+    RUNTIME_STATE["poweroff_battery_remaining"] = battery_remaining
+    RUNTIME_STATE["poweroff_pv_power"] = pv_power
+
+    if selected_comfort_mode != COMFORT_MODE_POWER_OFF:
+        return _set_poweroff_runtime_state(
+            active=False,
+            started_at=None,
+            hold_until=None,
+            reason="comfort mode is not PowerOff",
+        )
+
+    selected_hvac_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity) or "")
+    if selected_hvac_mode.strip().lower() == "off":
+        return _set_poweroff_runtime_state(
+            active=False,
+            started_at=None,
+            hold_until=None,
+            reason="HVAC mode is Off",
+        )
+
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("poweroff_activation_started_at"))
+    if started_at is None:
+        if battery_remaining is None:
+            return _set_poweroff_runtime_state(
+                active=False,
+                started_at=None,
+                hold_until=None,
+                reason="missing battery remaining",
+            )
+        if battery_remaining <= POWEROFF_ACTIVATION_BATTERY_THRESHOLD:
+            return _set_poweroff_runtime_state(
+                active=False,
+                started_at=None,
+                hold_until=None,
+                reason=(
+                    f"battery {battery_remaining:.1f} <= "
+                    f"{POWEROFF_ACTIVATION_BATTERY_THRESHOLD:.1f}"
+                ),
+            )
+        if pv_power is None:
+            return _set_poweroff_runtime_state(
+                active=False,
+                started_at=None,
+                hold_until=None,
+                reason="missing PV power",
+            )
+        if pv_power <= POWEROFF_PV_POWER_THRESHOLD:
+            return _set_poweroff_runtime_state(
+                active=False,
+                started_at=None,
+                hold_until=None,
+                reason=f"PV power {pv_power:.2f} <= {POWEROFF_PV_POWER_THRESHOLD:.2f}",
+            )
+
+        started_at = normalized_now
+        hold_until = started_at + timedelta(seconds=POWEROFF_MIN_ACTIVATION_SECONDS)
+        return _set_poweroff_runtime_state(
+            active=True,
+            started_at=started_at,
+            hold_until=hold_until,
+            reason=(
+                f"battery {battery_remaining:.1f} > {POWEROFF_ACTIVATION_BATTERY_THRESHOLD:.1f}; "
+                f"PV power {pv_power:.2f} > {POWEROFF_PV_POWER_THRESHOLD:.2f}"
+            ),
+        )
+
+    hold_until = started_at + timedelta(seconds=POWEROFF_MIN_ACTIVATION_SECONDS)
+    if battery_remaining is not None and battery_remaining < POWEROFF_DEACTIVATION_BATTERY_THRESHOLD:
+        if normalized_now >= hold_until:
+            return _set_poweroff_runtime_state(
+                active=False,
+                started_at=None,
+                hold_until=None,
+                reason=(
+                    f"battery {battery_remaining:.1f} < "
+                    f"{POWEROFF_DEACTIVATION_BATTERY_THRESHOLD:.1f} after minimum activation"
+                ),
+            )
+        return _set_poweroff_runtime_state(
+            active=True,
+            started_at=started_at,
+            hold_until=hold_until,
+            reason=(
+                f"minimum activation hold until {hold_until.isoformat()}; "
+                f"battery {battery_remaining:.1f} < {POWEROFF_DEACTIVATION_BATTERY_THRESHOLD:.1f}"
+            ),
+        )
+
+    return _set_poweroff_runtime_state(
+        active=True,
+        started_at=started_at,
+        hold_until=hold_until,
+        reason=f"active; battery {battery_remaining if battery_remaining is not None else 'unknown'} has not fallen below {POWEROFF_DEACTIVATION_BATTERY_THRESHOLD:.1f}",
+    )
+
+
 def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None:
     task.unique(CONTROL_PASS_TASK_NAME)
 
@@ -767,10 +911,17 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("last_heat_demand_fan_boost_at", None)
     RUNTIME_STATE.setdefault("max_power_demand_5m_kw", None)
     RUNTIME_STATE.setdefault("heat_demand_fan_boost_reason", None)
+    RUNTIME_STATE.setdefault("poweroff_battery_remaining", None)
+    RUNTIME_STATE.setdefault("poweroff_pv_power", None)
+    RUNTIME_STATE.setdefault("poweroff_activation_started_at", None)
+    RUNTIME_STATE.setdefault("poweroff_activation_hold_until", None)
+    RUNTIME_STATE.setdefault("poweroff_active", False)
+    RUNTIME_STATE.setdefault("poweroff_reason", None)
     RUNTIME_STATE["last_trigger"] = reason
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
     powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(controller, now)
+    poweroff_active = _update_poweroff_runtime_state(controller, now)
 
     snapshot = build_snapshot(
         controller,
@@ -779,6 +930,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         pending_switch_states=RUNTIME_STATE["pending_zone_state"],
         heat_sink_available=powerday_heat_sink_active,
         free_power_later_available=powerday_free_power_later_active,
+        poweroff_active=poweroff_active,
         now=now,
     )
 

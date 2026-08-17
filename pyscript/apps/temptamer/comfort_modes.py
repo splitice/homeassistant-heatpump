@@ -20,6 +20,7 @@ class ComfortModeSnapshotData:
     free_power_available: bool
     heat_sink_available: bool
     free_power_later_available: bool = False
+    poweroff_active: bool = False
     now: datetime | None = None
 
 
@@ -228,6 +229,32 @@ class PowerComfortMode(DefaultComfortMode):
             return float(price_state_text) == float(self.free_power_state)
         except (TypeError, ValueError):
             return False
+
+
+@dataclass(frozen=True)
+class PowerOffComfortMode(DefaultComfortMode):
+    """Use another comfort mode while the PowerOff activation is latched."""
+
+    # PyScript evaluates dataclass field annotations at runtime and does not
+    # support ``Type | None`` expressions there.
+    power_day_mode: object = None
+    night_mode: object = None
+    off_mode: object = None
+    day_start_time: time = time(8, 0)
+    day_end_time: time = time(22, 0)
+
+    def effective_mode(self, snapshot_data: ComfortModeSnapshotData) -> DefaultComfortMode:
+        if self.power_day_mode is None or self.night_mode is None or self.off_mode is None:
+            raise ValueError("PowerOffComfortMode requires PowerDay, Night, and Off mode definitions")
+        if not snapshot_data.poweroff_active:
+            return self.off_mode
+        if snapshot_data.now is None:
+            return self.power_day_mode
+
+        current_time = snapshot_data.now.time()
+        if self.day_start_time <= current_time < self.day_end_time:
+            return self.power_day_mode
+        return self.night_mode
 
 
 DefaultComforMode = DefaultComfortMode

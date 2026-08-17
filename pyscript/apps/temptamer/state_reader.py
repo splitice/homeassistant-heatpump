@@ -9,6 +9,7 @@ from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_AUTO,
     COMFORT_MODE_OFF,
+    COMFORT_MODE_POWER_OFF,
     CONTROL_HVAC_MODE_COOL,
     CONTROL_HVAC_MODE_HEAT,
     CONTROL_HVAC_MODE_HEATCOOL,
@@ -153,6 +154,9 @@ def _resolve_comfort_mode_scheme_name(
     snapshot_data: ComfortModeSnapshotData,
 ) -> str:
     comfort_mode_behavior = config.comfort_modes[comfort_mode]
+    effective_mode = getattr(comfort_mode_behavior, "effective_mode", None)
+    if callable(effective_mode):
+        comfort_mode_behavior = effective_mode(snapshot_data)
     scheme_for_zone = getattr(comfort_mode_behavior, "scheme_for_zone", None)
     if callable(scheme_for_zone):
         return scheme_for_zone(zone_key, reader, snapshot_data)
@@ -200,17 +204,13 @@ def build_snapshot(
     pending_switch_states: Mapping[str, object] | None = None,
     heat_sink_available: bool = False,
     free_power_later_available: bool = False,
+    poweroff_active: bool = False,
     now: datetime | None = None,
 ) -> DemandSnapshot:
     last_switch_changes = last_switch_changes or {}
     pending_switch_states = pending_switch_states or {}
     raw_mode = reader.get_state(config.comfort_mode_entity)
     comfort_mode = _resolve_comfort_mode(raw_mode, config)
-    comfort_mode_behavior = config.comfort_modes[comfort_mode]
-    free_power_is_available = getattr(comfort_mode_behavior, "free_power_is_available", None)
-    free_power_available = free_power_is_available(reader) if callable(free_power_is_available) else False
-    resolved_heat_sink_available = free_power_available or bool(heat_sink_available)
-    resolved_free_power_later_available = free_power_available and bool(free_power_later_available)
     raw_hvac_mode = reader.get_state(config.hvac_mode_entity)
     selected_hvac_mode = str(raw_hvac_mode) if raw_hvac_mode in VALID_HVAC_MODES else CONTROL_HVAC_MODE_HEAT
 
@@ -222,6 +222,23 @@ def build_snapshot(
         CLIMATE_CURRENT_TEMPERATURE_ATTR,
         house_temp,
     )
+    initial_snapshot_data = ComfortModeSnapshotData(
+        comfort_mode=comfort_mode,
+        selected_hvac_mode=selected_hvac_mode,
+        inlet_temp=inlet_temp,
+        free_power_available=False,
+        heat_sink_available=False,
+        poweroff_active=poweroff_active,
+        now=now,
+    )
+    comfort_mode_behavior = config.comfort_modes[comfort_mode]
+    effective_mode = getattr(comfort_mode_behavior, "effective_mode", None)
+    if callable(effective_mode):
+        comfort_mode_behavior = effective_mode(initial_snapshot_data)
+    free_power_is_available = getattr(comfort_mode_behavior, "free_power_is_available", None)
+    free_power_available = free_power_is_available(reader) if callable(free_power_is_available) else False
+    resolved_heat_sink_available = free_power_available or bool(heat_sink_available)
+    resolved_free_power_later_available = free_power_available and bool(free_power_later_available)
     snapshot_data = ComfortModeSnapshotData(
         comfort_mode=comfort_mode,
         selected_hvac_mode=selected_hvac_mode,
@@ -229,6 +246,7 @@ def build_snapshot(
         free_power_available=free_power_available,
         heat_sink_available=resolved_heat_sink_available,
         free_power_later_available=resolved_free_power_later_available,
+        poweroff_active=poweroff_active,
         now=now,
     )
 
@@ -348,6 +366,7 @@ def build_snapshot(
         free_power_available=free_power_available,
         heat_sink_available=resolved_heat_sink_available,
         free_power_later_available=resolved_free_power_later_available,
+        poweroff_forced_off=comfort_mode == COMFORT_MODE_POWER_OFF and not poweroff_active,
         zones=zones,
         heat_calling_zones=heat_calling,
         continue_heating_zones=continue_heating,

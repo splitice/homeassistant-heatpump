@@ -11,6 +11,7 @@ from pyscript.apps.temptamer.comfort_modes import (
     DefaultComfortMode,
     NightComfortMode,
     PowerComfortMode,
+    PowerOffComfortMode,
     ScheduledComfortMode,
 )
 from pyscript.apps.temptamer.config import (
@@ -24,10 +25,12 @@ from pyscript.apps.temptamer.config import (
     POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
     POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
+    POWEROFF_MIN_ACTIVATION_SECONDS,
 )
 from pyscript.apps.temptamer.constants import (
     COMFORT_MODE_NIGHT,
     COMFORT_MODE_POWER_DAY,
+    COMFORT_MODE_POWER_OFF,
     FAN_LOW,
     HVAC_COOL,
     HVAC_FAN_ONLY,
@@ -151,6 +154,7 @@ def build_behavior_snapshot(
     pending_switch_states=None,
     heat_sink_available=False,
     free_power_later_available=False,
+    poweroff_active=False,
     now=None,
 ):
     return build_snapshot(
@@ -160,6 +164,7 @@ def build_behavior_snapshot(
         pending_switch_states=pending_switch_states,
         heat_sink_available=heat_sink_available,
         free_power_later_available=free_power_later_available,
+        poweroff_active=poweroff_active,
         now=now,
     )
 
@@ -267,11 +272,13 @@ class TempTamerTests(unittest.TestCase):
         day_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"]
         night_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_NIGHT]
         power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+        poweroff_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_OFF]
 
         self.assertIsInstance(day_mode, DefaultComfortMode)
         self.assertIsInstance(day_mode, ScheduledComfortMode)
         self.assertIsInstance(night_mode, NightComfortMode)
         self.assertIsInstance(power_mode, PowerComfortMode)
+        self.assertIsInstance(poweroff_mode, PowerOffComfortMode)
         self.assertEqual(day_mode.fan_speed_level(2.6, 1, current_speed_level=1), 1)
         self.assertEqual(day_mode.fan_speed_level(2.6, 1, current_speed_level=1, starting=True), 2)
         self.assertEqual(night_mode.fan_speed_level(4.1, 1, current_speed_level=1), 1)
@@ -283,6 +290,129 @@ class TempTamerTests(unittest.TestCase):
         self.assertIn(GOODWE_PV_POWER_SENSOR, MODE_TRIGGER_ENTITIES)
         self.assertIn(EAGLE_200_POWER_DEMAND_SENSOR, MODE_TRIGGER_ENTITIES)
         self.assertIn(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR, MODE_TRIGGER_ENTITIES)
+
+    def test_poweroff_uses_powerday_during_the_day_and_night_outside_it(self):
+        day_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            poweroff_active=True,
+            now=datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc),
+        )
+        night_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            poweroff_active=True,
+            now=datetime(2026, 7, 25, 22, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsInstance(day_snapshot.comfort_mode_behavior, PowerComfortMode)
+        self.assertEqual(day_snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
+        self.assertEqual(day_snapshot.zones["downstairs"].scheme.name, SCHEME_DINING_BASIC)
+        self.assertIsInstance(night_snapshot.comfort_mode_behavior, NightComfortMode)
+        self.assertTrue(all(zone.scheme.name == SCHEME_NIGHT for zone in night_snapshot.zones.values()))
+
+    def test_poweroff_forces_the_heatpump_off_until_activation(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                        TEST_CLIMATE_ENTITY: "heat",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            poweroff_active=False,
+            now=datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc),
+        )
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc),
+            operation_mode=HVAC_HEAT,
+        )
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(),
+            predicted_open,
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+        )
+
+        self.assertTrue(snapshot.poweroff_forced_off)
+        self.assertEqual([(action.zone_key, action.turn_on) for action in actions], [("office", False)])
+        self.assertEqual(predicted_open, ())
+        self.assertTrue(plan.turn_off)
+
+    def test_poweroff_latches_for_fifteen_minutes_then_stops_below_ninety_percent(self):
+        start = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                    GOODWE_BATTERY_REMAINING_SENSOR: "95.1",
+                    GOODWE_PV_POWER_SENSOR: "1.1",
+                }
+            )
+        )
+
+        self.assertTrue(temptamer_main._update_poweroff_runtime_state(active_reader, start))
+        self.assertEqual(temptamer_main.RUNTIME_STATE["poweroff_activation_started_at"], start)
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["poweroff_activation_hold_until"],
+            start + timedelta(seconds=POWEROFF_MIN_ACTIVATION_SECONDS),
+        )
+
+        low_battery_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                    GOODWE_BATTERY_REMAINING_SENSOR: "89.9",
+                    GOODWE_PV_POWER_SENSOR: "0",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_poweroff_runtime_state(low_battery_reader, start + timedelta(minutes=14)))
+        self.assertFalse(
+            temptamer_main._update_poweroff_runtime_state(
+                low_battery_reader,
+                start + timedelta(seconds=POWEROFF_MIN_ACTIVATION_SECONDS),
+            )
+        )
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["poweroff_activation_started_at"])
+        self.assertIn("after minimum activation", temptamer_main.RUNTIME_STATE["poweroff_reason"])
+
+    def test_poweroff_clears_its_activation_immediately_when_another_comfort_mode_is_selected(self):
+        start = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+        poweroff_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_OFF,
+                    GOODWE_BATTERY_REMAINING_SENSOR: "96",
+                    GOODWE_PV_POWER_SENSOR: "2",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_poweroff_runtime_state(poweroff_reader, start))
+
+        other_mode_reader = FakeReader(base_state_map(**{"input_select.temptamer_comfort_mode": "Day"}))
+        self.assertFalse(temptamer_main._update_poweroff_runtime_state(other_mode_reader, start + timedelta(minutes=1)))
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["poweroff_activation_started_at"])
+        self.assertEqual(temptamer_main.RUNTIME_STATE["poweroff_reason"], "comfort mode is not PowerOff")
 
     def test_powerday_uses_office_mapping_when_power_is_not_free(self):
         snapshot = build_behavior_snapshot(
