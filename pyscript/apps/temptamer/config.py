@@ -23,6 +23,7 @@ from .comfort_adjustments import (
     ComfortAdjustmentRoomConfig,
     ComfortAdjustmentZoneConfig,
     ConstructionProfile,
+    FabricSolarConfig,
     RoomEnvelopeConfig,
     WindowConfig,
 )
@@ -424,6 +425,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ),
             ),
             upstairs=True,
+            fabric_solar=FabricSolarConfig(
+                filter_time_constant_seconds=30 * 60,
+                irradiance_threshold=20.0,
+                score_coefficient=0.0045,
+                score_limit=0.40,
+            ),
         ),
         ComfortAdjustmentZoneConfig(
             key="dining",

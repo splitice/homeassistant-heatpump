@@ -42,6 +42,16 @@ class RoomEnvelopeConfig:
 
 
 @dataclass(frozen=True)
+class FabricSolarConfig:
+    """Per-zone calibration for delayed solar warmth in fabric and contents."""
+
+    filter_time_constant_seconds: int = 30 * 60
+    irradiance_threshold: float = 20.0
+    score_coefficient: float = 0.0045
+    score_limit: float = 0.40
+
+
+@dataclass(frozen=True)
 class ComfortAdjustmentRoomConfig:
     primary_temperature_entity_id: str
     fallback_temperature_entity_id: str | None = None
@@ -57,6 +67,9 @@ class ComfortAdjustmentZoneConfig:
     fallback_temperature_entity_id: str | None
     rooms: tuple[ComfortAdjustmentRoomConfig, ...]
     upstairs: bool = False
+    # Keep this as ``object`` for the PyScript evaluator; see the equivalent
+    # envelope field above.
+    fabric_solar: object = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +128,7 @@ class ComfortAdjustmentResult:
     effective_window_outdoor_temperatures: Mapping[str, float | None]
     effective_wall_outdoor_temperatures: Mapping[str, float | None]
     solar_index: float
+    filtered_solar_irradiances: Mapping[str, float | None]
     operating_modes: Mapping[str, str | None]
     operating_mode: str | None
     operating_mode_source: str
@@ -123,6 +137,7 @@ class ComfortAdjustmentResult:
     reference_temperatures: Mapping[str, float | None]
     envelope_adjustments: Mapping[str, float]
     solar_adjustments: Mapping[str, float]
+    fabric_solar_scores: Mapping[str, float]
     raw_adjustments: Mapping[str, float]
     adjustments: Mapping[str, float]
     calculation_validity: Mapping[str, bool]
@@ -771,14 +786,25 @@ def _calculate_room_operative_adjustment(
     if operative_denominator < config.minimum_operative_denominator:
         return None
 
-    envelope_adjustment = (1.0 - config.operative_air_weight) * conductive_drive / operative_denominator
+    envelope_target_compensation = (
+        (1.0 - config.operative_air_weight) * conductive_drive / operative_denominator
+    )
     solar_mrt_increase = config.solar_mrt_coefficient * solar_drive
-    solar_adjustment = -(
+    current_solar_adjustment = -(
         (1.0 - config.operative_air_weight) * solar_mrt_increase / operative_denominator
     )
-    solar_adjustment = _clamp(solar_adjustment, -config.solar_adjustment_limit, config.solar_adjustment_limit)
-    room_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
-    return envelope_adjustment, solar_adjustment, room_adjustment, {
+    current_solar_adjustment = _clamp(
+        current_solar_adjustment,
+        -config.solar_adjustment_limit,
+        config.solar_adjustment_limit,
+    )
+    # A comfort score uses the inverse polarity of a target compensation:
+    # cold fabric is negative (request heating sooner), solar warmth positive
+    # (delay heating).  The consumer therefore applies target - score.
+    envelope_score = -envelope_target_compensation
+    window_solar_score = -current_solar_adjustment
+    room_comfort_score = _clamp(envelope_score + window_solar_score, -1.5, 1.5)
+    return envelope_score, window_solar_score, room_comfort_score, {
         "comfort_weight": envelope.comfort_weight,
         "construction_profile": profile.key,
         "wall_u_value": profile.wall_u_value,
@@ -802,9 +828,13 @@ def _calculate_room_operative_adjustment(
         "solar_drive": solar_drive,
         "solar_irradiance_source": irradiance_source,
         "windows": window_details,
-        "room_envelope_adjustment": envelope_adjustment,
-        "room_solar_adjustment": solar_adjustment,
-        "room_raw_adjustment": room_adjustment,
+        "envelope_target_compensation": envelope_target_compensation,
+        "current_solar_adjustment": current_solar_adjustment,
+        "envelope_score": envelope_score,
+        "window_solar_score": window_solar_score,
+        "room_envelope_adjustment": envelope_score,
+        "room_solar_adjustment": window_solar_score,
+        "room_raw_adjustment": room_comfort_score,
     }
 
 
@@ -859,20 +889,26 @@ def _calculate_room_legacy_adjustment(
     temperature_gap = _clamp((target_temperature - effective_outdoor_temperature) / 10.0, -1.0, 1.0)
     if upstairs:
         solar_coefficient = 1.35 if operating_mode == "heat" else 1.50
-        envelope_adjustment = 1.10 * envelope_transmission * temperature_gap
+        envelope_target_compensation = 1.10 * envelope_transmission * temperature_gap
     else:
         solar_coefficient = 1.00 if operating_mode == "heat" else 1.20
-        envelope_adjustment = 1.25 * temperature_gap
-    solar_adjustment = -solar_coefficient * solar_access * solar_index
-    room_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
-    return envelope_adjustment, solar_adjustment, room_adjustment, {
+        envelope_target_compensation = 1.25 * temperature_gap
+    current_solar_adjustment = -solar_coefficient * solar_access * solar_index
+    envelope_score = -envelope_target_compensation
+    window_solar_score = -current_solar_adjustment
+    room_comfort_score = _clamp(envelope_score + window_solar_score, -1.5, 1.5)
+    return envelope_score, window_solar_score, room_comfort_score, {
         "comfort_weight": envelope.comfort_weight,
         "legacy_envelope_transmission": envelope_transmission,
         "legacy_solar_access": solar_access,
         "windows": window_details,
-        "room_envelope_adjustment": envelope_adjustment,
-        "room_solar_adjustment": solar_adjustment,
-        "room_raw_adjustment": room_adjustment,
+        "envelope_target_compensation": envelope_target_compensation,
+        "current_solar_adjustment": current_solar_adjustment,
+        "envelope_score": envelope_score,
+        "window_solar_score": window_solar_score,
+        "room_envelope_adjustment": envelope_score,
+        "room_solar_adjustment": window_solar_score,
+        "room_raw_adjustment": room_comfort_score,
     }
 
 
@@ -894,6 +930,21 @@ def filter_outdoor_temperature(
         return raw_temperature
     alpha = 1.0 - exp(-elapsed_seconds / time_constant_seconds)
     return previous_temperature + (raw_temperature - previous_temperature) * alpha
+
+
+def calculate_fabric_solar_score(
+    fabric_solar: object,
+    filtered_irradiance: float | None,
+) -> float:
+    """Return a configured zone's slow solar-warmth score."""
+    if not isinstance(fabric_solar, FabricSolarConfig) or filtered_irradiance is None:
+        return 0.0
+    return _clamp(
+        fabric_solar.score_coefficient
+        * max(filtered_irradiance - fabric_solar.irradiance_threshold, 0.0),
+        0.0,
+        fabric_solar.score_limit,
+    )
 
 
 def apply_adjustment_hysteresis(
@@ -948,6 +999,7 @@ def calculate_comfort_adjustments(
     effective_wall_outdoor_temperatures: Mapping[str, float | None] | None = None,
     filter_warming_up: Mapping[str, bool] | None = None,
     cover_position_overrides: Mapping[str, tuple[float, str]] | None = None,
+    filtered_solar_irradiances: Mapping[str, float | None] | None = None,
     last_valid_operating_mode: object | None = None,
     last_valid_operating_mode_at: object | None = None,
 ) -> ComfortAdjustmentResult:
@@ -968,6 +1020,19 @@ def calculate_comfort_adjustments(
     if outdoor_temperature is None:
         outdoor_temperature = weather_temperature_reading.value
     solar_index = resolve_solar_index(reader, config)
+    resolved_filtered_solar_irradiances: dict[str, float | None] = {}
+    for zone in config.zones:
+        filtered_irradiance = (
+            filtered_solar_irradiances.get(zone.key)
+            if filtered_solar_irradiances is not None
+            else None
+        )
+        resolved_filtered_irradiance = _parse_float(filtered_irradiance)
+        resolved_filtered_solar_irradiances[zone.key] = (
+            max(0.0, resolved_filtered_irradiance)
+            if resolved_filtered_irradiance is not None
+            else None
+        )
     user_mode = reader.get_state(config.heatpump_mode_user_entity_id)
     configured_hvac_mode = reader.get_state(config.climate_entity_id)
     hvac_action = reader.get_attr(config.climate_entity_id, "hvac_action")
@@ -1018,6 +1083,7 @@ def calculate_comfort_adjustments(
     reference_temperatures: dict[str, float | None] = {}
     envelope_adjustments: dict[str, float] = {}
     solar_adjustments: dict[str, float] = {}
+    fabric_solar_scores: dict[str, float] = {}
     raw_adjustments: dict[str, float] = {}
     adjustments: dict[str, float] = {}
     calculation_validity: dict[str, bool] = {}
@@ -1055,6 +1121,7 @@ def calculate_comfort_adjustments(
             reference_temperatures[zone.key] = None
             envelope_adjustments[zone.key] = 0.0
             solar_adjustments[zone.key] = 0.0
+            fabric_solar_scores[zone.key] = 0.0
             raw_adjustments[zone.key] = 0.0
             adjustments[zone.key] = 0.0
             calculation_validity[zone.key] = False
@@ -1068,6 +1135,8 @@ def calculate_comfort_adjustments(
                 "input_issues": tuple(input_issues),
                 "outdoor_temperature_source": outdoor_temperature_source,
                 "effective_outdoor_model": "separate_window_and_wall_filters",
+                "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
+                "fabric_solar_score": 0.0,
             }
             continue
 
@@ -1132,6 +1201,7 @@ def calculate_comfort_adjustments(
         if comfort_weight_total <= 0.0 or room_calculation_failed:
             envelope_adjustments[zone.key] = 0.0
             solar_adjustments[zone.key] = 0.0
+            fabric_solar_scores[zone.key] = 0.0
             raw_adjustments[zone.key] = 0.0
             adjustments[zone.key] = 0.0
             calculation_validity[zone.key] = False
@@ -1147,13 +1217,20 @@ def calculate_comfort_adjustments(
                 "input_issues": tuple(input_issues),
                 "outdoor_temperature_source": outdoor_temperature_source,
                 "effective_outdoor_model": "separate_window_and_wall_filters",
+                "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
+                "fabric_solar_score": 0.0,
             }
             continue
         envelope_adjustment = weighted_envelope_adjustment / comfort_weight_total
         solar_adjustment = weighted_solar_adjustment / comfort_weight_total
-        raw_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
+        fabric_solar_score = calculate_fabric_solar_score(
+            zone.fabric_solar,
+            resolved_filtered_solar_irradiances[zone.key],
+        )
+        raw_adjustment = _clamp(envelope_adjustment + solar_adjustment + fabric_solar_score, -1.5, 1.5)
         envelope_adjustments[zone.key] = envelope_adjustment
         solar_adjustments[zone.key] = solar_adjustment
+        fabric_solar_scores[zone.key] = fabric_solar_score
         raw_adjustments[zone.key] = raw_adjustment
         adjustments[zone.key] = round_comfort_adjustment(raw_adjustment)
         calculation_validity[zone.key] = True
@@ -1168,6 +1245,8 @@ def calculate_comfort_adjustments(
             "input_issues": tuple(input_issues),
             "outdoor_temperature_source": outdoor_temperature_source,
             "effective_outdoor_model": "separate_window_and_wall_filters",
+            "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
+            "fabric_solar_score": fabric_solar_score,
             "window_k": weighted_window_k / comfort_weight_total,
             "wall_k": weighted_wall_k / comfort_weight_total,
             "total_k": weighted_total_k / comfort_weight_total,
@@ -1206,6 +1285,7 @@ def calculate_comfort_adjustments(
         effective_window_outdoor_temperatures=resolved_window_outdoor_temperatures,
         effective_wall_outdoor_temperatures=resolved_wall_outdoor_temperatures,
         solar_index=solar_index,
+        filtered_solar_irradiances=resolved_filtered_solar_irradiances,
         operating_modes=operating_modes,
         operating_mode=operating_mode,
         operating_mode_source=operating_mode_source,
@@ -1214,6 +1294,7 @@ def calculate_comfort_adjustments(
         reference_temperatures=reference_temperatures,
         envelope_adjustments=envelope_adjustments,
         solar_adjustments=solar_adjustments,
+        fabric_solar_scores=fabric_solar_scores,
         raw_adjustments=raw_adjustments,
         adjustments=adjustments,
         calculation_validity=calculation_validity,

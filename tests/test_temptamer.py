@@ -324,11 +324,11 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertEqual(result.zone_temperatures["office"], 21.0)
         self.assertEqual(result.zone_temperatures["dining"], 21.0)
         self.assertEqual(result.reference_temperatures["office"], 20.0)
-        self.assertEqual(result.adjustments["downstairs"], 1.0)
-        self.assertEqual(result.adjustments["bedroom_1_2"], 0.9)
-        self.assertEqual(result.adjustments["bedroom_3_4"], 0.9)
-        self.assertEqual(result.adjustments["office"], 0.9)
-        self.assertEqual(result.adjustments["dining"], 0.9)
+        self.assertEqual(result.adjustments["downstairs"], -1.0)
+        self.assertEqual(result.adjustments["bedroom_1_2"], -0.9)
+        self.assertEqual(result.adjustments["bedroom_3_4"], -0.9)
+        self.assertEqual(result.adjustments["office"], -0.9)
+        self.assertEqual(result.adjustments["dining"], -0.9)
         self.assertEqual(result.zone_diagnostics["bedroom_1_2"]["room_aggregation"], "comfort_weighted_mean")
 
     def test_temperature_gap_uses_unadjusted_zone_target_but_mode_uses_room_temperature(self):
@@ -344,8 +344,34 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
         self.assertEqual(result.operating_modes["office"], "heat")
         self.assertEqual(result.reference_temperatures["office"], 19.7)
-        self.assertAlmostEqual(result.raw_adjustments["office"], 0.324, places=3)
-        self.assertEqual(result.adjustments["office"], 0.3)
+        self.assertAlmostEqual(result.raw_adjustments["office"], -0.324, places=3)
+        self.assertEqual(result.adjustments["office"], -0.3)
+
+    def test_office_comfort_score_combines_inverse_operative_terms_and_filtered_fabric_solar(self):
+        result = self.calculate(
+            {
+                "sensor.gw3000c_outdoor_temperature": "16.3",
+                "sensor.gw3000c_solar_radiation": "90.0",
+            },
+            reference_zone_targets={"office": (19.7, 20.5)},
+            filtered_solar_irradiances={"office": 90.0},
+        )
+
+        self.assertLess(result.envelope_adjustments["office"], 0.0)
+        self.assertGreaterEqual(result.solar_adjustments["office"], 0.0)
+        self.assertAlmostEqual(result.fabric_solar_scores["office"], 0.315)
+        self.assertEqual(result.fabric_solar_scores["dining"], 0.0)
+        self.assertAlmostEqual(
+            result.raw_adjustments["office"],
+            result.envelope_adjustments["office"]
+            + result.solar_adjustments["office"]
+            + result.fabric_solar_scores["office"],
+        )
+
+        capped = self.calculate(filtered_solar_irradiances={"office": 125.0})
+        dim = self.calculate(filtered_solar_irradiances={"office": 25.0})
+        self.assertEqual(capped.fabric_solar_scores["office"], 0.4)
+        self.assertAlmostEqual(dim.fabric_solar_scores["office"], 0.0225)
 
     def test_uses_one_global_operating_mode_and_reports_its_source(self):
         result = self.calculate(
@@ -423,7 +449,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
         self.assertEqual(warmer_wall.effective_window_outdoor_temperatures["office"], 11.0)
         self.assertEqual(warmer_wall.effective_wall_outdoor_temperatures["office"], 17.0)
-        self.assertLess(warmer_wall.envelope_adjustments["office"], same_temperature.envelope_adjustments["office"])
+        self.assertGreater(warmer_wall.envelope_adjustments["office"], same_temperature.envelope_adjustments["office"])
         self.assertGreater(room["window_envelope_adjustment"], room["wall_envelope_adjustment"])
 
     def test_closed_shutter_reduces_only_its_window_conductive_and_solar_terms(self):
@@ -444,7 +470,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertLess(closed_window["effective_u_value"], open_window["effective_u_value"])
         self.assertLess(closed_window["effective_direct_shgc"], open_window["effective_direct_shgc"])
         self.assertLess(abs(closed_result.solar_adjustments["office"]), abs(open_result.solar_adjustments["office"]))
-        self.assertLess(closed_result.envelope_adjustments["office"], open_result.envelope_adjustments["office"])
+        self.assertGreater(closed_result.envelope_adjustments["office"], open_result.envelope_adjustments["office"])
 
     def test_low_sun_retains_direct_beam_and_zeros_solar_below_horizon(self):
         result = self.calculate(
@@ -467,7 +493,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
             window["direct_irradiance"],
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_maximum_direct_normal_irradiance,
         )
-        self.assertGreaterEqual(result.solar_adjustments["office"], -0.4)
+        self.assertLessEqual(result.solar_adjustments["office"], 0.4)
 
         below_horizon = self.calculate(
             {
@@ -565,7 +591,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
             }
         )
         self.assertTrue(no_indoor.calculation_validity["office"])
-        self.assertGreater(no_indoor.adjustments["office"], 0.0)
+        self.assertLess(no_indoor.adjustments["office"], 0.0)
         self.assertIsNone(no_indoor.zone_temperatures["office"])
 
         no_outdoor = self.calculate(
@@ -708,11 +734,11 @@ class ComfortAdjustmentTests(unittest.TestCase):
                 "sun.sun": {"elevation": 30.0, "azimuth": 135.0},
             },
         )
-        self.assertEqual(exposed.adjustments["office"], 0.4)
-        self.assertEqual(tapered.adjustments["office"], 0.6)
-        self.assertEqual(band_edge.adjustments["office"], 0.8)
-        self.assertLess(exposed.solar_adjustments["office"], tapered.solar_adjustments["office"])
-        self.assertLess(tapered.solar_adjustments["office"], band_edge.solar_adjustments["office"])
+        self.assertEqual(exposed.adjustments["office"], -0.4)
+        self.assertEqual(tapered.adjustments["office"], -0.6)
+        self.assertEqual(band_edge.adjustments["office"], -0.8)
+        self.assertGreater(exposed.solar_adjustments["office"], tapered.solar_adjustments["office"])
+        self.assertGreater(tapered.solar_adjustments["office"], band_edge.solar_adjustments["office"])
         exposed_window = exposed.zone_diagnostics["office"]["room_values"][0]["windows"][0]
         tapered_window = tapered.zone_diagnostics["office"]["room_values"][0]["windows"][0]
         self.assertAlmostEqual(exposed_window["direct_incidence_factor"], 0.8660, places=4)
@@ -733,7 +759,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
         self.assertIsNone(window["facade"])
         self.assertEqual(window["facade_source"], "cover_device_label")
-        self.assertLess(labelled.solar_adjustments["office"], unexposed.solar_adjustments["office"])
+        self.assertGreater(labelled.solar_adjustments["office"], unexposed.solar_adjustments["office"])
 
     def test_window_and_wall_filters_have_separate_thermal_responses(self):
         window_effective_temperature = filter_outdoor_temperature(
@@ -846,6 +872,30 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
         self.assertEqual(first_wall["downstairs"], 11.0)
         self.assertGreater(second_window["office"], second_wall["office"])
         self.assertGreater(second_wall["office"], second_wall["downstairs"])
+
+    def test_fabric_solar_filter_is_configured_and_tracked_per_zone(self):
+        first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        second_now = first_now + timedelta(minutes=30)
+        for key in (
+            "comfort_adjustment_fabric_solar_filter_values",
+            "comfort_adjustment_fabric_solar_filter_updated_at",
+            "comfort_adjustment_fabric_solar_filter_seeded_at",
+        ):
+            temptamer_main.RUNTIME_STATE[key] = {}
+        controller = FakeReader(
+            {DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id: "20.0"}
+        )
+
+        first = temptamer_main._resolve_filtered_solar_irradiances(controller, first_now)
+        controller.state_map[DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id] = "100.0"
+        second = temptamer_main._resolve_filtered_solar_irradiances(controller, second_now)
+
+        office = next(zone for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones if zone.key == "office")
+        self.assertIsNotNone(office.fabric_solar)
+        self.assertIsNone(next(zone for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones if zone.key == "dining").fabric_solar)
+        self.assertEqual(first["office"], 20.0)
+        self.assertIsNone(first["dining"])
+        self.assertAlmostEqual(second["office"], 70.57, places=2)
 
     def test_cover_position_holds_last_valid_before_configured_fallback(self):
         first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -992,35 +1042,35 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
                     "set_value",
                     blocking=True,
                     entity_id="input_number.comfort_adjustment_downstairs",
-                    value=0.2,
+                    value=-0.2,
                 ),
                 call(
                     "input_number",
                     "set_value",
                     blocking=True,
                     entity_id="input_number.comfort_adjustment_bed_1_2",
-                    value=0.2,
+                    value=-0.2,
                 ),
                 call(
                     "input_number",
                     "set_value",
                     blocking=True,
                     entity_id="input_number.comfort_adjustment_bed_3_4",
-                    value=0.2,
+                    value=-0.2,
                 ),
                 call(
                     "input_number",
                     "set_value",
                     blocking=True,
                     entity_id="input_number.comfort_adjustment_office",
-                    value=0.2,
+                    value=-0.2,
                 ),
                 call(
                     "input_number",
                     "set_value",
                     blocking=True,
                     entity_id="input_number.comfort_adjustment_dining",
-                    value=0.2,
+                    value=-0.2,
                 ),
             ],
         )
@@ -1185,10 +1235,10 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["dining"].scheme.name, "Night")
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Night")
 
-    def test_comfort_adjustment_shifts_every_zone_threshold_and_demand_boundary(self):
+    def test_positive_comfort_score_lowers_every_zone_threshold_and_delays_heat_demand(self):
         baseline = build_snapshot(
             FakeReader(
-                base_state_map(**{"sensor.office_average_temperature": "18.8"}),
+                base_state_map(**{"sensor.office_average_temperature": "18.4"}),
                 base_attr_map(),
             )
         )
@@ -1196,7 +1246,7 @@ class TempTamerTests(unittest.TestCase):
             FakeReader(
                 base_state_map(
                     **{
-                        "sensor.office_average_temperature": "18.8",
+                        "sensor.office_average_temperature": "18.4",
                         "input_number.comfort_adjustment_office": "0.5",
                     }
                 ),
@@ -1208,14 +1258,14 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(adjusted.base_zone_targets["office"], (19.7, 20.5))
         self.assertEqual(adjusted_zone.comfort_adjustment, 0.5)
-        self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside + 0.5)
-        self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until + 0.5)
-        self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target + 0.5)
-        self.assertEqual(adjusted_zone.cool_scheme.enable_outside, baseline_zone.cool_scheme.enable_outside + 0.5)
-        self.assertEqual(adjusted_zone.cool_scheme.continue_until, baseline_zone.cool_scheme.continue_until + 0.5)
-        self.assertEqual(adjusted_zone.cool_scheme.ideal_target, baseline_zone.cool_scheme.ideal_target + 0.5)
-        self.assertNotIn("office", baseline.heat_calling_zones)
-        self.assertIn("office", adjusted.heat_calling_zones)
+        self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside - 0.5)
+        self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until - 0.5)
+        self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target - 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.enable_outside, baseline_zone.cool_scheme.enable_outside - 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.continue_until, baseline_zone.cool_scheme.continue_until - 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.ideal_target, baseline_zone.cool_scheme.ideal_target - 0.5)
+        self.assertIn("office", baseline.heat_calling_zones)
+        self.assertNotIn("office", adjusted.heat_calling_zones)
 
     def test_comfort_adjustment_defaults_and_clamps_invalid_helper_values(self):
         unavailable = build_snapshot(
@@ -1240,8 +1290,8 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(unavailable.zones["office"].comfort_adjustment, 0.0)
         self.assertEqual(positive.zones["office"].comfort_adjustment, 1.5)
         self.assertEqual(negative.zones["office"].comfort_adjustment, -1.5)
-        self.assertEqual(positive.zones["office"].scheme.ideal_target, 21.2)
-        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 19.0)
+        self.assertEqual(positive.zones["office"].scheme.ideal_target, 18.2)
+        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 22.0)
 
     def test_global_setpoint_adjustment_shifts_all_zone_thresholds_and_composes(self):
         baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
@@ -1260,7 +1310,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(adjusted.global_setpoint_adjustment, 0.4)
         for zone_key, baseline_zone in baseline.zones.items():
             adjusted_zone = adjusted.zones[zone_key]
-            expected_offset = 0.6 if zone_key == "office" else 0.4
+            expected_offset = 0.2 if zone_key == "office" else 0.4
             self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside + expected_offset)
             self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until + expected_offset)
             self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target + expected_offset)
@@ -6982,14 +7032,14 @@ class IdleDemandForecastTests(unittest.TestCase):
         self.assertEqual(result.earliest_zone_key, "office")
         self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=1))
 
-    def test_forecast_adjusted_threshold_uses_hourly_condition_and_can_block_shutdown(self):
+    def test_forecast_comfort_score_uses_hourly_condition_and_can_block_shutdown(self):
         now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.4)
         conditions: list[str | None] = []
 
         def adjustment_provider(_at, _outdoor_temperature, condition):
             conditions.append(condition)
-            return {"office": 0.5}
+            return {"office": -0.5}
 
         result = forecast_idle_demand(
             snapshot,

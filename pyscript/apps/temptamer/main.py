@@ -250,6 +250,9 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_adjustment_outdoor_filter_values": {},
     "comfort_adjustment_outdoor_filter_updated_at": {},
     "comfort_adjustment_outdoor_filter_seeded_at": {},
+    "comfort_adjustment_fabric_solar_filter_values": {},
+    "comfort_adjustment_fabric_solar_filter_updated_at": {},
+    "comfort_adjustment_fabric_solar_filter_seeded_at": {},
     "comfort_adjustment_last_valid_cover_positions": {},
     "comfort_adjustment_last_published_adjustments": {},
     "comfort_adjustment_last_valid": {},
@@ -680,6 +683,46 @@ def _resolve_effective_outdoor_temperatures(
     return window_temperatures, wall_temperatures, filter_warming_up
 
 
+def _resolve_filtered_solar_irradiances(
+    controller: PyscriptController,
+    now: datetime,
+) -> dict[str, float | None]:
+    """Low-pass measured irradiance for each zone with a fabric calibration."""
+    irradiance = parse_float(
+        controller.get_state(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id)
+    )
+    previous_values = _comfort_adjustment_runtime_mapping(
+        "comfort_adjustment_fabric_solar_filter_values"
+    )
+    previous_updated_at = _comfort_adjustment_runtime_mapping(
+        "comfort_adjustment_fabric_solar_filter_updated_at"
+    )
+    seeded_at = _comfort_adjustment_runtime_mapping(
+        "comfort_adjustment_fabric_solar_filter_seeded_at"
+    )
+    filtered_irradiances: dict[str, float | None] = {}
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        fabric_solar = zone.fabric_solar
+        if fabric_solar is None or irradiance is None or irradiance < 0.0:
+            filtered_irradiances[zone.key] = None
+            continue
+        time_constant_seconds = int(
+            getattr(fabric_solar, "filter_time_constant_seconds", 0)
+        )
+        filtered_irradiance, _warming_up = _update_outdoor_temperature_filter(
+            filter_key=f"fabric_solar_{zone.key}",
+            outdoor_temperature=irradiance,
+            now=now,
+            time_constant_seconds=time_constant_seconds,
+            warmup_fraction=0.0,
+            previous_temperatures=previous_values,
+            previous_updated_at=previous_updated_at,
+            filter_seeded_at=seeded_at,
+        )
+        filtered_irradiances[zone.key] = filtered_irradiance
+    return filtered_irradiances
+
+
 def _resolve_cover_position_overrides(controller: PyscriptController, now: datetime) -> dict[str, tuple[float, str]]:
     overrides: dict[str, tuple[float, str]] = {}
     cached_positions = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid_cover_positions")
@@ -714,7 +757,15 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
     """Return the live-tunable model settings in a log-friendly form."""
     config = DEFAULT_COMFORT_ADJUSTMENT_CONFIG
     rooms: dict[str, tuple[dict[str, object], ...]] = {}
+    fabric_solar: dict[str, dict[str, object]] = {}
     for zone in config.zones:
+        if zone.fabric_solar is not None:
+            fabric_solar[zone.key] = {
+                "filter_seconds": zone.fabric_solar.filter_time_constant_seconds,
+                "irradiance_threshold": zone.fabric_solar.irradiance_threshold,
+                "score_coefficient": zone.fabric_solar.score_coefficient,
+                "score_limit": zone.fabric_solar.score_limit,
+            }
         room_parameters: list[dict[str, object]] = []
         for room in zone.rooms:
             envelope = room.envelope
@@ -769,6 +820,7 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
         "solar_mrt_coefficient": config.solar_mrt_coefficient,
         "solar_maximum_direct_normal_irradiance": config.solar_maximum_direct_normal_irradiance,
         "solar_adjustment_limit": config.solar_adjustment_limit,
+        "fabric_solar": fabric_solar,
         "output_rate_limit": (
             config.output_rate_limit_celsius,
             config.output_rate_limit_seconds,
@@ -944,7 +996,7 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         calculation_status = str(publication["calculation_status"])
         source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
         LOGGER.info(
-            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope=%s solar=%s raw=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
             now.isoformat(),
             zone_key,
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
@@ -952,11 +1004,13 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
             source_status,
             result.envelope_adjustments[zone_key],
             result.solar_adjustments[zone_key],
+            result.fabric_solar_scores[zone_key],
             publication["raw_adjustment"],
             publication["rounded_adjustment"],
             publication["unrounded_rate_limited_adjustment"],
             publication["filtered_adjustment"],
             result.reference_temperatures[zone_key],
+            result.filtered_solar_irradiances[zone_key],
             result.effective_window_outdoor_temperatures[zone_key],
             result.effective_wall_outdoor_temperatures[zone_key],
             zone_diagnostics.get("filter_warming_up", result.filter_warming_up.get(zone_key, False)),
@@ -995,6 +1049,7 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
         outdoor_temperature,
         now,
     )
+    filtered_solar_irradiances = _resolve_filtered_solar_irradiances(controller, now)
     reference_zone_targets = _reference_zone_targets_for_comfort_adjustments(controller, now)
     cover_position_overrides = _resolve_cover_position_overrides(controller, now)
     result = calculate_comfort_adjustments(
@@ -1006,6 +1061,7 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
         effective_wall_outdoor_temperatures=wall_outdoor_temperatures,
         filter_warming_up=filter_warming_up,
         cover_position_overrides=cover_position_overrides,
+        filtered_solar_irradiances=filtered_solar_irradiances,
         reference_zone_targets=reference_zone_targets,
         last_valid_operating_mode=(
             RUNTIME_STATE["comfort_adjustment_last_valid_mode"].get("mode")

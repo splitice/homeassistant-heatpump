@@ -331,21 +331,21 @@ def forecast_idle_demand(
         calling_zones: list[str] = []
         for zone_key in enabled_zone_keys:
             zone = snapshot.zones[zone_key]
-            adjustment = _forecast_adjustment(zone_key, zone.comfort_adjustment, adjustments)
-            adjustment_delta = adjustment - zone.comfort_adjustment
+            forecast_score = _forecast_adjustment(zone_key, zone.comfort_adjustment, adjustments)
+            score_delta = forecast_score - zone.comfort_adjustment
             if operation_mode == HVAC_HEAT:
                 calling = _heat_calling(
                     primary_temperature=primary_temperatures[zone_key],
                     minimum_temperature=minimum_temperatures[zone_key],
-                    enable_threshold=zone.scheme.enable_outside + adjustment_delta,
-                    ideal_threshold=zone.scheme.ideal_target + adjustment_delta,
+                    enable_threshold=zone.scheme.enable_outside - score_delta,
+                    ideal_threshold=zone.scheme.ideal_target - score_delta,
                 )
             else:
                 calling = _cool_calling(
                     primary_temperature=primary_temperatures[zone_key],
                     maximum_temperature=maximum_temperatures[zone_key],
-                    enable_threshold=zone.cool_scheme.enable_outside + adjustment_delta,
-                    ideal_threshold=zone.cool_scheme.ideal_target + adjustment_delta,
+                    enable_threshold=zone.cool_scheme.enable_outside - score_delta,
+                    ideal_threshold=zone.cool_scheme.ideal_target - score_delta,
                 )
             if calling:
                 calling_zones.append(zone_key)

@@ -128,15 +128,21 @@ def _resolve_comfort_adjustment(reader: StateReader, entity_id: str | None) -> f
     return max(-1.5, min(1.5, adjustment))
 
 
-def _shift_control_scheme(scheme: ControlScheme, adjustment: float) -> ControlScheme:
-    if adjustment == 0.0:
+def _shift_control_scheme(scheme: ControlScheme, setpoint_offset: float) -> ControlScheme:
+    """Apply a conventional manual setpoint offset to every scheme threshold."""
+    if setpoint_offset == 0.0:
         return scheme
     return replace(
         scheme,
-        enable_outside=scheme.enable_outside + adjustment,
-        continue_until=scheme.continue_until + adjustment,
-        ideal_target=scheme.ideal_target + adjustment,
+        enable_outside=scheme.enable_outside + setpoint_offset,
+        continue_until=scheme.continue_until + setpoint_offset,
+        ideal_target=scheme.ideal_target + setpoint_offset,
     )
+
+
+def _apply_comfort_score(scheme: ControlScheme, comfort_score: float) -> ControlScheme:
+    """Lower targets for radiant warmth and raise them for a cold envelope."""
+    return _shift_control_scheme(scheme, -comfort_score)
 
 
 def _can_use_min_sensor_for_heating(zone: ZoneRuntimeState, threshold: float) -> bool:
@@ -350,11 +356,16 @@ def build_snapshot(
             reader,
             config.zone_comfort_adjustment_entities.get(zone_key),
         )
-        adjustment = global_setpoint_adjustment + comfort_adjustment
         zones[zone_key] = replace(
             zone_state,
-            scheme=_shift_control_scheme(zone_state.scheme, adjustment),
-            cool_scheme=_shift_control_scheme(zone_state.cool_scheme, adjustment),
+            scheme=_apply_comfort_score(
+                _shift_control_scheme(zone_state.scheme, global_setpoint_adjustment),
+                comfort_adjustment,
+            ),
+            cool_scheme=_apply_comfort_score(
+                _shift_control_scheme(zone_state.cool_scheme, global_setpoint_adjustment),
+                comfort_adjustment,
+            ),
             comfort_adjustment=comfort_adjustment,
         )
 
