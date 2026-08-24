@@ -6,6 +6,8 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import (
+    COMFORT_ADJUSTMENT_TRIGGER_ENTITIES,
+    DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
     DEFAULT_SYSTEM_CONFIG,
     EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
@@ -32,6 +34,12 @@ from .config import (
     POWEROFF_DEACTIVATION_BATTERY_THRESHOLD,
     POWEROFF_MIN_ACTIVATION_SECONDS,
     POWEROFF_PV_POWER_THRESHOLD,
+)
+from .comfort_adjustments import (
+    apply_adjustment_hysteresis,
+    calculate_comfort_adjustments,
+    filter_outdoor_temperature,
+    resolve_outdoor_temperature,
 )
 from .constants import (
     APP_NAME,
@@ -160,10 +168,12 @@ if USING_PYTHON_IMPORTS and "state" not in globals():  # pragma: no cover - used
 LOGGER = logging.getLogger(LOGGER_NAME)
 
 CONTROL_PASS_TASK_NAME = f"{APP_NAME}_control_pass"
+COMFORT_ADJUSTMENT_PASS_TASK_NAME = f"{APP_NAME}_comfort_adjustment_pass"
 STATUS_ENTITY_ID = f"pyscript.{APP_NAME}_status"
 ENABLED_ENTITY_ID = f"pyscript.{APP_NAME}_enabled"
 
 task.unique(CONTROL_PASS_TASK_NAME)
+task.unique(COMFORT_ADJUSTMENT_PASS_TASK_NAME)
 
 state.persist(  # type: ignore[name-defined]
     ENABLED_ENTITY_ID,
@@ -222,6 +232,10 @@ RUNTIME_STATE: dict[str, Any] = {
     "poweroff_activation_hold_until": None,
     "poweroff_active": False,
     "poweroff_reason": None,
+    "comfort_adjustment_label_warnings": set(),
+    "comfort_adjustment_last_error": None,
+    "comfort_adjustment_effective_outdoor_temperatures": {},
+    "comfort_adjustment_effective_outdoor_updated_at": {},
 }
 
 
@@ -270,6 +284,211 @@ class PyscriptController:
 
     def call_service(self, domain: str, service_name: str, **kwargs: object) -> None:
         service.call(domain, service_name, blocking=True, **kwargs)  # type: ignore[name-defined]
+
+
+def _comfort_adjustment_warn_once(warning_key: str, message: str) -> None:
+    warnings = RUNTIME_STATE.setdefault("comfort_adjustment_label_warnings", set())
+    if not isinstance(warnings, set):
+        warnings = set()
+        RUNTIME_STATE["comfort_adjustment_label_warnings"] = warnings
+    if warning_key in warnings:
+        return
+    warnings.add(warning_key)
+    LOGGER.warning("COMFORT ADJUSTMENT: %s", message)
+
+
+def _resolve_cover_facades() -> dict[str, str | None]:
+    """Return façade directions from labels assigned to each cover's device."""
+    cover_entity_ids: list[str] = []
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        for room in zone.rooms:
+            if room.cover_entity_id and room.cover_entity_id not in cover_entity_ids:
+                cover_entity_ids.append(room.cover_entity_id)
+
+    resolved_facades: dict[str, str | None] = {}
+    try:
+        active_hass = hass  # type: ignore[name-defined]
+        from homeassistant.helpers import device_registry as device_registry
+        from homeassistant.helpers import entity_registry as entity_registry
+
+        devices = device_registry.async_get(active_hass)
+        entities = entity_registry.async_get(active_hass)
+    except (AttributeError, ImportError, NameError) as exc:
+        _comfort_adjustment_warn_once(
+            "device-label-registry-unavailable",
+            "unable to read cover-device labels; set pyscript hass_is_global and allow_all_imports: %s" % exc,
+        )
+        for cover_entity_id in cover_entity_ids:
+            resolved_facades[cover_entity_id] = None
+        return resolved_facades
+
+    for cover_entity_id in cover_entity_ids:
+        try:
+            entity_entry = entities.async_get(cover_entity_id)
+            device_id = getattr(entity_entry, "device_id", None) if entity_entry is not None else None
+            device_entry = devices.async_get(device_id) if device_id else None
+            device_labels = getattr(device_entry, "labels", ()) if device_entry is not None else ()
+            matching_facades: set[str] = set()
+            for label_id in device_labels:
+                facade = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.facade_labels.get(str(label_id))
+                if facade is not None:
+                    matching_facades.add(facade)
+        except Exception as exc:  # pragma: no cover - depends on the Home Assistant registry runtime
+            _comfort_adjustment_warn_once(
+                f"cover-label-read-{cover_entity_id}",
+                f"unable to read labels for {cover_entity_id}; treating it as unexposed: {exc}",
+            )
+            resolved_facades[cover_entity_id] = None
+            continue
+
+        if len(matching_facades) == 1:
+            resolved_facades[cover_entity_id] = next(iter(matching_facades))
+            continue
+
+        resolved_facades[cover_entity_id] = None
+        if not matching_facades:
+            _comfort_adjustment_warn_once(
+                f"cover-label-missing-{cover_entity_id}",
+                f"{cover_entity_id} device has no awning_n/e/s/w label; treating it as unexposed",
+            )
+        else:
+            _comfort_adjustment_warn_once(
+                f"cover-label-ambiguous-{cover_entity_id}",
+                f"{cover_entity_id} device has multiple façade labels; treating it as unexposed",
+            )
+
+    return resolved_facades
+
+
+def _comfort_adjustment_runtime_mapping(key: str) -> dict[str, object]:
+    values = RUNTIME_STATE.setdefault(key, {})
+    if isinstance(values, dict):
+        return values
+    values = {}
+    RUNTIME_STATE[key] = values
+    return values
+
+
+def _resolve_effective_outdoor_temperatures(
+    outdoor_temperature: float | None,
+    now: datetime,
+) -> dict[str, float | None]:
+    effective_temperatures: dict[str, float | None] = {}
+    if outdoor_temperature is None:
+        for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+            effective_temperatures[zone.key] = None
+        return effective_temperatures
+
+    previous_temperatures = _comfort_adjustment_runtime_mapping("comfort_adjustment_effective_outdoor_temperatures")
+    previous_updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_effective_outdoor_updated_at")
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        previous_temperature = parse_float(previous_temperatures.get(zone.key))
+        updated_at = _normalize_runtime_datetime(previous_updated_at.get(zone.key))
+        elapsed_seconds = (now - updated_at).total_seconds() if updated_at is not None else None
+        time_constant_seconds = (
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_filter_time_constant_seconds
+            if zone.upstairs
+            else DEFAULT_COMFORT_ADJUSTMENT_CONFIG.downstairs_outdoor_filter_time_constant_seconds
+        )
+        effective_temperature = filter_outdoor_temperature(
+            outdoor_temperature,
+            previous_temperature,
+            elapsed_seconds,
+            time_constant_seconds,
+        )
+        effective_temperatures[zone.key] = effective_temperature
+        previous_temperatures[zone.key] = effective_temperature
+        previous_updated_at[zone.key] = now
+    return effective_temperatures
+
+
+def _reference_zone_targets_for_comfort_adjustments(
+    controller: PyscriptController,
+    now: datetime,
+) -> dict[str, tuple[float, float]] | None:
+    """Read dynamic, unadjusted zone targets without running control actions."""
+    if not _control_is_enabled():
+        return None
+
+    try:
+        snapshot = build_snapshot(
+            controller,
+            config=DEFAULT_SYSTEM_CONFIG,
+            last_switch_changes=RUNTIME_STATE.get("last_zone_change"),
+            pending_switch_states=RUNTIME_STATE.get("pending_zone_state"),
+            heat_sink_available=bool(RUNTIME_STATE.get("powerday_heat_sink_active")),
+            free_power_later_available=bool(RUNTIME_STATE.get("powerday_free_power_later_active")),
+            poweroff_active=bool(RUNTIME_STATE.get("poweroff_active")),
+            now=now,
+        )
+    except ValueError:
+        # A control snapshot with no usable target is equivalent to disabled
+        # control for this calculation, so retain the safe nominal fallback.
+        return None
+    return snapshot.base_zone_targets
+
+
+def run_comfort_adjustment_pass(*, reason: str) -> None:
+    """Calculate and publish independent per-zone comfort adjustments."""
+    task.unique(COMFORT_ADJUSTMENT_PASS_TASK_NAME)
+
+    controller = PyscriptController()
+    now = _system_now()
+    outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG)
+    effective_outdoor_temperatures = _resolve_effective_outdoor_temperatures(outdoor_temperature, now)
+    reference_zone_targets = _reference_zone_targets_for_comfort_adjustments(controller, now)
+    result = calculate_comfort_adjustments(
+        controller,
+        config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        cover_facades=_resolve_cover_facades(),
+        effective_outdoor_temperatures=effective_outdoor_temperatures,
+        reference_zone_targets=reference_zone_targets,
+    )
+    published_adjustments: list[str] = []
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        previous_adjustment = parse_float(controller.get_state(zone.output_entity_id))
+        adjustment = apply_adjustment_hysteresis(
+            result.raw_adjustments[zone.key],
+            previous_adjustment,
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
+        )
+        controller.call_service(
+            "input_number",
+            "set_value",
+            entity_id=zone.output_entity_id,
+            value=adjustment,
+        )
+        published_adjustments.append(f"{zone.key}={adjustment:.1f}")
+
+    RUNTIME_STATE["comfort_adjustment_last_error"] = None
+    LOGGER.info(
+        "COMFORT ADJUSTMENT: trigger=%s outdoor=%s downstairs_effective_outdoor=%s solar_index=%.2f reference_targets=%s values=%s",
+        reason,
+        f"{result.outdoor_temperature:.1f}" if result.outdoor_temperature is not None else "unavailable",
+        (
+            f"{result.effective_outdoor_temperatures['downstairs']:.1f}"
+            if result.effective_outdoor_temperatures.get("downstairs") is not None
+            else "unavailable"
+        ),
+        result.solar_index,
+        ",".join(
+            [
+                f"{zone_key}={reference_temperature:.1f}"
+                for zone_key, reference_temperature in result.reference_temperatures.items()
+                if reference_temperature is not None
+            ]
+        )
+        or "unavailable",
+        ",".join(published_adjustments),
+    )
+
+
+def _run_comfort_adjustment_pass(*, reason: str) -> None:
+    try:
+        run_comfort_adjustment_pass(reason=reason)
+    except Exception as exc:  # pragma: no cover - exercised in Home Assistant runtime
+        RUNTIME_STATE["comfort_adjustment_last_error"] = str(exc)
+        LOGGER.exception("COMFORT ADJUSTMENT: pass failed")
 
 
 def _describe_open_zones(open_zones: tuple[str, ...]) -> str:
@@ -1513,7 +1732,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _update_idle_heat_runtime_state(plan, now)
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -1526,6 +1745,14 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         plan.setpoint,
         _describe_open_zones(plan.open_zones),
         _format_zone_temps(snapshot, plan),
+        ",".join(
+            [
+                f"{zone_key}={zone.comfort_adjustment:+.1f}"
+                for zone_key, zone in snapshot.zones.items()
+                if zone.comfort_adjustment != 0.0
+            ]
+        )
+        or "none",
         plan.reason,
     )
     RUNTIME_STATE["last_error"] = None
@@ -1608,11 +1835,26 @@ def temptamer_initialize() -> None:
     _publish_runtime_state("stopped")
 
 
+@time_trigger("startup")
+def temptamer_initialize_comfort_adjustments() -> None:
+    _run_comfort_adjustment_pass(reason="startup")
+
+
 @time_trigger(f"period(now, {CONTROL_INTERVAL_SECONDS}s)")
 def temptamer_periodic_control_pass() -> None:
     _run_enabled_control_pass(reason="periodic trigger")
 
 
+@time_trigger(f"period(now, {CONTROL_INTERVAL_SECONDS}s)")
+def temptamer_periodic_comfort_adjustments() -> None:
+    _run_comfort_adjustment_pass(reason="periodic trigger")
+
+
 @state_trigger(*MODE_TRIGGER_ENTITIES)
 def temptamer_mode_changed(*_args, **_kwargs) -> None:
     _run_enabled_control_pass(reason="mode selection changed", comfort_mode_changed=True)
+
+
+@state_trigger(*COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+def temptamer_comfort_adjustment_input_changed(*_args, **_kwargs) -> None:
+    _run_comfort_adjustment_pass(reason="comfort adjustment input changed")

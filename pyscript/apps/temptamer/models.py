@@ -37,6 +37,7 @@ class SystemConfig:
     comfort_modes: dict[str, ComfortMode]
     heat_control_schemes: dict[str, ControlScheme]
     cool_control_schemes: dict[str, ControlScheme]
+    zone_comfort_adjustment_entities: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class ZoneRuntimeState:
     is_enabled_by_mode: bool
     switch_is_on: bool
     last_switch_change: datetime | None
+    comfort_adjustment: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,10 @@ class DemandSnapshot:
     above_ideal_zones: tuple[str, ...]
     at_or_below_ideal_zones: tuple[str, ...]
     poweroff_forced_off: bool = False
+    # Heat and cool ideal targets before the per-zone comfort adjustment is
+    # applied.  The independent publisher uses these values as its reference
+    # temperature, avoiding a feedback loop through the adjusted schemes.
+    base_zone_targets: dict[str, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

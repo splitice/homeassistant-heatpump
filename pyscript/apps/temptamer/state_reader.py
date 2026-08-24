@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from typing import Protocol
 
 from .comfort_modes import ComfortModeSnapshotData
@@ -21,7 +22,7 @@ from .constants import (
     SWITCH_STATE_SETTLE_SECONDS,
     UNKNOWN_STATES,
 )
-from .models import DemandSnapshot, SystemConfig, ZoneRuntimeState
+from .models import ControlScheme, DemandSnapshot, SystemConfig, ZoneRuntimeState
 
 
 CLIMATE_CURRENT_TEMPERATURE_ATTR = "current_temperature"
@@ -115,6 +116,27 @@ def _resolve_optional_sensor(reader: StateReader, entity_id: str | None) -> floa
     if not entity_id:
         return None
     return parse_float(reader.get_state(entity_id))
+
+
+def _resolve_comfort_adjustment(reader: StateReader, entity_id: str | None) -> float:
+    """Read a usable helper value, with the documented safe range."""
+    if entity_id is None:
+        return 0.0
+    adjustment = parse_float(reader.get_state(entity_id))
+    if adjustment is None or not isfinite(adjustment):
+        return 0.0
+    return max(-1.5, min(1.5, adjustment))
+
+
+def _shift_control_scheme(scheme: ControlScheme, adjustment: float) -> ControlScheme:
+    if adjustment == 0.0:
+        return scheme
+    return replace(
+        scheme,
+        enable_outside=scheme.enable_outside + adjustment,
+        continue_until=scheme.continue_until + adjustment,
+        ideal_target=scheme.ideal_target + adjustment,
+    )
 
 
 def _can_use_min_sensor_for_heating(zone: ZoneRuntimeState, threshold: float) -> bool:
@@ -313,6 +335,24 @@ def build_snapshot(
         if zone_state.applied_comfort_mode == comfort_mode:
             zones[zone_key] = comfort_mode_behavior.adjust_zone(zone_state, adjustment_snapshot_data)
 
+    # Capture the dynamic schemes after comfort-/power-mode supplements but
+    # before applying the published comfort value.  These base targets are
+    # consumed by the independent publisher so an adjustment never becomes its
+    # own future reference.
+    base_zone_targets: dict[str, tuple[float, float]] = {}
+    for zone_key, zone_state in zones.items():
+        base_zone_targets[zone_key] = (zone_state.scheme.ideal_target, zone_state.cool_scheme.ideal_target)
+        adjustment = _resolve_comfort_adjustment(
+            reader,
+            config.zone_comfort_adjustment_entities.get(zone_key),
+        )
+        zones[zone_key] = replace(
+            zone_state,
+            scheme=_shift_control_scheme(zone_state.scheme, adjustment),
+            cool_scheme=_shift_control_scheme(zone_state.cool_scheme, adjustment),
+            comfort_adjustment=adjustment,
+        )
+
     enabled_zones: dict[str, ZoneRuntimeState] = {}
     heat_calling_list: list[str] = []
     continue_heating_list: list[str] = []
@@ -384,4 +424,5 @@ def build_snapshot(
         continue_cooling_zones=continue_cooling,
         above_ideal_zones=above_ideal,
         at_or_below_ideal_zones=at_or_below_ideal,
+        base_zone_targets=base_zone_targets,
     )

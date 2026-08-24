@@ -17,6 +17,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - `pyscript/apps/temptamer/__init__.py` – the Home Assistant app package entrypoint that is autoloaded by `pyscript`
 - `pyscript/apps/temptamer/main.py` – the TempTamer runtime with trigger-driven periodic control, status entities, and immediate comfort-mode reconciliation
 - `pyscript/apps/temptamer/config.py` – entity IDs, zone definitions, comfort-mode mapping, and default thresholds
+- `pyscript/apps/temptamer/comfort_adjustments.py` – pure per-zone adjustment, solar, shutter, and operating-mode calculation
 - `pyscript/apps/temptamer/state_reader.py` – Home Assistant state normalization with fallback to `sensor.home_temperature` and `climate.current_temperature`
 - `pyscript/apps/temptamer/zone_control.py` – zone opening/closing decisions
 - `pyscript/apps/temptamer/demand_resolver.py` – abstract heating demand resolution
@@ -30,11 +31,13 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 
 	 ```yaml
 	 pyscript:
+		 allow_all_imports: true
+		 hass_is_global: true
 		 apps:
 			 temptamer: {}
 	 ```
 
-	 If you already keep `pyscript` configuration in `config/pyscript/config.yaml`, add the same `apps.temptamer` entry there instead.
+	 `allow_all_imports` and `hass_is_global` are required for TempTamer's cover-device label lookup. If you already keep `pyscript` configuration in `config/pyscript/config.yaml`, add the same settings and `apps.temptamer` entry there instead.
 4. Update `pyscript/apps/temptamer/config.py` so the zone sensor and switch entity IDs match your Home Assistant entities.
 5. Ensure these helper entities exist, or adjust `pyscript/apps/temptamer/config.py` to match your setup:
    - `input_select.temptamer_comfort_mode` with `Off`, `Night`, `Day`, `Office`, `PowerDay`, and `PowerOff`
@@ -50,6 +53,18 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
    - a kW-valued, rolling five-minute maximum-demand sensor (configured as `sensor.eagle_200_max_power_demand_5m`)
    - `climate.wt32_hpctrl_e8dbd0_heatpump`
    - `switch.roof_wt32_hpctrl_e8dbd0_downstairs`
+   - `input_select.heatpump_mode_user`, whose direct `Heat` or `Cool` selection takes precedence for comfort adjustments
+   - `input_number.awning_min_sun_elevation` and `input_number.awning_exposure_half_band`
+   - five manual number helpers with minimum `-1.5`, maximum `1.5`, and step `0.1`:
+     - `input_number.comfort_adjustment_downstairs`
+     - `input_number.comfort_adjustment_bed_1_2`
+     - `input_number.comfort_adjustment_bed_3_4`
+     - `input_number.comfort_adjustment_office`
+     - `input_number.comfort_adjustment_dining`
+   - `sensor.gw3000c_outdoor_temperature` and `sensor.gw3000c_solar_radiation`, or the `weather.epping` temperature/condition fallbacks
+   - `sun.sun` with `elevation` and `azimuth` attributes
+   - the room temperature sensors and shutter covers configured in `DEFAULT_COMFORT_ADJUSTMENT_CONFIG`
+   - one `awning_n`, `awning_e`, `awning_s`, or `awning_w` label on each shutter cover's Home Assistant device
 6. Reload `pyscript`.
 
 ## Runtime model
@@ -62,6 +77,8 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
 - Heat-demand fan boost is persisted in `/config/pyscript/temptamer_fan_boost.state`; it is restored after a PyScript reload only when the file was updated within the last 15 minutes.
 - The runtime calls `task.unique(...)` for each control pass so overlapping periodic, startup, and comfort-mode triggers do not pile up across reloads or rapid state changes.
 - Comfort-mode changes still trigger an immediate reconciliation pass whenever TempTamer is enabled.
+- A separate comfort-adjustment publisher runs at startup, on source changes, and every minute regardless of whether TempTamer control is enabled. It calculates independent per-zone relative adjustments from room temperature, outdoor conditions, solar gain, façade exposure, and shutter openness, then writes the five `input_number.comfort_adjustment_*` helpers. Outdoor temperature is exponentially filtered with a 10-minute time constant upstairs and a 30-minute time constant downstairs to model the double-brick thermal delay; a 0.025°C rounding hysteresis prevents output chatter. Solar access retains a diffuse baseline while direct gain tapers from on-axis to zero at the configured façade-exposure band. Its envelope calculation uses the active zone's unadjusted heat or cool `ideal_target` (or `20.0C` when control is disabled or that target is unavailable), while room temperature still selects heat or cool operation.
+- Each helper immediately shifts its zone's heat and cool `enable_outside`, `continue_until`, and `ideal_target` thresholds by the helper value. This keeps the threshold spacing intact and applies the adjustment to zone opening, equipment demand, fan logic, and dispatch planning without adding a separate global heat-pump setpoint offset.
 - HVAC selection supports `Heat`, `Cool`, `HeatCool`, `Off`, and `Manual`. `Manual` leaves both the zone switches and heatpump untouched, while `HeatCool` enforces a one-hour anti-flap delay before changing between heating and cooling.
 - `PowerDay` follows the `Office` comfort mapping except downstairs, which uses the dedicated `Downstairs` scheme. The Downstairs thresholds are each `0.5C` above `DayLiving`. When `sensor.entry_goodwe_inverter_current_electricity_price` reports `0`, dining and bedroom zones using `DiningBasic` or `Bedroom` are upgraded to `DayLiving` so the house can heat soak during free power; the normal free-power offsets also apply to `Downstairs`.
 - The free-power heating supplements (`free_power_initial_suppliment` and `free_power_later`) for office and dining are held until downstairs is strictly above `19C`. The `Downstairs` scheme retains its `1.25C` initial and `3C` later supplements; every other scheme receives `0.75C` initially and `1.5C` later. Cooling thresholds are unaffected.

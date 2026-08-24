@@ -18,6 +18,8 @@ from pyscript.apps.temptamer.comfort_modes import (
     ScheduledComfortMode,
 )
 from pyscript.apps.temptamer.config import (
+    COMFORT_ADJUSTMENT_TRIGGER_ENTITIES,
+    DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
     DEFAULT_SYSTEM_CONFIG,
     EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
@@ -34,6 +36,13 @@ from pyscript.apps.temptamer.config import (
     POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
     POWEROFF_MIN_ACTIVATION_SECONDS,
+)
+from pyscript.apps.temptamer.comfort_adjustments import (
+    apply_adjustment_hysteresis,
+    calculate_comfort_adjustments,
+    filter_outdoor_temperature,
+    resolve_operating_mode as resolve_comfort_adjustment_operating_mode,
+    resolve_solar_index,
 )
 from pyscript.apps.temptamer.constants import (
     COMFORT_MODE_NIGHT,
@@ -129,6 +138,66 @@ def base_attr_map(current_temperature="19.0", temperature=None, target_temp_step
     return {TEST_CLIMATE_ENTITY: attrs}
 
 
+COMFORT_ADJUSTMENT_COVER_FACADES = {
+    "cover.bed1shutters": "e",
+    "cover.bed_2_shutters": "e",
+    "cover.bed_3_shutters": "e",
+    "cover.bed_4_shutters": "e",
+    "cover.officeshutters": "e",
+    "cover.kitchen_shutters": "e",
+    "cover.lego_shutters": "e",
+}
+
+
+def comfort_adjustment_state_map(**overrides):
+    state_map = {
+        "input_select.heatpump_mode_user": "Heat",
+        TEST_CLIMATE_ENTITY: "heat",
+        "sensor.home_temperature": "20.0",
+        "sensor.rumpus_average_temperature": "20.0",
+        "sensor.develco_products_a_s_moszb_140_temperature_2": "20.0",
+        "sensor.kitchen_average_temperature": "22.0",
+        "sensor.kitchen_motion_temperature": "22.0",
+        "sensor.downstairs_zone_average_temperature": "21.0",
+        "sensor.bedroom_1_average_temperature": "20.0",
+        "sensor.bedroom_2_average_temperature": "22.0",
+        "sensor.average_bed1_2_zone_temp": "21.0",
+        "sensor.bedroom_3_average_temperature": "20.0",
+        "sensor.bedroom_4_average_temperature": "22.0",
+        "sensor.bathroom_average_temperature": "21.0",
+        "sensor.bathroom_motion_temperature": "21.0",
+        "sensor.average_bed3_4_zone_temp": "21.0",
+        "sensor.office_average_temperature": "21.0",
+        "sensor.dining_average_temperature": "20.0",
+        "sensor.lego_room_average_temperature": "22.0",
+        "sensor.average_dining_zone_temp": "21.0",
+        "sensor.gw3000c_outdoor_temperature": "11.0",
+        "sensor.gw3000c_solar_radiation": "75.0",
+        "weather.epping": "sunny",
+        "input_number.awning_min_sun_elevation": "10.0",
+        "input_number.awning_exposure_half_band": "45.0",
+    }
+    state_map.update(overrides)
+    return state_map
+
+
+def comfort_adjustment_attr_map(**overrides):
+    attr_map = {
+        TEST_CLIMATE_ENTITY: {"hvac_action": "idle"},
+        "weather.epping": {"temperature": "11.0"},
+        "sun.sun": {"elevation": 30.0, "azimuth": 90.0},
+        "cover.bed1shutters": {"current_position": 100.0},
+        "cover.bed_2_shutters": {"current_position": 100.0},
+        "cover.bed_3_shutters": {"current_position": 100.0},
+        "cover.bed_4_shutters": {"current_position": 100.0},
+        "cover.officeshutters": {"current_position": 100.0},
+        "cover.kitchen_shutters": {"current_position": 100.0},
+        "cover.lego_shutters": {"current_position": 100.0},
+    }
+    attr_map.update(overrides)
+    return attr_map
+
+
 TEST_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_NIGHT],
@@ -159,6 +228,7 @@ TEST_SYSTEM_CONFIG = SystemConfig(
     comfort_modes=DEFAULT_SYSTEM_CONFIG.comfort_modes,
     heat_control_schemes=TEST_HEAT_CONTROL_SCHEMES,
     cool_control_schemes=TEST_COOL_CONTROL_SCHEMES,
+    zone_comfort_adjustment_entities=DEFAULT_SYSTEM_CONFIG.zone_comfort_adjustment_entities,
 )
 
 
@@ -203,6 +273,361 @@ def powerday_downstairs_priority_state_map(**overrides):
             **overrides,
         }
     )
+
+
+class ComfortAdjustmentTests(unittest.TestCase):
+    def calculate(self, state_overrides=None, attr_overrides=None, cover_facades=None, reference_zone_targets=None):
+        state_overrides = state_overrides or {}
+        attr_overrides = attr_overrides or {}
+        return calculate_comfort_adjustments(
+            FakeReader(
+                comfort_adjustment_state_map(**state_overrides),
+                comfort_adjustment_attr_map(**attr_overrides),
+            ),
+            config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+            cover_facades=COMFORT_ADJUSTMENT_COVER_FACADES if cover_facades is None else cover_facades,
+            reference_zone_targets=reference_zone_targets,
+        )
+
+    def test_uses_equal_room_means_and_the_zone_formulas(self):
+        result = self.calculate()
+
+        self.assertEqual(result.zone_temperatures["downstairs"], 21.0)
+        self.assertEqual(result.zone_temperatures["bedroom_1_2"], 21.0)
+        self.assertEqual(result.zone_temperatures["bedroom_3_4"], 21.0)
+        self.assertEqual(result.zone_temperatures["office"], 21.0)
+        self.assertEqual(result.zone_temperatures["dining"], 21.0)
+        self.assertEqual(result.reference_temperatures["office"], 20.0)
+        self.assertEqual(result.adjustments["downstairs"], 1.1)
+        self.assertEqual(result.adjustments["bedroom_1_2"], 1.0)
+        self.assertEqual(result.adjustments["bedroom_3_4"], 1.0)
+        self.assertEqual(result.adjustments["office"], 1.0)
+        self.assertEqual(result.adjustments["dining"], 1.0)
+
+    def test_temperature_gap_uses_unadjusted_zone_target_but_mode_uses_room_temperature(self):
+        result = self.calculate(
+            {
+                "input_select.heatpump_mode_user": "HeatCool",
+                "sensor.office_average_temperature": "22.4",
+                "sensor.gw3000c_outdoor_temperature": "16.3",
+                "sensor.gw3000c_solar_radiation": "75.0",
+            },
+            reference_zone_targets={"office": (19.7, 20.5)},
+        )
+
+        self.assertEqual(result.operating_modes["office"], "heat")
+        self.assertEqual(result.reference_temperatures["office"], 19.7)
+        self.assertAlmostEqual(result.raw_adjustments["office"], 0.374, places=3)
+        self.assertEqual(result.adjustments["office"], 0.4)
+
+    def test_room_source_and_zone_fallbacks_exclude_unusable_temperatures(self):
+        result = self.calculate(
+            {
+                "sensor.rumpus_average_temperature": "unavailable",
+                "sensor.develco_products_a_s_moszb_140_temperature_2": "20.0",
+                "sensor.bedroom_3_average_temperature": "unknown",
+                "sensor.bedroom_4_average_temperature": "unknown",
+                "sensor.bathroom_average_temperature": "unknown",
+                "sensor.bathroom_motion_temperature": "unknown",
+                "sensor.average_bed3_4_zone_temp": "19.5",
+                "sensor.office_average_temperature": "unknown",
+                "sensor.home_temperature": "20.0",
+            }
+        )
+
+        self.assertEqual(result.zone_temperatures["downstairs"], 21.0)
+        self.assertEqual(result.zone_temperatures["bedroom_3_4"], 19.5)
+        self.assertEqual(result.zone_temperatures["office"], 20.0)
+
+    def test_returns_zero_when_indoor_or_outdoor_temperature_is_unusable(self):
+        no_indoor = self.calculate(
+            {
+                "sensor.office_average_temperature": "unavailable",
+                "sensor.home_temperature": "unknown",
+            }
+        )
+        self.assertEqual(no_indoor.adjustments["office"], 0.0)
+
+        no_outdoor = self.calculate(
+            {
+                "sensor.gw3000c_outdoor_temperature": "unavailable",
+            },
+            {"weather.epping": {"temperature": "unknown"}},
+        )
+        self.assertEqual(set(no_outdoor.adjustments.values()), {0.0})
+
+    def test_operating_mode_precedence_and_deadband(self):
+        self.assertEqual(
+            resolve_comfort_adjustment_operating_mode(
+                user_mode="Cool",
+                hvac_action="heating",
+                configured_hvac_mode="heat",
+                zone_temperature=20.0,
+                outdoor_temperature=10.0,
+            ),
+            "cool",
+        )
+        self.assertEqual(
+            resolve_comfort_adjustment_operating_mode(
+                user_mode="HeatCool",
+                hvac_action="cooling",
+                configured_hvac_mode="heat",
+                zone_temperature=20.0,
+                outdoor_temperature=10.0,
+            ),
+            "cool",
+        )
+        self.assertEqual(
+            resolve_comfort_adjustment_operating_mode(
+                user_mode=None,
+                hvac_action="idle",
+                configured_hvac_mode="cool",
+                zone_temperature=20.0,
+                outdoor_temperature=19.5,
+            ),
+            "heat",
+        )
+        self.assertEqual(
+            resolve_comfort_adjustment_operating_mode(
+                user_mode=None,
+                hvac_action="idle",
+                configured_hvac_mode="heat",
+                zone_temperature=20.0,
+                outdoor_temperature=20.0,
+            ),
+            "heat",
+        )
+        self.assertEqual(
+            resolve_comfort_adjustment_operating_mode(
+                user_mode=None,
+                hvac_action="idle",
+                configured_hvac_mode="off",
+                zone_temperature=20.0,
+                outdoor_temperature=20.1,
+            ),
+            "cool",
+        )
+
+    def test_solar_index_uses_measurement_or_weather_elevation_fallback(self):
+        measured = resolve_solar_index(
+            FakeReader(
+                comfort_adjustment_state_map(**{"sensor.gw3000c_solar_radiation": "600"}),
+                comfort_adjustment_attr_map(),
+            ),
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        )
+        fallback = resolve_solar_index(
+            FakeReader(
+                comfort_adjustment_state_map(**{"sensor.gw3000c_solar_radiation": "unavailable"}),
+                comfort_adjustment_attr_map(),
+            ),
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        )
+        below_horizon = resolve_solar_index(
+            FakeReader(
+                comfort_adjustment_state_map(**{"sensor.gw3000c_solar_radiation": "600"}),
+                comfort_adjustment_attr_map(**{"sun.sun": {"elevation": -1.0, "azimuth": 90.0}}),
+            ),
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        )
+
+        self.assertEqual(measured, 1.0)
+        self.assertAlmostEqual(fallback, 0.5)
+        self.assertEqual(below_horizon, 0.0)
+
+    def test_shutter_position_and_facade_exposure_change_solar_adjustment(self):
+        state_overrides = {"sensor.gw3000c_solar_radiation": "600"}
+        attr_overrides = {"cover.officeshutters": {"current_position": 50.0}}
+        exposed = self.calculate(state_overrides, attr_overrides)
+        tapered = self.calculate(
+            state_overrides,
+            {
+                "cover.officeshutters": {"current_position": 50.0},
+                "sun.sun": {"elevation": 30.0, "azimuth": 112.5},
+            },
+        )
+        band_edge = self.calculate(
+            state_overrides,
+            {
+                "cover.officeshutters": {"current_position": 50.0},
+                "sun.sun": {"elevation": 30.0, "azimuth": 135.0},
+            },
+        )
+        unexposed_facades = dict(COMFORT_ADJUSTMENT_COVER_FACADES)
+        unexposed_facades["cover.officeshutters"] = "w"
+        unexposed = self.calculate(state_overrides, attr_overrides, unexposed_facades)
+
+        self.assertEqual(exposed.adjustments["office"], 0.0)
+        self.assertEqual(tapered.adjustments["office"], 0.3)
+        self.assertEqual(band_edge.adjustments["office"], 0.5)
+        self.assertEqual(unexposed.adjustments["office"], 0.5)
+
+    def test_downstairs_uses_a_slower_effective_outdoor_temperature_filter(self):
+        upstairs_effective_temperature = filter_outdoor_temperature(
+            raw_temperature=10.1,
+            previous_temperature=10.0,
+            elapsed_seconds=120.0,
+            time_constant_seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_filter_time_constant_seconds,
+        )
+        downstairs_effective_temperature = filter_outdoor_temperature(
+            raw_temperature=10.1,
+            previous_temperature=10.0,
+            elapsed_seconds=120.0,
+            time_constant_seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.downstairs_outdoor_filter_time_constant_seconds,
+        )
+
+        self.assertAlmostEqual(upstairs_effective_temperature, 10.0181, places=4)
+        self.assertAlmostEqual(downstairs_effective_temperature, 10.0064, places=4)
+        self.assertLess(downstairs_effective_temperature, upstairs_effective_temperature)
+
+    def test_output_hysteresis_holds_changes_close_to_a_rounding_boundary(self):
+        self.assertEqual(apply_adjustment_hysteresis(0.56, 0.5, 0.025), 0.5)
+        self.assertEqual(apply_adjustment_hysteresis(0.58, 0.5, 0.025), 0.6)
+        self.assertEqual(apply_adjustment_hysteresis(0.42, 0.5, 0.025), 0.4)
+
+    def test_adjustment_trigger_inputs_exclude_output_input_numbers(self):
+        self.assertIn("input_select.heatpump_mode_user", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn(f"{TEST_CLIMATE_ENTITY}.hvac_action", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn("cover.officeshutters.current_position", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+            self.assertNotIn(zone.output_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+            self.assertIn(zone.output_entity_id, MODE_TRIGGER_ENTITIES)
+
+
+class ComfortAdjustmentRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state_values = dict(temptamer_main.state._values)
+        self.original_state_attrs = deepcopy(temptamer_main.state._attrs)
+        self.original_runtime_state = deepcopy(temptamer_main.RUNTIME_STATE)
+        self.original_service_call = temptamer_main.service.call
+
+    def tearDown(self):
+        temptamer_main.state._values = dict(self.original_state_values)
+        temptamer_main.state._attrs = dict(self.original_state_attrs)
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(self.original_runtime_state)
+        temptamer_main.service.call = self.original_service_call
+
+    def test_cover_facades_are_read_from_cover_device_labels(self):
+        entity_entries = SimpleNamespace(
+            async_get=lambda _entity_id: SimpleNamespace(device_id="cover-device"),
+        )
+        device_entries = SimpleNamespace(
+            async_get=lambda _device_id: SimpleNamespace(labels={"awning_e"}),
+        )
+        entity_registry_module = ModuleType("homeassistant.helpers.entity_registry")
+        entity_registry_module.async_get = lambda _hass: entity_entries
+        device_registry_module = ModuleType("homeassistant.helpers.device_registry")
+        device_registry_module.async_get = lambda _hass: device_entries
+        helpers_module = ModuleType("homeassistant.helpers")
+        helpers_module.entity_registry = entity_registry_module
+        helpers_module.device_registry = device_registry_module
+        homeassistant_module = ModuleType("homeassistant")
+        homeassistant_module.helpers = helpers_module
+
+        with (
+            patch.object(temptamer_main, "hass", object(), create=True),
+            patch.dict(
+                sys.modules,
+                {
+                    "homeassistant": homeassistant_module,
+                    "homeassistant.helpers": helpers_module,
+                    "homeassistant.helpers.device_registry": device_registry_module,
+                    "homeassistant.helpers.entity_registry": entity_registry_module,
+                },
+            ),
+        ):
+            facades = temptamer_main._resolve_cover_facades()
+
+        self.assertEqual(set(facades.values()), {"e"})
+
+    def test_publisher_updates_only_input_numbers_while_control_is_disabled(self):
+        temptamer_main.state._values.clear()
+        temptamer_main.state._values.update(comfort_adjustment_state_map())
+        temptamer_main.state._values[temptamer_main.ENABLED_ENTITY_ID] = "off"
+        temptamer_main.state._attrs.clear()
+        temptamer_main.state._attrs.update(comfort_adjustment_attr_map())
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        with patch.object(temptamer_main, "_resolve_cover_facades", return_value=COMFORT_ADJUSTMENT_COVER_FACADES):
+            temptamer_main.run_comfort_adjustment_pass(reason="test")
+
+        self.assertEqual(
+            service_call.call_args_list,
+            [
+                call(
+                    "input_number",
+                    "set_value",
+                    blocking=True,
+                    entity_id="input_number.comfort_adjustment_downstairs",
+                    value=1.1,
+                ),
+                call(
+                    "input_number",
+                    "set_value",
+                    blocking=True,
+                    entity_id="input_number.comfort_adjustment_bed_1_2",
+                    value=1.0,
+                ),
+                call(
+                    "input_number",
+                    "set_value",
+                    blocking=True,
+                    entity_id="input_number.comfort_adjustment_bed_3_4",
+                    value=1.0,
+                ),
+                call(
+                    "input_number",
+                    "set_value",
+                    blocking=True,
+                    entity_id="input_number.comfort_adjustment_office",
+                    value=1.0,
+                ),
+                call(
+                    "input_number",
+                    "set_value",
+                    blocking=True,
+                    entity_id="input_number.comfort_adjustment_dining",
+                    value=1.0,
+                ),
+            ],
+        )
+
+    def test_publisher_uses_live_unadjusted_control_targets_when_enabled(self):
+        state_values = base_state_map()
+        state_values.update(
+            comfort_adjustment_state_map(
+                **{
+                    "sensor.office_average_temperature": "22.4",
+                    "sensor.gw3000c_outdoor_temperature": "16.7",
+                    "input_number.comfort_adjustment_office": "1.5",
+                }
+            )
+        )
+        temptamer_main.state._values.clear()
+        temptamer_main.state._values.update(state_values)
+        temptamer_main.state._values[temptamer_main.ENABLED_ENTITY_ID] = "on"
+        state_attrs = base_attr_map()
+        state_attrs.update(comfort_adjustment_attr_map())
+        temptamer_main.state._attrs.clear()
+        temptamer_main.state._attrs.update(state_attrs)
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        with patch.object(temptamer_main, "_resolve_cover_facades", return_value=COMFORT_ADJUSTMENT_COVER_FACADES):
+            temptamer_main.run_comfort_adjustment_pass(reason="test")
+
+        self.assertIn(
+            call(
+                "input_number",
+                "set_value",
+                blocking=True,
+                entity_id="input_number.comfort_adjustment_office",
+                value=0.3,
+            ),
+            service_call.call_args_list,
+        )
 
 
 class TempTamerTests(unittest.TestCase):
@@ -255,6 +680,64 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "Night")
         self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Night")
+
+    def test_comfort_adjustment_shifts_every_zone_threshold_and_demand_boundary(self):
+        baseline = build_snapshot(
+            FakeReader(
+                base_state_map(**{"sensor.office_average_temperature": "18.8"}),
+                base_attr_map(),
+            )
+        )
+        adjusted = build_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "sensor.office_average_temperature": "18.8",
+                        "input_number.comfort_adjustment_office": "0.5",
+                    }
+                ),
+                base_attr_map(),
+            )
+        )
+        baseline_zone = baseline.zones["office"]
+        adjusted_zone = adjusted.zones["office"]
+
+        self.assertEqual(adjusted.base_zone_targets["office"], (19.7, 20.5))
+        self.assertEqual(adjusted_zone.comfort_adjustment, 0.5)
+        self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside + 0.5)
+        self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until + 0.5)
+        self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target + 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.enable_outside, baseline_zone.cool_scheme.enable_outside + 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.continue_until, baseline_zone.cool_scheme.continue_until + 0.5)
+        self.assertEqual(adjusted_zone.cool_scheme.ideal_target, baseline_zone.cool_scheme.ideal_target + 0.5)
+        self.assertNotIn("office", baseline.heat_calling_zones)
+        self.assertIn("office", adjusted.heat_calling_zones)
+
+    def test_comfort_adjustment_defaults_and_clamps_invalid_helper_values(self):
+        unavailable = build_snapshot(
+            FakeReader(
+                base_state_map(**{"input_number.comfort_adjustment_office": "unavailable"}),
+                base_attr_map(),
+            )
+        )
+        positive = build_snapshot(
+            FakeReader(
+                base_state_map(**{"input_number.comfort_adjustment_office": "9.0"}),
+                base_attr_map(),
+            )
+        )
+        negative = build_snapshot(
+            FakeReader(
+                base_state_map(**{"input_number.comfort_adjustment_office": "-9.0"}),
+                base_attr_map(),
+            )
+        )
+
+        self.assertEqual(unavailable.zones["office"].comfort_adjustment, 0.0)
+        self.assertEqual(positive.zones["office"].comfort_adjustment, 1.5)
+        self.assertEqual(negative.zones["office"].comfort_adjustment, -1.5)
+        self.assertEqual(positive.zones["office"].scheme.ideal_target, 21.2)
+        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 19.0)
 
     def test_build_snapshot_auto_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(

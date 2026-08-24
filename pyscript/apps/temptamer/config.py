@@ -18,6 +18,11 @@ from .constants import (
     SCHEME_OFF,
 )
 from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode, PowerOffComfortMode, ScheduledComfortMode
+from .comfort_adjustments import (
+    ComfortAdjustmentConfig,
+    ComfortAdjustmentRoomConfig,
+    ComfortAdjustmentZoneConfig,
+)
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
 GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR = "sensor.entry_goodwe_inverter_current_electricity_price"
@@ -231,6 +236,14 @@ DEFAULT_ZONE_COMFORT_MODE_ENTITIES = {
     "bedroom_3_4": "input_select.temptamer_comfort_mode_bed34",
 }
 
+DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES = {
+    "downstairs": "input_number.comfort_adjustment_downstairs",
+    "bedroom_1_2": "input_number.comfort_adjustment_bed_1_2",
+    "bedroom_3_4": "input_number.comfort_adjustment_bed_3_4",
+    "office": "input_number.comfort_adjustment_office",
+    "dining": "input_number.comfort_adjustment_dining",
+}
+
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
@@ -241,7 +254,142 @@ DEFAULT_SYSTEM_CONFIG = SystemConfig(
     comfort_modes=DEFAULT_COMFORT_MODES,
     heat_control_schemes=DEFAULT_HEAT_CONTROL_SCHEMES,
     cool_control_schemes=DEFAULT_COOL_CONTROL_SCHEMES,
+    zone_comfort_adjustment_entities=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES,
 )
+
+DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
+    zones=(
+        ComfortAdjustmentZoneConfig(
+            key="downstairs",
+            output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["downstairs"],
+            fallback_temperature_entity_id="sensor.downstairs_zone_average_temperature",
+            rooms=(
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.rumpus_average_temperature",
+                    fallback_temperature_entity_id="sensor.develco_products_a_s_moszb_140_temperature_2",
+                    solar_access_when_exposed=0.05,
+                    solar_access_when_unexposed=0.05,
+                ),
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.kitchen_average_temperature",
+                    fallback_temperature_entity_id="sensor.kitchen_motion_temperature",
+                    facade="e",
+                    solar_access_when_exposed=1.0,
+                    solar_access_when_unexposed=0.25,
+                ),
+            ),
+            upstairs=False,
+        ),
+        ComfortAdjustmentZoneConfig(
+            key="bedroom_1_2",
+            output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_1_2"],
+            fallback_temperature_entity_id="sensor.average_bed1_2_zone_temp",
+            rooms=(
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.bedroom_1_average_temperature",
+                    cover_entity_id="cover.bed1shutters",
+                ),
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.bedroom_2_average_temperature",
+                    cover_entity_id="cover.bed_2_shutters",
+                ),
+            ),
+            upstairs=True,
+        ),
+        ComfortAdjustmentZoneConfig(
+            key="bedroom_3_4",
+            output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_3_4"],
+            fallback_temperature_entity_id="sensor.average_bed3_4_zone_temp",
+            rooms=(
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.bedroom_3_average_temperature",
+                    cover_entity_id="cover.bed_3_shutters",
+                ),
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.bedroom_4_average_temperature",
+                    cover_entity_id="cover.bed_4_shutters",
+                ),
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.bathroom_average_temperature",
+                    fallback_temperature_entity_id="sensor.bathroom_motion_temperature",
+                    solar_access_when_exposed=0.60,
+                    solar_access_when_unexposed=0.60,
+                ),
+            ),
+            upstairs=True,
+        ),
+        ComfortAdjustmentZoneConfig(
+            key="office",
+            output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["office"],
+            fallback_temperature_entity_id="sensor.office_average_temperature",
+            rooms=(
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.office_average_temperature",
+                    cover_entity_id="cover.officeshutters",
+                ),
+            ),
+            upstairs=True,
+        ),
+        ComfortAdjustmentZoneConfig(
+            key="dining",
+            output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["dining"],
+            fallback_temperature_entity_id="sensor.average_dining_zone_temp",
+            rooms=(
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.dining_average_temperature",
+                    cover_entity_id="cover.kitchen_shutters",
+                ),
+                ComfortAdjustmentRoomConfig(
+                    primary_temperature_entity_id="sensor.lego_room_average_temperature",
+                    cover_entity_id="cover.lego_shutters",
+                ),
+            ),
+            upstairs=True,
+        ),
+    ),
+    house_temperature_entity_id="sensor.home_temperature",
+    heatpump_mode_user_entity_id="input_select.heatpump_mode_user",
+    climate_entity_id=DEFAULT_SYSTEM_CONFIG.climate_entity,
+    outdoor_temperature_entity_id="sensor.gw3000c_outdoor_temperature",
+    weather_entity_id="weather.epping",
+    solar_radiation_entity_id="sensor.gw3000c_solar_radiation",
+    sun_entity_id="sun.sun",
+    awning_min_sun_elevation_entity_id="input_number.awning_min_sun_elevation",
+    awning_exposure_half_band_entity_id="input_number.awning_exposure_half_band",
+    facade_labels={"awning_n": "n", "awning_e": "e", "awning_s": "s", "awning_w": "w"},
+    outdoor_filter_time_constant_seconds=10 * 60,
+    downstairs_outdoor_filter_time_constant_seconds=30 * 60,
+    output_hysteresis=0.025,
+)
+
+_comfort_adjustment_trigger_entities: list[str] = []
+
+
+def _add_comfort_adjustment_trigger_entity(entity_id: str | None) -> None:
+    if entity_id and entity_id not in _comfort_adjustment_trigger_entities:
+        _comfort_adjustment_trigger_entities.append(entity_id)
+
+
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.heatpump_mode_user_entity_id)
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.climate_entity_id)
+_add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.climate_entity_id}.hvac_action")
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_temperature_entity_id)
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.weather_entity_id)
+_add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.weather_entity_id}.*")
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id)
+_add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.sun_entity_id}.*")
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.awning_min_sun_elevation_entity_id)
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.awning_exposure_half_band_entity_id)
+_add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.house_temperature_entity_id)
+for comfort_adjustment_zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+    _add_comfort_adjustment_trigger_entity(comfort_adjustment_zone.fallback_temperature_entity_id)
+    for comfort_adjustment_room in comfort_adjustment_zone.rooms:
+        _add_comfort_adjustment_trigger_entity(comfort_adjustment_room.primary_temperature_entity_id)
+        _add_comfort_adjustment_trigger_entity(comfort_adjustment_room.fallback_temperature_entity_id)
+        if comfort_adjustment_room.cover_entity_id:
+            _add_comfort_adjustment_trigger_entity(f"{comfort_adjustment_room.cover_entity_id}.current_position")
+
+COMFORT_ADJUSTMENT_TRIGGER_ENTITIES = tuple(_comfort_adjustment_trigger_entities)
 
 _temperature_trigger_entities: list[str] = []
 
@@ -274,6 +422,8 @@ _add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
 _add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity)
 _add_mode_trigger_entity(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR)
 for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values():
+    _add_mode_trigger_entity(entity_id)
+for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_adjustment_entities.values():
     _add_mode_trigger_entity(entity_id)
 for comfort_mode in DEFAULT_SYSTEM_CONFIG.comfort_modes.values():
     for entity_id in comfort_mode.trigger_entity_ids:
