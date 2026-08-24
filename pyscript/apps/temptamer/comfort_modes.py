@@ -5,7 +5,14 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, time
 from typing import ClassVar, Protocol
 
-from .constants import SCHEME_BEDROOM, SCHEME_DAY_LIVING, SCHEME_DINING_BASIC, SCHEME_OFF
+from .constants import (
+    COMFORT_MODE_POWER_DAY,
+    SCHEME_BEDROOM,
+    SCHEME_DAY_LIVING,
+    SCHEME_DINING_BASIC,
+    SCHEME_DOWNSTAIRS,
+    SCHEME_OFF,
+)
 
 
 class StateReaderLike(Protocol):
@@ -20,6 +27,7 @@ class ComfortModeSnapshotData:
     free_power_available: bool
     heat_sink_available: bool
     free_power_later_available: bool = False
+    downstairs_temp: float | None = None
     poweroff_active: bool = False
     now: datetime | None = None
 
@@ -147,9 +155,15 @@ class PowerComfortMode(DefaultComfortMode):
     free_power_heat_start_medium_fan_differential: ClassVar[float] = 1.5
     free_power_low_to_medium_fan_differential: ClassVar[float] = 2.5
     free_power_medium_to_low_fan_differential: ClassVar[float] = 1.25
-    free_power_initial_suppliment: ClassVar[float] = 1.25
-    free_power_later: ClassVar[float] = 3.0
+    free_power_initial_suppliment: ClassVar[float] = 0.75
+    free_power_later: ClassVar[float] = 1.5
+    free_power_downstairs_initial_suppliment: ClassVar[float] = 1.25
+    free_power_downstairs_later: ClassVar[float] = 3.0
     free_power_later_start: ClassVar[time] = time(13, 0)
+    free_power_downstairs_zone_key: ClassVar[str] = "downstairs"
+    free_power_downstairs_enable_outside_supplement: ClassVar[float] = 1.0
+    free_power_downstairs_temperature_threshold: ClassVar[float] = 19.0
+    free_power_downstairs_gated_zone_keys: ClassVar[frozenset[str]] = frozenset({"office", "dining"})
 
     power_price_entity_id: str = ""
     free_power_state: str = "0"
@@ -173,21 +187,44 @@ class PowerComfortMode(DefaultComfortMode):
     def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
         if not snapshot_data.heat_sink_available or zone.scheme.name == SCHEME_OFF:
             return zone
-        adjusted_continue_until = zone.scheme.continue_until + self._free_power_heating_supplement(snapshot_data)
+        if (
+            zone.key in self.free_power_downstairs_gated_zone_keys
+            and (
+                snapshot_data.downstairs_temp is None
+                or snapshot_data.downstairs_temp <= self.free_power_downstairs_temperature_threshold
+            )
+        ):
+            return zone
+        adjusted_continue_until = zone.scheme.continue_until + self._free_power_heating_supplement(
+            zone.scheme.name,
+            snapshot_data,
+        )
+        adjusted_enable_outside = adjusted_continue_until - 0.75
+        if (
+            snapshot_data.comfort_mode == COMFORT_MODE_POWER_DAY
+            and snapshot_data.free_power_available
+            and zone.key == self.free_power_downstairs_zone_key
+        ):
+            adjusted_enable_outside += self.free_power_downstairs_enable_outside_supplement
         adjusted_scheme = replace(
             zone.scheme,
             continue_until=adjusted_continue_until,
-            enable_outside=adjusted_continue_until - 0.75,
+            enable_outside=adjusted_enable_outside,
             ideal_target=adjusted_continue_until - 0.5,
         )
         return replace(zone, scheme=adjusted_scheme)
 
-    def _free_power_heating_supplement(self, snapshot_data: ComfortModeSnapshotData) -> float:
+    def _free_power_heating_supplement(
+        self,
+        scheme_name: str,
+        snapshot_data: ComfortModeSnapshotData,
+    ) -> float:
+        is_downstairs_scheme = scheme_name == SCHEME_DOWNSTAIRS
         if snapshot_data.free_power_later_available:
-            return self.free_power_later
+            return self.free_power_downstairs_later if is_downstairs_scheme else self.free_power_later
         if snapshot_data.now is not None and snapshot_data.now.time() > self.free_power_later_start:
-            return self.free_power_later
-        return self.free_power_initial_suppliment
+            return self.free_power_downstairs_later if is_downstairs_scheme else self.free_power_later
+        return self.free_power_downstairs_initial_suppliment if is_downstairs_scheme else self.free_power_initial_suppliment
 
     def fan_speed_level(
         self,

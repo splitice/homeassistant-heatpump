@@ -12,11 +12,13 @@ from .config import (
     GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     GOODWE_PV_POWER_SENSOR,
+    HEAT_DEMAND_FAN_BOOST_STATE_FILE,
     MODE_TRIGGER_ENTITIES,
     POWERDAY_BATTERY_THRESHOLD,
     POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP,
     POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP,
     POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
+    POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS,
     POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS,
     POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
     POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
@@ -37,6 +39,10 @@ from .constants import (
     COMFORT_MODE_POWER_OFF,
     CONTROL_HVAC_MODE_MANUAL,
     CONTROL_INTERVAL_SECONDS,
+    HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS,
+    HEAT_DEMAND_FAN_BOOST_MAX_LEVEL,
+    HVAC_START_FAN_RAMP_DURATION_SECONDS,
+    HVAC_START_FAN_RAMP_MIN_OFF_SECONDS,
     HVAC_COOL,
     HVAC_HEAT,
     LOGGER_NAME,
@@ -110,6 +116,11 @@ if USING_PYTHON_IMPORTS and "task" not in globals():  # pragma: no cover - used 
     task = _TaskRuntime()
 
 
+if USING_PYTHON_IMPORTS and "pyscript_executor" not in globals():  # pragma: no cover - used only outside PyScript runtime
+    def pyscript_executor(func):
+        return func
+
+
 if USING_PYTHON_IMPORTS and "state" not in globals():  # pragma: no cover - used only outside PyScript runtime
     class _StateRuntime:
         def __init__(self):
@@ -179,8 +190,11 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
     "last_fan_speed_decrease_at": None,
+    "hvac_off_started_at": None,
+    "hvac_start_fan_ramp_started_at": None,
     "heat_demand_fan_boost_level": 0,
     "last_heat_demand_fan_boost_at": None,
+    "heat_demand_fan_boost_restore_checked": False,
     "max_power_demand_5m_kw": None,
     "heat_demand_fan_boost_reason": None,
     "last_trigger": None,
@@ -344,6 +358,8 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
             "last_fan_speed_decrease_at": _isoformat(RUNTIME_STATE.get("last_fan_speed_decrease_at")),
+            "hvac_off_started_at": _isoformat(RUNTIME_STATE.get("hvac_off_started_at")),
+            "hvac_start_fan_ramp_started_at": _isoformat(RUNTIME_STATE.get("hvac_start_fan_ramp_started_at")),
             "heat_demand_fan_boost_level": RUNTIME_STATE.get("heat_demand_fan_boost_level", 0),
             "last_heat_demand_fan_boost_at": _isoformat(RUNTIME_STATE.get("last_heat_demand_fan_boost_at")),
             "max_power_demand_5m_kw": RUNTIME_STATE.get("max_power_demand_5m_kw"),
@@ -451,6 +467,130 @@ def _normalize_runtime_datetime(value: object | None) -> datetime | None:
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _observe_hvac_off_period(current_hvac_mode: str | None, now: datetime) -> None:
+    """Track continuous periods in which the heat pump reports itself off."""
+    if (current_hvac_mode or "").lower() != "off":
+        RUNTIME_STATE["hvac_off_started_at"] = None
+        return
+
+    previous_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("hvac_off_started_at"))
+    normalized_now = _normalize_runtime_datetime(now)
+    if normalized_now is None:
+        return
+    if previous_started_at is None or previous_started_at > normalized_now:
+        RUNTIME_STATE["hvac_off_started_at"] = normalized_now
+
+
+def _resolve_hvac_start_fan_ramp_started_at(plan, current_hvac_mode: str | None, now: datetime) -> datetime | None:
+    """Start or maintain a fan ramp for a heat or cool cycle following a long off period."""
+    current_mode = (current_hvac_mode or "").lower()
+    normalized_now = _normalize_runtime_datetime(now)
+    previous_ramp_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("hvac_start_fan_ramp_started_at"))
+
+    if plan.turn_off:
+        if current_mode != "off" and normalized_now is not None:
+            RUNTIME_STATE["hvac_off_started_at"] = normalized_now
+        RUNTIME_STATE["hvac_start_fan_ramp_started_at"] = None
+        return None
+
+    if plan.hvac_mode not in {HVAC_HEAT, HVAC_COOL} or plan.idle:
+        RUNTIME_STATE["hvac_start_fan_ramp_started_at"] = None
+        return None
+
+    if previous_ramp_started_at is not None and normalized_now is not None:
+        if 0 <= (normalized_now - previous_ramp_started_at).total_seconds() <= HVAC_START_FAN_RAMP_DURATION_SECONDS:
+            return previous_ramp_started_at
+        RUNTIME_STATE["hvac_start_fan_ramp_started_at"] = None
+
+    hvac_off_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("hvac_off_started_at"))
+    if (
+        current_mode != "off"
+        or hvac_off_started_at is None
+        or normalized_now is None
+        or (normalized_now - hvac_off_started_at).total_seconds() < HVAC_START_FAN_RAMP_MIN_OFF_SECONDS
+    ):
+        return None
+
+    RUNTIME_STATE["hvac_start_fan_ramp_started_at"] = normalized_now
+    return normalized_now
+
+
+@pyscript_executor
+def _read_heat_demand_fan_boost_state(file_path):
+    """Read the persisted boost and its filesystem modification timestamp."""
+    import os
+
+    try:
+        with open(file_path, encoding="utf-8") as state_file:
+            raw_level = state_file.read().strip()
+        modified_at = os.path.getmtime(file_path)
+    except OSError as exc:
+        return None, None, str(exc)
+
+    try:
+        return int(raw_level), modified_at, None
+    except ValueError:
+        return None, modified_at, f"invalid fan boost value {raw_level!r}"
+
+
+@pyscript_executor
+def _write_heat_demand_fan_boost_state(file_path, fan_boost_level):
+    """Persist one fan-boost level, refreshing the file modification time."""
+    try:
+        with open(file_path, "w", encoding="utf-8") as state_file:
+            state_file.write(f"{int(fan_boost_level)}\n")
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _restore_heat_demand_fan_boost_state(now: datetime) -> None:
+    if RUNTIME_STATE.get("heat_demand_fan_boost_restore_checked"):
+        return
+    RUNTIME_STATE["heat_demand_fan_boost_restore_checked"] = True
+
+    persisted_level, modified_timestamp, read_error = _read_heat_demand_fan_boost_state(
+        HEAT_DEMAND_FAN_BOOST_STATE_FILE
+    )
+    if read_error is not None:
+        if modified_timestamp is not None:
+            LOGGER.warning("FAN BOOST: ignoring persisted state: %s", read_error)
+        return
+    if persisted_level is None or modified_timestamp is None:
+        return
+
+    modified_at = datetime.fromtimestamp(modified_timestamp, tz=timezone.utc)
+    normalized_now = _normalize_runtime_datetime(now) or _system_now().astimezone(timezone.utc)
+    state_age = normalized_now - modified_at
+    if state_age < timedelta(0) or state_age >= timedelta(seconds=HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS):
+        LOGGER.info(
+            "FAN BOOST: persisted state is stale (modified %s); starting from zero",
+            modified_at.isoformat(),
+        )
+        return
+
+    restored_level = max(0, min(HEAT_DEMAND_FAN_BOOST_MAX_LEVEL, persisted_level))
+    RUNTIME_STATE["heat_demand_fan_boost_level"] = restored_level
+    RUNTIME_STATE["last_heat_demand_fan_boost_at"] = modified_at
+    RUNTIME_STATE["heat_demand_fan_boost_reason"] = (
+        f"restored boost={restored_level} from {modified_at.isoformat()}"
+    )
+    LOGGER.info(
+        "FAN BOOST: restored boost=%s from state modified %s",
+        restored_level,
+        modified_at.isoformat(),
+    )
+
+
+def _persist_heat_demand_fan_boost_state(fan_boost_level: int) -> None:
+    write_error = _write_heat_demand_fan_boost_state(
+        HEAT_DEMAND_FAN_BOOST_STATE_FILE,
+        fan_boost_level,
+    )
+    if write_error is not None:
+        LOGGER.warning("FAN BOOST: failed to persist state: %s", write_error)
 
 
 def _is_free_power_price_state(value: object | None) -> bool:
@@ -962,6 +1102,24 @@ def _update_powerday_downstairs_priority_runtime_state(snapshot, operating_mode:
     )
 
 
+def _powerday_downstairs_free_power_fan_boost(
+    snapshot,
+    demand,
+    predicted_open_zones: tuple[str, ...],
+    operating_mode: str | None,
+) -> int:
+    """Return the physical fan-level boost for active free-power downstairs heating."""
+    if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY:
+        return 0
+    if not snapshot.free_power_available or operating_mode != HVAC_HEAT:
+        return 0
+    if not demand.heat_requested:
+        return 0
+    if POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY not in predicted_open_zones:
+        return 0
+    return POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS
+
+
 def _set_poweroff_runtime_state(
     *,
     active: bool,
@@ -1102,8 +1260,11 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
     RUNTIME_STATE.setdefault("last_fan_speed_decrease_at", None)
+    RUNTIME_STATE.setdefault("hvac_off_started_at", None)
+    RUNTIME_STATE.setdefault("hvac_start_fan_ramp_started_at", None)
     RUNTIME_STATE.setdefault("heat_demand_fan_boost_level", 0)
     RUNTIME_STATE.setdefault("last_heat_demand_fan_boost_at", None)
+    RUNTIME_STATE.setdefault("heat_demand_fan_boost_restore_checked", False)
     RUNTIME_STATE.setdefault("max_power_demand_5m_kw", None)
     RUNTIME_STATE.setdefault("heat_demand_fan_boost_reason", None)
     RUNTIME_STATE.setdefault("powerday_downstairs_priority_started_at", None)
@@ -1118,6 +1279,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("poweroff_active", False)
     RUNTIME_STATE.setdefault("poweroff_reason", None)
     RUNTIME_STATE["last_trigger"] = reason
+    _restore_heat_demand_fan_boost_state(now)
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
     powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(controller, now)
@@ -1143,6 +1305,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     current_setpoint = controller.get_attr(climate_entity, "temperature")
     target_temp_step = controller.get_attr(climate_entity, "target_temp_step")
     current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
+    _observe_hvac_off_period(current_hvac_mode_str, now)
 
     operating_mode, operating_mode_reason = resolve_operating_mode(
         snapshot,
@@ -1212,6 +1375,13 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE["last_heat_demand_fan_boost_at"] = last_heat_demand_fan_boost_at
     RUNTIME_STATE["max_power_demand_5m_kw"] = max_power_demand_5m_kw
     RUNTIME_STATE["heat_demand_fan_boost_reason"] = heat_demand_fan_boost_reason
+    _persist_heat_demand_fan_boost_state(heat_demand_fan_boost_level)
+    downstairs_free_power_fan_boost = _powerday_downstairs_free_power_fan_boost(
+        snapshot,
+        demand,
+        predicted_open_zones,
+        operating_mode,
+    )
 
     if zone_actions:
         apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
@@ -1228,31 +1398,43 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     if not predicted_open_zones:
         LOGGER.warning("ZONES: predicted_open=none details=%s", " | ".join(zone_diagnostics))
 
-    plan = build_dispatch_plan(
-        snapshot,
-        demand,
-        predicted_open_zones,
-        current_hvac_mode=current_hvac_mode_str,
-        current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
-        current_setpoint=current_setpoint,
-        target_temp_step=target_temp_step,
-        operation_mode=operating_mode,
-        comfort_mode_changed=comfort_mode_changed,
-        idle_started_at=RUNTIME_STATE["idle_started_at"],
-        idle_heat_step=RUNTIME_STATE["idle_heat_step"],
-        idle_heat_step_changed_at=RUNTIME_STATE["idle_heat_step_changed_at"],
-        idle_heat_zone_key=RUNTIME_STATE["idle_heat_zone_key"],
-        idle_shutdown_at=RUNTIME_STATE["idle_shutdown_at"],
-        idle_shutdown_heat_step=RUNTIME_STATE["idle_shutdown_heat_step"],
-        idle_shutdown_zone_key=RUNTIME_STATE["idle_shutdown_zone_key"],
-        supported_fan_modes=supported_fan_modes,
-        fan_speed_decrease_at=RUNTIME_STATE["last_fan_speed_decrease_at"],
-        base_fan_boost=heat_demand_fan_boost_level,
-        additional_fan_levels=(
-            POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0
+    dispatch_plan_kwargs = {
+        "current_hvac_mode": current_hvac_mode_str,
+        "current_fan_mode": str(current_fan_mode) if current_fan_mode is not None else None,
+        "current_setpoint": current_setpoint,
+        "target_temp_step": target_temp_step,
+        "operation_mode": operating_mode,
+        "comfort_mode_changed": comfort_mode_changed,
+        "idle_started_at": RUNTIME_STATE["idle_started_at"],
+        "idle_heat_step": RUNTIME_STATE["idle_heat_step"],
+        "idle_heat_step_changed_at": RUNTIME_STATE["idle_heat_step_changed_at"],
+        "idle_heat_zone_key": RUNTIME_STATE["idle_heat_zone_key"],
+        "idle_shutdown_at": RUNTIME_STATE["idle_shutdown_at"],
+        "idle_shutdown_heat_step": RUNTIME_STATE["idle_shutdown_heat_step"],
+        "idle_shutdown_zone_key": RUNTIME_STATE["idle_shutdown_zone_key"],
+        "supported_fan_modes": supported_fan_modes,
+        "fan_speed_decrease_at": RUNTIME_STATE["last_fan_speed_decrease_at"],
+        "base_fan_boost": heat_demand_fan_boost_level,
+        "additional_fan_levels": max(
+            downstairs_free_power_fan_boost,
+            POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0,
         ),
-        now=now,
+        "now": now,
+    }
+    plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
+    hvac_start_fan_ramp_started_at = _resolve_hvac_start_fan_ramp_started_at(
+        plan,
+        current_hvac_mode_str,
+        now,
     )
+    if hvac_start_fan_ramp_started_at is not None:
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            predicted_open_zones,
+            **dispatch_plan_kwargs,
+            hvac_start_fan_ramp_started_at=hvac_start_fan_ramp_started_at,
+        )
 
     apply_dispatch_plan(
         controller,

@@ -149,6 +149,49 @@ def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     return zone.current_temp >= zone.scheme.continue_until
 
 
+def resolve_high_fan_office_closure(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    *,
+    operation_mode: str | None,
+    requested_fan_speed_level: int | None,
+) -> ZoneAction | None:
+    """Close Office when high airflow would make it materially over-conditioned."""
+    if requested_fan_speed_level is None or requested_fan_speed_level <= 5:
+        return None
+    if operation_mode not in {HVAC_HEAT, HVAC_COOL}:
+        return None
+
+    office_zone = snapshot.zones.get("office")
+    if office_zone is None or not office_zone.switch_is_on or office_zone.key not in predicted_open_zones:
+        return None
+    if len(predicted_open_zones) <= MIN_OPEN_ZONES:
+        return None
+
+    if operation_mode == HVAC_HEAT:
+        threshold = office_zone.scheme.enable_outside + 1.0
+        is_one_degree_beyond_enable = office_zone.current_temp >= threshold
+        comparison = ">="
+    else:
+        threshold = office_zone.cool_scheme.enable_outside - 1.0
+        is_one_degree_beyond_enable = office_zone.current_temp <= threshold
+        comparison = "<="
+
+    if not is_one_degree_beyond_enable:
+        return None
+
+    return ZoneAction(
+        zone_key=office_zone.key,
+        turn_on=False,
+        reason=(
+            f"requested fan level {requested_fan_speed_level} is above 5 and Office is "
+            f"{office_zone.current_temp:.1f}{comparison}{threshold:.1f}, one degree beyond its enable threshold; "
+            "another zone remains open for safety"
+        ),
+        discretionary=False,
+    )
+
+
 def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
     if operation_mode == HVAC_COOL:
         # More overheated zones should sort first, so invert the distance from the cooling threshold.
@@ -298,6 +341,7 @@ def resolve_zone_actions(
     downstairs_priority_active: bool = False,
     downstairs_zone_key: str | None = None,
     upstairs_zone_keys: tuple[str, ...] = (),
+    requested_fan_speed_level: int | None = None,
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
     predicted_open: set[str] = set()
@@ -452,6 +496,16 @@ def resolve_zone_actions(
                 )
             )
             discretionary_used += 1
+
+    high_fan_office_closure = resolve_high_fan_office_closure(
+        snapshot,
+        tuple(sorted(predicted_open)),
+        operation_mode=operation_mode,
+        requested_fan_speed_level=requested_fan_speed_level,
+    )
+    if high_fan_office_closure is not None:
+        predicted_open.remove(high_fan_office_closure.zone_key)
+        actions.append(high_fan_office_closure)
 
     if not predicted_open and active_thermal_demand:
         safety_zone_key = _select_safety_open_zone(snapshot, operation_mode)

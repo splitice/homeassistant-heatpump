@@ -19,6 +19,7 @@ from .constants import (
     HEAT_DEMAND_FAN_BOOST_MAX_LEVEL,
     HEAT_DEMAND_FAN_BOOST_MAX_POWER_KW,
     HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP,
+    HVAC_START_FAN_RAMP_DURATION_SECONDS,
     HVAC_COOL,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
@@ -716,6 +717,11 @@ def _fan_speed_level(fan_mode: str | None) -> int | None:
     return int(match.group(1))
 
 
+def fan_speed_level(fan_mode: str | None) -> int | None:
+    """Return the physical fan level represented by a requested fan mode."""
+    return _fan_speed_level(fan_mode)
+
+
 def is_fan_speed_decrease(current_fan_mode: str | None, requested_fan_mode: str | None) -> bool:
     """Return whether applying the requested mode lowers the actual fan speed."""
     current_level = _fan_speed_level(current_fan_mode)
@@ -874,6 +880,29 @@ def _current_fan_speed_level(fan_mode: str | None, *, open_zone_count: int = 1) 
     return max(1, math.ceil(int(match.group(1)) / _fan_speed_multiplier(open_zone_count)))
 
 
+def resolve_hvac_start_fan_ramp_mode(
+    requested_fan_mode: str | None,
+    hvac_start_ramp_started_at: datetime | None,
+    *,
+    supported_fan_modes: Iterable[object] | None,
+    now: datetime | None,
+) -> str | None:
+    """Cap a new heating or cooling cycle's physical fan speed while it stabilizes."""
+    if requested_fan_mode is None:
+        return None
+
+    started_at = _normalize_timestamp(hvac_start_ramp_started_at)
+    current_time = _normalize_timestamp(now)
+    requested_level = _fan_speed_level(requested_fan_mode)
+    if started_at is None or current_time is None or requested_level is None or requested_level <= 1:
+        return requested_fan_mode
+
+    elapsed_seconds = max(0.0, (current_time - started_at).total_seconds())
+    ramp_progress = min(1.0, elapsed_seconds / HVAC_START_FAN_RAMP_DURATION_SECONDS)
+    ramp_level = 1 + math.floor((requested_level - 1) * ramp_progress)
+    return _actual_fan_mode_for_level(ramp_level, supported_fan_modes)
+
+
 def resolve_fan_mode(
     current_fan_mode: str | None,
     current_hvac_mode: str | None,
@@ -887,6 +916,7 @@ def resolve_fan_mode(
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
     additional_fan_levels: int = 0,
+    hvac_start_fan_ramp_started_at: datetime | None = None,
     now: datetime | None = None,
 ) -> str | None:
     if demand.fan_only_requested:
@@ -919,8 +949,16 @@ def resolve_fan_mode(
     if not cooling:
         fan_speed_level += _bounded_fan_boost_level(base_fan_boost) * _fan_speed_multiplier(open_zone_count)
         fan_speed_level += _additional_fan_levels(additional_fan_levels)
+    requested_fan_mode = _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes)
+    if hvac_start_fan_ramp_started_at is not None:
+        return resolve_hvac_start_fan_ramp_mode(
+            requested_fan_mode,
+            hvac_start_fan_ramp_started_at,
+            supported_fan_modes=supported_fan_modes,
+            now=now,
+        )
     return _limit_fan_speed_decrease(
-        _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes),
+        requested_fan_mode,
         current_fan_mode,
         supported_fan_modes=supported_fan_modes,
         fan_speed_decrease_at=fan_speed_decrease_at,
@@ -966,6 +1004,7 @@ def build_dispatch_plan(
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
     additional_fan_levels: int = 0,
+    hvac_start_fan_ramp_started_at: datetime | None = None,
     now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.poweroff_forced_off:
@@ -1010,6 +1049,7 @@ def build_dispatch_plan(
             fan_speed_decrease_at=fan_speed_decrease_at,
             base_fan_boost=base_fan_boost,
             additional_fan_levels=additional_fan_levels,
+            hvac_start_fan_ramp_started_at=hvac_start_fan_ramp_started_at,
             now=now,
         )
 

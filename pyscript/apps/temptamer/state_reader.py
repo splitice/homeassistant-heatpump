@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
@@ -301,9 +302,16 @@ def build_snapshot(
             ),
             last_switch_change=_normalize_timestamp(last_switch_changes.get(zone_key)),
         )
-        if applied_comfort_mode == comfort_mode:
-            zone_state = comfort_mode_behavior.adjust_zone(zone_state, snapshot_data)
         zones[zone_key] = zone_state
+
+    downstairs_zone = zones.get("downstairs")
+    adjustment_snapshot_data = replace(
+        snapshot_data,
+        downstairs_temp=downstairs_zone.current_temp if downstairs_zone is not None else None,
+    )
+    for zone_key, zone_state in zones.items():
+        if zone_state.applied_comfort_mode == comfort_mode:
+            zones[zone_key] = comfort_mode_behavior.adjust_zone(zone_state, adjustment_snapshot_data)
 
     enabled_zones: dict[str, ZoneRuntimeState] = {}
     heat_calling_list: list[str] = []

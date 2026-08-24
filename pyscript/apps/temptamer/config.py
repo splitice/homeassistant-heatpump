@@ -12,6 +12,7 @@ from .constants import (
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
+    SCHEME_DOWNSTAIRS,
     SCHEME_DINING_BASIC,
     SCHEME_NIGHT,
     SCHEME_OFF,
@@ -26,6 +27,9 @@ EAGLE_200_POWER_DEMAND_SENSOR = "sensor.eagle_200_power_demand"
 # This must be a kW-valued, rolling five-minute maximum-demand sensor.  Change
 # the entity ID to match the helper configured in Home Assistant.
 EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR = "sensor.eagle_200_max_power_demand_5m"
+# A one-line runtime state file.  It lives outside the app package so updates do
+# not trigger a PyScript app reload.
+HEAT_DEMAND_FAN_BOOST_STATE_FILE = "/config/pyscript/temptamer_fan_boost.state"
 POWERDAY_BATTERY_THRESHOLD = 95.0
 POWERDAY_EXPORT_POWER_THRESHOLD = -1.0
 POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS = 10 * 60
@@ -39,6 +43,7 @@ POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP = 3.0
 POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP = 2.0
 POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS = 10 * 60
 POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS = 2
+POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS = 1
 POWEROFF_ACTIVATION_BATTERY_THRESHOLD = 95.0
 POWEROFF_DEACTIVATION_BATTERY_THRESHOLD = 90.0
 POWEROFF_PV_POWER_THRESHOLD = 1.0
@@ -54,6 +59,12 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
         enable_outside=18.6,
         continue_until=20.1,
         ideal_target=19.7,
+    ),
+    SCHEME_DOWNSTAIRS: ControlScheme(
+        name=SCHEME_DOWNSTAIRS,
+        enable_outside=19.1,
+        continue_until=20.6,
+        ideal_target=20.2,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
@@ -78,6 +89,12 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
         enable_outside=21.5,
         continue_until=19.5,
         ideal_target=20.5,
+    ),
+    SCHEME_DOWNSTAIRS: ControlScheme(
+        name=SCHEME_DOWNSTAIRS,
+        enable_outside=22.0,
+        continue_until=20.0,
+        ideal_target=21.0,
     ),
     SCHEME_DINING_BASIC: ControlScheme(
         name=SCHEME_DINING_BASIC,
@@ -148,7 +165,7 @@ DEFAULT_COMFORT_MODE_NIGHT_MAPPING = {
 DEFAULT_COMFORT_MODE_DAY_MAPPING = {
     "office": SCHEME_DAY_LIVING,
     "dining": SCHEME_DAY_LIVING,
-    "downstairs": SCHEME_DINING_BASIC,
+    "downstairs": SCHEME_DOWNSTAIRS,
     "bedroom_1_2": SCHEME_BEDROOM,
     "bedroom_3_4": SCHEME_BEDROOM,
 }
@@ -161,11 +178,16 @@ DEFAULT_COMFORT_MODE_OFFICE_MAPPING = {
     "bedroom_3_4": SCHEME_BEDROOM,
 }
 
+DEFAULT_COMFORT_MODE_POWER_DAY_MAPPING = {
+    **DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+    "downstairs": SCHEME_DOWNSTAIRS,
+}
+
 DEFAULT_COMFORT_MODE_OFF = DefaultComfortMode(name=COMFORT_MODE_OFF, zone_schemes=DEFAULT_COMFORT_MODE_OFF_MAPPING)
 DEFAULT_COMFORT_MODE_NIGHT = NightComfortMode(name=COMFORT_MODE_NIGHT, zone_schemes=DEFAULT_COMFORT_MODE_NIGHT_MAPPING)
 DEFAULT_COMFORT_MODE_POWER_DAY = PowerComfortMode(
     name=COMFORT_MODE_POWER_DAY,
-    zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING,
+    zone_schemes=DEFAULT_COMFORT_MODE_POWER_DAY_MAPPING,
     trigger_entity_ids=(
         GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
         GOODWE_BATTERY_REMAINING_SENSOR,
@@ -181,9 +203,6 @@ DEFAULT_COMFORT_MODES = {
     COMFORT_MODE_DAY: ScheduledComfortMode(
         name=COMFORT_MODE_DAY,
         zone_schemes=DEFAULT_COMFORT_MODE_DAY_MAPPING,
-        scheduled_zone_schemes={
-            "downstairs": ((time(16, 0), SCHEME_DAY_LIVING),),
-        },
     ),
     COMFORT_MODE_OFFICE: DefaultComfortMode(name=COMFORT_MODE_OFFICE, zone_schemes=DEFAULT_COMFORT_MODE_OFFICE_MAPPING),
     COMFORT_MODE_POWER_DAY: DEFAULT_COMFORT_MODE_POWER_DAY,
