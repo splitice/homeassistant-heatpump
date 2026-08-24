@@ -11,6 +11,7 @@ from .comfort_modes import DefaultComfortMode
 from .config import DEFAULT_SYSTEM_CONFIG
 from .constants import (
     COMFORT_MODE_OFF,
+    COMFORT_MODE_POWER_DAY,
     CONTROL_HVAC_MODE_OFF,
     FAN_SPEED_DECREASE_INTERVAL_SECONDS,
     FAN_LOW,
@@ -47,6 +48,7 @@ from .constants import (
     MAX_HEAT_SETPOINT,
     MIN_HEAT_SETPOINT,
 )
+from .idle_demand_forecast import IdleDemandForecast
 from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig, ZoneRuntimeState
 from .logging_control import install_temptamer_log_filter
 from .state_reader import parse_float
@@ -1007,6 +1009,7 @@ def build_dispatch_plan(
     base_fan_boost: int = 0,
     additional_fan_levels: int = 0,
     hvac_start_fan_ramp_started_at: datetime | None = None,
+    idle_demand_forecast: IdleDemandForecast | None = None,
     now: datetime | None = None,
 ) -> DispatchPlan:
     if snapshot.poweroff_forced_off:
@@ -1187,6 +1190,22 @@ def build_dispatch_plan(
         operation_mode=operation_mode,
     )
     if idle_hvac_mode in {HVAC_HEAT, HVAC_COOL}:
+        powerday_heat_soak_active = (
+            snapshot.comfort_mode == COMFORT_MODE_POWER_DAY
+            and snapshot.heat_sink_available
+            and idle_hvac_mode == HVAC_HEAT
+        )
+        if (
+            idle_demand_forecast is not None
+            and idle_demand_forecast.operation_mode == idle_hvac_mode
+            and idle_demand_forecast.safe_to_turn_off
+            and not powerday_heat_soak_active
+        ):
+            return DispatchPlan(
+                turn_off=True,
+                open_zones=predicted_open_zones,
+                reason="forecast idle shutdown: " + idle_demand_forecast.reason,
+            )
         normalized_now = _normalize_timestamp(now)
         normalized_idle_started_at = _normalize_timestamp(idle_started_at)
         if (

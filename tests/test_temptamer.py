@@ -40,6 +40,7 @@ from pyscript.apps.temptamer.config import (
     POWERDAY_HEAT_SINK_MIN_SECONDS,
     POWEROFF_MIN_ACTIVATION_SECONDS,
     TEMPTAMER_LOGGING_CATEGORIES,
+    IDLE_DEMAND_FORECAST_WEATHER_ENTITY,
 )
 from pyscript.apps.temptamer.comfort_adjustments import (
     apply_adjustment_hysteresis,
@@ -79,6 +80,13 @@ from pyscript.apps.temptamer.heatpump_dispatcher import (
     resolve_heat_demand_fan_boost,
     resolve_hvac_start_fan_ramp_mode,
     resolve_idle_started_at,
+)
+from pyscript.apps.temptamer.idle_demand_forecast import (
+    IdleDemandForecast,
+    WeatherForecastPoint,
+    forecast_idle_demand,
+    forecast_temperature_at,
+    parse_hourly_weather_forecast,
 )
 from pyscript.apps.temptamer.logging_control import _TempTamerCategoryFilter
 from pyscript.apps.temptamer.models import ControlScheme, DispatchPlan, EquipmentDemand, SystemConfig
@@ -1381,7 +1389,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertIsInstance(day_snapshot.comfort_mode_behavior, PowerComfortMode)
         self.assertEqual(day_snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
-        self.assertEqual(day_snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
+        self.assertEqual(day_snapshot.zones["downstairs"].scheme.name, SCHEME_NIGHT)
         self.assertIsInstance(night_snapshot.comfort_mode_behavior, NightComfortMode)
         self.assertTrue(all(zone.scheme.name == SCHEME_NIGHT for zone in night_snapshot.zones.values()))
 
@@ -2117,6 +2125,53 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(snapshot.free_power_later_available)
         self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
         self.assertIn("before free power start", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
+
+    def test_powerday_uses_night_scheme_downstairs_before_free_power_in_heat_mode(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    }
+                )
+            ),
+            now=datetime(2026, 7, 25, 10, 59, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_NIGHT)
+
+    def test_powerday_uses_downstairs_scheme_at_free_power_start_in_heat_mode(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    }
+                )
+            ),
+            now=datetime(2026, 7, 25, 11, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
+
+    def test_powerday_keeps_downstairs_scheme_before_free_power_in_cool_mode(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    }
+                )
+            ),
+            now=datetime(2026, 7, 25, 10, 59, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
+        self.assertEqual(snapshot.zones["downstairs"].cool_scheme.name, SCHEME_DOWNSTAIRS)
 
     def test_powerday_pv_early_later_supplement_requires_average_above_threshold(self):
         now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
@@ -6794,6 +6849,294 @@ class TempTamerTests(unittest.TestCase):
             ),
             "low",
         )
+
+
+class IdleDemandForecastTests(unittest.TestCase):
+    def setUp(self):
+        self.original_runtime_state = deepcopy(temptamer_main.RUNTIME_STATE)
+        temptamer_main.RUNTIME_STATE.clear()
+
+    def tearDown(self):
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(self.original_runtime_state)
+
+    @staticmethod
+    def _snapshot(*, operation_mode, office_temperature, office_minimum=None):
+        overrides = {
+            "input_select.temptamer_comfort_mode": "Office",
+            "input_select.temptamer_hvac_mode": "Heat" if operation_mode == HVAC_HEAT else "Cool",
+            "input_select.temptamer_comfort_mode_dining": "Off",
+            "input_select.temptamer_comfort_mode_downstairs": "Off",
+            "input_select.temptamer_comfort_mode_bed12": "Off",
+            "input_select.temptamer_comfort_mode_bed34": "Off",
+            "sensor.office_average_temperature": str(office_temperature),
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+        }
+        if office_minimum is not None:
+            overrides["sensor.office_minimum_temperature"] = str(office_minimum)
+        return build_behavior_snapshot(FakeReader(base_state_map(**overrides), base_attr_map("22.0")))
+
+    def test_hourly_weather_forecast_parses_valid_entries_and_interpolates_from_current_temperature(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        response = {
+            IDLE_DEMAND_FORECAST_WEATHER_ENTITY: {
+                "forecast": [
+                    {"datetime": "2026-08-24T13:00:00Z", "temperature": 20.0, "condition": "sunny"},
+                    {"datetime": "invalid", "temperature": 30.0},
+                    {"datetime": "2026-08-24T14:00:00Z", "temperature": "unknown", "condition": "cloudy"},
+                ]
+            }
+        }
+
+        points = parse_hourly_weather_forecast(response, IDLE_DEMAND_FORECAST_WEATHER_ENTITY)
+
+        self.assertEqual(len(points), 2)
+        self.assertEqual(points[0].condition, "sunny")
+        self.assertIsNone(points[1].temperature)
+        self.assertEqual(
+            forecast_temperature_at(
+                points,
+                now=now,
+                at=now + timedelta(minutes=30),
+                current_outdoor_temperature=10.0,
+            ),
+            15.0,
+        )
+
+    def test_weather_forecast_refresh_uses_cache_for_fifteen_minutes_then_refreshes(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        response = {
+            IDLE_DEMAND_FORECAST_WEATHER_ENTITY: {
+                "forecast": [{"datetime": "2026-08-24T13:00:00Z", "temperature": 20.0, "condition": "sunny"}]
+            }
+        }
+        controller = Mock()
+        controller.call_service.return_value = response
+
+        first = temptamer_main._refresh_idle_demand_weather_forecast(controller, now)
+        cached = temptamer_main._refresh_idle_demand_weather_forecast(controller, now + timedelta(minutes=14, seconds=59))
+        refreshed = temptamer_main._refresh_idle_demand_weather_forecast(controller, now + timedelta(minutes=15))
+
+        self.assertEqual(first, cached)
+        self.assertEqual(first, refreshed)
+        self.assertEqual(controller.call_service.call_count, 2)
+        self.assertEqual(
+            controller.call_service.call_args_list[0],
+            call(
+                "weather",
+                "get_forecasts",
+                entity_id=IDLE_DEMAND_FORECAST_WEATHER_ENTITY,
+                type="hourly",
+                return_response=True,
+            ),
+        )
+
+    def test_heating_forecast_is_safe_when_demand_is_first_predicted_at_thirty_minutes(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.195)
+
+        result = forecast_idle_demand(snapshot, operation_mode=HVAC_HEAT, now=now)
+
+        self.assertTrue(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_zone_key, "office")
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=30))
+        self.assertEqual(result.source, "base_rate")
+
+    def test_heating_forecast_retains_idle_when_demand_is_predicted_in_twenty_nine_minutes(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.19)
+
+        result = forecast_idle_demand(snapshot, operation_mode=HVAC_HEAT, now=now)
+
+        self.assertFalse(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_zone_key, "office")
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=29))
+
+    def test_cooling_forecast_is_safe_when_demand_is_first_predicted_at_thirty_minutes(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_COOL, office_temperature=21.805)
+
+        result = forecast_idle_demand(snapshot, operation_mode=HVAC_COOL, now=now)
+
+        self.assertTrue(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_zone_key, "office")
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=30))
+
+    def test_cooling_forecast_retains_idle_when_demand_is_predicted_in_twenty_nine_minutes(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_COOL, office_temperature=21.81)
+
+        result = forecast_idle_demand(snapshot, operation_mode=HVAC_COOL, now=now)
+
+        self.assertFalse(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_zone_key, "office")
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=29))
+
+    def test_forecast_uses_secondary_minimum_temperature_trigger(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.5, office_minimum=19.0)
+
+        result = forecast_idle_demand(snapshot, operation_mode=HVAC_HEAT, now=now)
+
+        self.assertFalse(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_zone_key, "office")
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=1))
+
+    def test_forecast_adjusted_threshold_uses_hourly_condition_and_can_block_shutdown(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.4)
+        conditions: list[str | None] = []
+
+        def adjustment_provider(_at, _outdoor_temperature, condition):
+            conditions.append(condition)
+            return {"office": 0.5}
+
+        result = forecast_idle_demand(
+            snapshot,
+            operation_mode=HVAC_HEAT,
+            now=now,
+            weather_points=(WeatherForecastPoint(now + timedelta(hours=1), 10.0, "sunny"),),
+            current_outdoor_temperature=10.0,
+            adjustment_provider=adjustment_provider,
+        )
+
+        self.assertFalse(result.safe_to_turn_off)
+        self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=1))
+        self.assertEqual(conditions, ["sunny"])
+
+    def test_safe_forecast_turns_off_without_creating_idle_shutdown_memory(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=22.5)
+        forecast = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=now + timedelta(minutes=30),
+            earliest_zone_key="office",
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=True,
+            source="forecast",
+            reason="office heat demand predicted in 30 minutes",
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(reason="all zones satisfied"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            idle_demand_forecast=forecast,
+            now=now,
+        )
+
+        self.assertTrue(plan.turn_off)
+        self.assertFalse(plan.idle)
+        self.assertFalse(plan.idle_shutdown)
+        self.assertIn("forecast idle shutdown", plan.reason)
+        temptamer_main.RUNTIME_STATE["idle_heat_step"] = -4
+        temptamer_main.RUNTIME_STATE["idle_heat_zone_key"] = "office"
+        temptamer_main._update_idle_shutdown_runtime_state(plan, now, current_hvac_mode="heat")
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["idle_shutdown_at"])
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["idle_shutdown_heat_step"])
+        self.assertIsNone(temptamer_main.RUNTIME_STATE["idle_shutdown_zone_key"])
+
+    def test_unsafe_forecast_preserves_existing_idle_dispatch(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=22.5)
+        forecast = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=now + timedelta(minutes=29),
+            earliest_zone_key="office",
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=False,
+            source="forecast",
+            reason="office heat demand predicted in 29 minutes",
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(reason="all zones satisfied"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint=22.0,
+            idle_demand_forecast=forecast,
+            now=now,
+        )
+
+        self.assertFalse(plan.turn_off)
+        self.assertTrue(plan.idle)
+
+    def test_active_demand_overrides_a_safe_idle_forecast(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=18.0)
+        forecast = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=None,
+            earliest_zone_key=None,
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=True,
+            source="forecast",
+            reason="no heat demand predicted within 30 minutes",
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(heat_requested=True, requested_by_zones=("office",), reason="office is below enable threshold"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            idle_demand_forecast=forecast,
+            now=now,
+        )
+
+        self.assertFalse(plan.turn_off)
+        self.assertEqual(plan.hvac_mode, HVAC_HEAT)
+
+    def test_powerday_boosted_heat_soak_preserves_existing_idle_dispatch(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_dining": "Off",
+                        "input_select.temptamer_comfort_mode_downstairs": "Off",
+                        "input_select.temptamer_comfort_mode_bed12": "Off",
+                        "input_select.temptamer_comfort_mode_bed34": "Off",
+                        "sensor.office_average_temperature": "23.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("22.0"),
+            ),
+            heat_sink_available=True,
+        )
+        forecast = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=None,
+            earliest_zone_key=None,
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=True,
+            source="forecast",
+            reason="no heat demand predicted within 30 minutes",
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(reason="all zones satisfied"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint=22.0,
+            idle_demand_forecast=forecast,
+            now=now,
+        )
+
+        self.assertFalse(plan.turn_off)
+        self.assertTrue(plan.idle)
 
 
 if __name__ == "__main__":

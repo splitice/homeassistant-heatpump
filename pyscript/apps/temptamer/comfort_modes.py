@@ -7,10 +7,12 @@ from typing import ClassVar, Protocol
 
 from .constants import (
     COMFORT_MODE_POWER_DAY,
+    CONTROL_HVAC_MODE_HEAT,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
     SCHEME_DINING_BASIC,
     SCHEME_DOWNSTAIRS,
+    SCHEME_NIGHT,
     SCHEME_OFF,
 )
 
@@ -166,6 +168,7 @@ class PowerComfortMode(DefaultComfortMode):
     free_power_downstairs_gated_zone_keys: ClassVar[frozenset[str]] = frozenset({"office", "dining"})
 
     power_price_entity_id: str = ""
+    downstairs_heat_start_time: time = time(11, 0)
     free_power_state: str = "0"
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
     heat_soak_scheme: str = SCHEME_DAY_LIVING
@@ -177,6 +180,14 @@ class PowerComfortMode(DefaultComfortMode):
         snapshot_data: ComfortModeSnapshotData | None = None,
     ) -> str:
         scheme_name = self.zone_schemes.get(zone_key, SCHEME_OFF)
+        if (
+            zone_key == self.free_power_downstairs_zone_key
+            and snapshot_data is not None
+            and snapshot_data.selected_hvac_mode == CONTROL_HVAC_MODE_HEAT
+            and snapshot_data.now is not None
+            and snapshot_data.now.time() < self.downstairs_heat_start_time
+        ):
+            return SCHEME_NIGHT
         heat_sink_available = (
             snapshot_data.heat_sink_available if snapshot_data is not None else self._free_power_is_available(reader)
         )

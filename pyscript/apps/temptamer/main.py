@@ -15,6 +15,10 @@ from .config import (
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     GOODWE_PV_POWER_SENSOR,
     HEAT_DEMAND_FAN_BOOST_STATE_FILE,
+    IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
+    IDLE_DEMAND_FORECAST_REFRESH_SECONDS,
+    IDLE_DEMAND_FORECAST_STEP_SECONDS,
+    IDLE_DEMAND_FORECAST_WEATHER_ENTITY,
     MODE_TRIGGER_ENTITIES,
     POWERDAY_BATTERY_THRESHOLD,
     POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP,
@@ -68,6 +72,12 @@ from .heatpump_dispatcher import (
     resolve_idle_started_at,
 )
 from .logging_control import install_temptamer_log_filter
+from .idle_demand_forecast import (
+    IdleDemandForecast,
+    WeatherForecastPoint,
+    forecast_idle_demand,
+    parse_hourly_weather_forecast,
+)
 from .state_reader import build_snapshot, is_switch_on, parse_float
 from .zone_control import describe_zone_predictions, resolve_zone_actions
 
@@ -245,6 +255,10 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_adjustment_last_valid": {},
     "comfort_adjustment_last_valid_mode": None,
     "comfort_adjustment_calibration_parameters": None,
+    "idle_demand_forecast_weather_points": (),
+    "idle_demand_forecast_weather_fetched_at": None,
+    "idle_demand_forecast_weather_error": None,
+    "idle_demand_forecast": None,
 }
 
 
@@ -291,8 +305,193 @@ class PyscriptController:
             return None
         return attrs.get(attr_name)
 
-    def call_service(self, domain: str, service_name: str, **kwargs: object) -> None:
-        service.call(domain, service_name, blocking=True, **kwargs)  # type: ignore[name-defined]
+    def call_service(self, domain: str, service_name: str, **kwargs: object) -> object | None:
+        return service.call(domain, service_name, blocking=True, **kwargs)  # type: ignore[name-defined]
+
+
+class _ForecastStateReader:
+    """Overlay a future weather condition on top of the live Home Assistant reader."""
+
+    def __init__(self, controller: PyscriptController, *, outdoor_temperature: float, condition: str | None):
+        self._controller = controller
+        self._outdoor_temperature = outdoor_temperature
+        self._condition = condition
+
+    def get_state(self, entity_id: str) -> object | None:
+        config = DEFAULT_COMFORT_ADJUSTMENT_CONFIG
+        if entity_id == config.outdoor_temperature_entity_id:
+            return self._outdoor_temperature
+        if entity_id == config.weather_entity_id and self._condition is not None:
+            return self._condition
+        if entity_id == config.solar_radiation_entity_id:
+            # Hourly forecasts provide a condition rather than future irradiance.
+            # This deliberately selects the comfort model's weather/sun fallback.
+            return None
+        return self._controller.get_state(entity_id)
+
+    def get_attr(self, entity_id: str, attr_name: str) -> object | None:
+        return self._controller.get_attr(entity_id, attr_name)
+
+
+class _ForecastComfortAdjustmentProvider:
+    """Re-use the comfort model without modifying its published state or filters."""
+
+    def __init__(
+        self,
+        controller: PyscriptController,
+        snapshot,
+        cover_facades: dict[str, str | None],
+        cover_position_overrides: dict[str, tuple[float, str]],
+    ):
+        self._controller = controller
+        self._snapshot = snapshot
+        self._cover_facades = cover_facades
+        self._cover_position_overrides = cover_position_overrides
+
+    def __call__(self, at: datetime, outdoor_temperature: float | None, condition: str | None) -> dict[str, float] | None:
+        if outdoor_temperature is None:
+            return None
+        reader = _ForecastStateReader(
+            self._controller,
+            outdoor_temperature=outdoor_temperature,
+            condition=condition,
+        )
+        effective_temperatures: dict[str, float] = {}
+        for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+            effective_temperatures[zone.key] = outdoor_temperature
+        result = calculate_comfort_adjustments(
+            reader,
+            config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+            cover_facades=self._cover_facades,
+            effective_outdoor_temperatures=effective_temperatures,
+            effective_window_outdoor_temperatures=effective_temperatures,
+            effective_wall_outdoor_temperatures=effective_temperatures,
+            filter_warming_up={},
+            cover_position_overrides=self._cover_position_overrides,
+            reference_zone_targets=self._snapshot.base_zone_targets,
+            last_valid_operating_mode=RUNTIME_STATE.get("comfort_adjustment_last_valid_mode"),
+            now=at,
+        )
+        adjustments: dict[str, float] = {}
+        for zone_key, adjustment in result.adjustments.items():
+            if result.calculation_validity.get(zone_key, False):
+                adjustments[zone_key] = adjustment
+        return adjustments
+
+
+def _cached_idle_demand_weather_points() -> tuple[WeatherForecastPoint, ...]:
+    raw_points = RUNTIME_STATE.get("idle_demand_forecast_weather_points")
+    if not isinstance(raw_points, (list, tuple)):
+        return ()
+    points: list[WeatherForecastPoint] = []
+    for point in raw_points:
+        if isinstance(point, WeatherForecastPoint):
+            points.append(point)
+    return tuple(points)
+
+
+def _refresh_idle_demand_weather_forecast(
+    controller: PyscriptController,
+    now: datetime,
+) -> tuple[WeatherForecastPoint, ...]:
+    fetched_at = _normalize_runtime_datetime(RUNTIME_STATE.get("idle_demand_forecast_weather_fetched_at"))
+    if fetched_at is not None:
+        age_seconds = (now - fetched_at).total_seconds()
+        if 0.0 <= age_seconds < IDLE_DEMAND_FORECAST_REFRESH_SECONDS:
+            return _cached_idle_demand_weather_points()
+
+    RUNTIME_STATE["idle_demand_forecast_weather_fetched_at"] = now
+    try:
+        response = controller.call_service(
+            "weather",
+            "get_forecasts",
+            entity_id=IDLE_DEMAND_FORECAST_WEATHER_ENTITY,
+            type="hourly",
+            return_response=True,
+        )
+        points = parse_hourly_weather_forecast(response, IDLE_DEMAND_FORECAST_WEATHER_ENTITY)
+    except Exception as exc:  # pragma: no cover - Home Assistant service failures are runtime-dependent
+        RUNTIME_STATE["idle_demand_forecast_weather_points"] = ()
+        RUNTIME_STATE["idle_demand_forecast_weather_error"] = str(exc)
+        LOGGER.warning("DISPATCH: idle demand forecast weather refresh failed: %s", exc)
+        return ()
+
+    RUNTIME_STATE["idle_demand_forecast_weather_points"] = points
+    if points:
+        RUNTIME_STATE["idle_demand_forecast_weather_error"] = None
+    else:
+        RUNTIME_STATE["idle_demand_forecast_weather_error"] = "hourly forecast response contained no valid points"
+        LOGGER.warning("DISPATCH: idle demand forecast weather refresh returned no valid hourly points")
+    return points
+
+
+def _has_active_equipment_demand(demand) -> bool:
+    return bool(
+        demand.heat_requested
+        or demand.cool_requested
+        or demand.fan_only_requested
+        or demand.maintain_heat_mode
+        or demand.maintain_cool_mode
+    )
+
+
+def _resolve_idle_demand_forecast(
+    controller: PyscriptController,
+    snapshot,
+    demand,
+    *,
+    current_hvac_mode: str | None,
+    operation_mode: str | None,
+    now: datetime,
+) -> IdleDemandForecast | None:
+    current_mode = (current_hvac_mode or "").lower()
+    if current_mode not in {HVAC_HEAT, HVAC_COOL} or operation_mode not in {HVAC_HEAT, HVAC_COOL}:
+        return None
+    if _has_active_equipment_demand(demand):
+        return None
+    if snapshot.comfort_mode == COMFORT_MODE_POWER_DAY and snapshot.heat_sink_available and operation_mode == HVAC_HEAT:
+        return IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
+            earliest_demand_at=None,
+            earliest_zone_key=None,
+            operation_mode=operation_mode,
+            safe_to_turn_off=False,
+            source="powerday_heat_soak",
+            reason="PowerDay boosted heat soak retains the existing idle behavior",
+        )
+
+    weather_points = _refresh_idle_demand_weather_forecast(controller, now)
+    outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG, now=now)
+    current_condition = controller.get_state(IDLE_DEMAND_FORECAST_WEATHER_ENTITY)
+    condition = str(current_condition) if current_condition is not None else None
+    has_forecast_temperature = False
+    has_forecast_condition = condition is not None
+    for point in weather_points:
+        if point.temperature is not None:
+            has_forecast_temperature = True
+        if point.condition is not None:
+            has_forecast_condition = True
+    forecast_anchor_temperature = outdoor_temperature if has_forecast_temperature else None
+    adjustment_provider = None
+    if has_forecast_temperature and has_forecast_condition:
+        adjustment_provider = _ForecastComfortAdjustmentProvider(
+            controller,
+            snapshot,
+            _resolve_cover_facades(),
+            _resolve_cover_position_overrides(controller, now),
+        )
+    return forecast_idle_demand(
+        snapshot,
+        operation_mode=operation_mode,
+        now=now,
+        weather_points=weather_points,
+        current_outdoor_temperature=forecast_anchor_temperature,
+        current_condition=condition,
+        horizon_seconds=IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
+        step_seconds=IDLE_DEMAND_FORECAST_STEP_SECONDS,
+        adjustment_provider=adjustment_provider,
+    )
 
 
 def _comfort_adjustment_warn_once(warning_key: str, message: str) -> None:
@@ -928,6 +1127,11 @@ def _isoformat(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
+def _current_idle_demand_forecast() -> IdleDemandForecast | None:
+    forecast = RUNTIME_STATE.get("idle_demand_forecast")
+    return forecast if isinstance(forecast, IdleDemandForecast) else None
+
+
 def _control_is_enabled() -> bool:
     enabled_state = state.get(ENABLED_ENTITY_ID)  # type: ignore[name-defined]
     if enabled_state is None:
@@ -944,6 +1148,7 @@ def _set_control_enabled(enabled: bool, *, reason: str) -> None:
 
 
 def _publish_runtime_state(status: str) -> None:
+    idle_demand_forecast = _current_idle_demand_forecast()
     state.set(  # type: ignore[name-defined]
         STATUS_ENTITY_ID,
         status,
@@ -962,6 +1167,31 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
+            "idle_demand_forecast_generated_at": _isoformat(
+                idle_demand_forecast.generated_at if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_horizon_seconds": (
+                idle_demand_forecast.horizon_seconds if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_earliest_demand_at": _isoformat(
+                idle_demand_forecast.earliest_demand_at if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_earliest_zone": (
+                idle_demand_forecast.earliest_zone_key if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_safe_to_turn_off": (
+                idle_demand_forecast.safe_to_turn_off if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_source": (
+                idle_demand_forecast.source if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_reason": (
+                idle_demand_forecast.reason if idle_demand_forecast is not None else None
+            ),
+            "idle_demand_forecast_weather_fetched_at": _isoformat(
+                _normalize_runtime_datetime(RUNTIME_STATE.get("idle_demand_forecast_weather_fetched_at"))
+            ),
+            "idle_demand_forecast_weather_error": RUNTIME_STATE.get("idle_demand_forecast_weather_error"),
             "last_fan_speed_decrease_at": _isoformat(RUNTIME_STATE.get("last_fan_speed_decrease_at")),
             "hvac_off_started_at": _isoformat(RUNTIME_STATE.get("hvac_off_started_at")),
             "hvac_start_fan_ramp_started_at": _isoformat(RUNTIME_STATE.get("hvac_start_fan_ramp_started_at")),
@@ -1883,6 +2113,11 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("poweroff_activation_hold_until", None)
     RUNTIME_STATE.setdefault("poweroff_active", False)
     RUNTIME_STATE.setdefault("poweroff_reason", None)
+    RUNTIME_STATE.setdefault("idle_demand_forecast_weather_points", ())
+    RUNTIME_STATE.setdefault("idle_demand_forecast_weather_fetched_at", None)
+    RUNTIME_STATE.setdefault("idle_demand_forecast_weather_error", None)
+    RUNTIME_STATE.setdefault("idle_demand_forecast", None)
+    RUNTIME_STATE["idle_demand_forecast"] = None
     RUNTIME_STATE["last_trigger"] = reason
     _restore_heat_demand_fan_boost_state(now)
     _reconcile_pending_zone_state(controller, now)
@@ -2034,6 +2269,18 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_free_power_fan_boost,
         POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0,
     )
+    idle_demand_forecast = None
+    if not comfort_mode_changed:
+        idle_demand_forecast = _resolve_idle_demand_forecast(
+            controller,
+            snapshot,
+            demand,
+            current_hvac_mode=current_hvac_mode_str,
+            operation_mode=operating_mode,
+            now=now,
+        )
+    RUNTIME_STATE["idle_demand_forecast"] = idle_demand_forecast
+    dispatch_plan_kwargs["idle_demand_forecast"] = idle_demand_forecast
     plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
 
     RUNTIME_STATE["heat_demand_fan_boost_level"] = heat_demand_fan_boost_level
@@ -2117,7 +2364,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _update_idle_heat_runtime_state(plan, now)
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -2125,6 +2372,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
         plan.idle,
+        idle_demand_forecast.reason if idle_demand_forecast is not None else "not evaluated",
         plan.fan_mode,
         heat_demand_fan_boost_level,
         plan.setpoint,
