@@ -53,6 +53,7 @@ from .heatpump_dispatcher import (
     apply_dispatch_plan,
     apply_zone_actions,
     build_dispatch_plan,
+    fan_speed_level,
     is_fan_speed_decrease,
     resolve_heat_demand_fan_boost,
     resolve_idle_started_at,
@@ -1337,20 +1338,6 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
         upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
     )
-    zone_diagnostics = describe_zone_predictions(
-        snapshot,
-        now,
-        predicted_open_zones,
-        operation_mode=operating_mode,
-        comfort_mode_changed=comfort_mode_changed,
-        startup_reconcile=startup_reconcile,
-    )
-    if startup_reconcile:
-        LOGGER.info(
-            "ZONES: startup_reconcile reported_open=%s desired_open=%s",
-            _describe_open_zones(_reported_open_zones(snapshot)),
-            _describe_open_zones(predicted_open_zones),
-        )
     demand = resolve_equipment_demand(
         snapshot,
         predicted_open_zones,
@@ -1359,9 +1346,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
     max_power_demand_5m_kw = parse_float(controller.get_state(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR))
     (
-        heat_demand_fan_boost_level,
-        last_heat_demand_fan_boost_at,
-        heat_demand_fan_boost_reason,
+        preliminary_heat_demand_fan_boost_level,
+        _,
+        _,
     ) = resolve_heat_demand_fan_boost(
         snapshot,
         demand,
@@ -1371,32 +1358,12 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         last_boost_at=RUNTIME_STATE["last_heat_demand_fan_boost_at"],
         now=now,
     )
-    RUNTIME_STATE["heat_demand_fan_boost_level"] = heat_demand_fan_boost_level
-    RUNTIME_STATE["last_heat_demand_fan_boost_at"] = last_heat_demand_fan_boost_at
-    RUNTIME_STATE["max_power_demand_5m_kw"] = max_power_demand_5m_kw
-    RUNTIME_STATE["heat_demand_fan_boost_reason"] = heat_demand_fan_boost_reason
-    _persist_heat_demand_fan_boost_state(heat_demand_fan_boost_level)
-    downstairs_free_power_fan_boost = _powerday_downstairs_free_power_fan_boost(
+    preliminary_downstairs_free_power_fan_boost = _powerday_downstairs_free_power_fan_boost(
         snapshot,
         demand,
         predicted_open_zones,
         operating_mode,
     )
-
-    if zone_actions:
-        apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
-        for action in zone_actions:
-            RUNTIME_STATE["last_zone_change"][action.zone_key] = now
-            RUNTIME_STATE["pending_zone_state"][action.zone_key] = action.turn_on
-            LOGGER.info(
-                "ZONES: %s %s because %s",
-                "Opening" if action.turn_on else "Closing",
-                DEFAULT_SYSTEM_CONFIG.zones[action.zone_key].label,
-                action.reason,
-            )
-
-    if not predicted_open_zones:
-        LOGGER.warning("ZONES: predicted_open=none details=%s", " | ".join(zone_diagnostics))
 
     dispatch_plan_kwargs = {
         "current_hvac_mode": current_hvac_mode_str,
@@ -1414,14 +1381,93 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         "idle_shutdown_zone_key": RUNTIME_STATE["idle_shutdown_zone_key"],
         "supported_fan_modes": supported_fan_modes,
         "fan_speed_decrease_at": RUNTIME_STATE["last_fan_speed_decrease_at"],
-        "base_fan_boost": heat_demand_fan_boost_level,
+        "base_fan_boost": preliminary_heat_demand_fan_boost_level,
         "additional_fan_levels": max(
-            downstairs_free_power_fan_boost,
+            preliminary_downstairs_free_power_fan_boost,
             POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0,
         ),
         "now": now,
     }
+    provisional_plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
+    zone_actions, predicted_open_zones = resolve_zone_actions(
+        snapshot,
+        now,
+        operation_mode=operating_mode,
+        comfort_mode_changed=comfort_mode_changed,
+        startup_reconcile=startup_reconcile,
+        downstairs_priority_active=powerday_downstairs_priority_active,
+        downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
+        upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        requested_fan_speed_level=fan_speed_level(provisional_plan.fan_mode),
+    )
+    demand = resolve_equipment_demand(
+        snapshot,
+        predicted_open_zones,
+        operation_mode=operating_mode,
+        allowed_zone_keys=(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,) if powerday_downstairs_priority_active else None,
+    )
+    (
+        heat_demand_fan_boost_level,
+        last_heat_demand_fan_boost_at,
+        heat_demand_fan_boost_reason,
+    ) = resolve_heat_demand_fan_boost(
+        snapshot,
+        demand,
+        predicted_open_zones,
+        max_power_demand_5m_kw,
+        previous_boost_level=RUNTIME_STATE["heat_demand_fan_boost_level"],
+        last_boost_at=RUNTIME_STATE["last_heat_demand_fan_boost_at"],
+        now=now,
+    )
+    downstairs_free_power_fan_boost = _powerday_downstairs_free_power_fan_boost(
+        snapshot,
+        demand,
+        predicted_open_zones,
+        operating_mode,
+    )
+    dispatch_plan_kwargs["base_fan_boost"] = heat_demand_fan_boost_level
+    dispatch_plan_kwargs["additional_fan_levels"] = max(
+        downstairs_free_power_fan_boost,
+        POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0,
+    )
     plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
+
+    RUNTIME_STATE["heat_demand_fan_boost_level"] = heat_demand_fan_boost_level
+    RUNTIME_STATE["last_heat_demand_fan_boost_at"] = last_heat_demand_fan_boost_at
+    RUNTIME_STATE["max_power_demand_5m_kw"] = max_power_demand_5m_kw
+    RUNTIME_STATE["heat_demand_fan_boost_reason"] = heat_demand_fan_boost_reason
+    _persist_heat_demand_fan_boost_state(heat_demand_fan_boost_level)
+
+    zone_diagnostics = describe_zone_predictions(
+        snapshot,
+        now,
+        predicted_open_zones,
+        operation_mode=operating_mode,
+        comfort_mode_changed=comfort_mode_changed,
+        startup_reconcile=startup_reconcile,
+    )
+    if startup_reconcile:
+        LOGGER.info(
+            "ZONES: startup_reconcile reported_open=%s desired_open=%s",
+            _describe_open_zones(_reported_open_zones(snapshot)),
+            _describe_open_zones(predicted_open_zones),
+        )
+
+    if zone_actions:
+        apply_zone_actions(controller, zone_actions, config=DEFAULT_SYSTEM_CONFIG)
+        for action in zone_actions:
+            RUNTIME_STATE["last_zone_change"][action.zone_key] = now
+            RUNTIME_STATE["pending_zone_state"][action.zone_key] = action.turn_on
+            LOGGER.info(
+                "ZONES: %s %s because %s",
+                "Opening" if action.turn_on else "Closing",
+                DEFAULT_SYSTEM_CONFIG.zones[action.zone_key].label,
+                action.reason,
+            )
+
+    if not predicted_open_zones:
+        LOGGER.warning("ZONES: predicted_open=none details=%s", " | ".join(zone_diagnostics))
+
     hvac_start_fan_ramp_started_at = _resolve_hvac_start_fan_ramp_started_at(
         plan,
         current_hvac_mode_str,

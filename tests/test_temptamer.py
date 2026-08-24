@@ -1856,6 +1856,124 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(second_actions[0].zone_key, "office")
         self.assertTrue(second_actions[0].safety_required)
 
+    def test_high_fan_closes_office_one_degree_beyond_enable_when_another_zone_is_open(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        shared_overrides = {
+            "input_select.temptamer_comfort_mode": "Office",
+            "input_select.temptamer_comfort_mode_downstairs": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed12": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed34": SCHEME_OFF,
+            "sensor.average_dining_zone_temp": "13.0",
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+            "switch.wt32_hpctrl_e8dbd0_dining": "on",
+        }
+        heating_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "sensor.office_average_temperature": "21.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+
+        heating_actions, heating_predicted_open = resolve_zone_actions(
+            heating_snapshot,
+            now,
+            operation_mode=HVAC_HEAT,
+            requested_fan_speed_level=6,
+        )
+
+        self.assertEqual([(action.zone_key, action.turn_on) for action in heating_actions], [("office", False)])
+        self.assertEqual(heating_predicted_open, ("dining",))
+        self.assertFalse(heating_actions[0].discretionary)
+        self.assertIn("another zone remains open for safety", heating_actions[0].reason)
+
+        threshold_actions, threshold_predicted_open = resolve_zone_actions(
+            heating_snapshot,
+            now,
+            operation_mode=HVAC_HEAT,
+            requested_fan_speed_level=5,
+        )
+
+        self.assertEqual(threshold_actions, [])
+        self.assertEqual(threshold_predicted_open, ("dining", "office"))
+
+        cooling_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "sensor.office_average_temperature": "21.0",
+                        "sensor.average_dining_zone_temp": "16.5",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+
+        cooling_actions, cooling_predicted_open = resolve_zone_actions(
+            cooling_snapshot,
+            now,
+            operation_mode=HVAC_COOL,
+            requested_fan_speed_level=6,
+        )
+
+        self.assertEqual([(action.zone_key, action.turn_on) for action in cooling_actions], [("office", False)])
+        self.assertEqual(cooling_predicted_open, ("dining",))
+
+    def test_high_fan_office_closure_requires_full_temperature_margin_and_another_open_zone(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        shared_overrides = {
+            "input_select.temptamer_comfort_mode": "Office",
+            "input_select.temptamer_comfort_mode_downstairs": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed12": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed34": SCHEME_OFF,
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+        }
+        below_margin_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "sensor.office_average_temperature": "20.9",
+                        "sensor.average_dining_zone_temp": "16.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+        only_open_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "sensor.office_average_temperature": "21.0",
+                        "sensor.average_dining_zone_temp": "16.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+
+        for snapshot in (below_margin_snapshot, only_open_snapshot):
+            actions, predicted_open = resolve_zone_actions(
+                snapshot,
+                now,
+                operation_mode=HVAC_HEAT,
+                requested_fan_speed_level=6,
+            )
+
+            self.assertEqual(actions, [])
+            self.assertEqual(predicted_open, ("office",))
+
     def test_zone_prediction_diagnostics_explain_anti_flap_decisions(self):
         now = datetime(2026, 5, 7, 12, 1, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
@@ -4226,6 +4344,67 @@ class TempTamerTests(unittest.TestCase):
                     temperature=24,
                 ),
             ],
+        )
+
+    def test_run_control_pass_closes_office_when_high_fan_is_requested(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Day",
+                    "input_select.temptamer_hvac_mode": "Heat",
+                    "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    "sensor.office_average_temperature": "21.0",
+                    "sensor.average_dining_zone_temp": "15.0",
+                    "sensor.downstairs_zone_average_temperature": "15.0",
+                    "sensor.average_bed1_2_zone_temp": "12.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    "switch.wt32_hpctrl_e8dbd0_dining": "on",
+                    "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "on",
+                    "switch.wt32_hpctrl_e8dbd0_bed_12": "on",
+                    TEST_CLIMATE_ENTITY: "heat",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 1",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "temperature": 20,
+            "current_temperature": 20,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+        temptamer_main._system_now = lambda: now
+
+        try:
+            temptamer_main.run_control_pass(reason="high fan office closure test")
+        finally:
+            temptamer_main._system_now = real_system_now
+
+        self.assertIn(
+            call(
+                "switch",
+                "turn_off",
+                blocking=True,
+                entity_id="switch.wt32_hpctrl_e8dbd0_office",
+            ),
+            service_call.call_args_list,
+        )
+        self.assertIn(
+            call(
+                "climate",
+                "set_fan_mode",
+                blocking=True,
+                entity_id=TEST_CLIMATE_ENTITY,
+                fan_mode="Level 6",
+            ),
+            service_call.call_args_list,
         )
 
     def test_run_control_pass_records_each_fan_speed_reduction(self):
