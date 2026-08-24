@@ -336,21 +336,26 @@ def build_snapshot(
             zones[zone_key] = comfort_mode_behavior.adjust_zone(zone_state, adjustment_snapshot_data)
 
     # Capture the dynamic schemes after comfort-/power-mode supplements but
-    # before applying the published comfort value.  These base targets are
-    # consumed by the independent publisher so an adjustment never becomes its
-    # own future reference.
+    # before applying the published comfort value or global manual offset.
+    # These base targets are consumed by the independent publisher so an
+    # adjustment never becomes its own future reference.
     base_zone_targets: dict[str, tuple[float, float]] = {}
+    global_setpoint_adjustment = _resolve_comfort_adjustment(
+        reader,
+        config.global_setpoint_adjustment_entity,
+    )
     for zone_key, zone_state in zones.items():
         base_zone_targets[zone_key] = (zone_state.scheme.ideal_target, zone_state.cool_scheme.ideal_target)
-        adjustment = _resolve_comfort_adjustment(
+        comfort_adjustment = _resolve_comfort_adjustment(
             reader,
             config.zone_comfort_adjustment_entities.get(zone_key),
         )
+        adjustment = global_setpoint_adjustment + comfort_adjustment
         zones[zone_key] = replace(
             zone_state,
             scheme=_shift_control_scheme(zone_state.scheme, adjustment),
             cool_scheme=_shift_control_scheme(zone_state.cool_scheme, adjustment),
-            comfort_adjustment=adjustment,
+            comfort_adjustment=comfort_adjustment,
         )
 
     enabled_zones: dict[str, ZoneRuntimeState] = {}
@@ -425,4 +430,5 @@ def build_snapshot(
         above_ideal_zones=above_ideal,
         at_or_below_ideal_zones=at_or_below_ideal,
         base_zone_targets=base_zone_targets,
+        global_setpoint_adjustment=global_setpoint_adjustment,
     )

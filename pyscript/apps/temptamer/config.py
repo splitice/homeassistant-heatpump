@@ -22,6 +22,9 @@ from .comfort_adjustments import (
     ComfortAdjustmentConfig,
     ComfortAdjustmentRoomConfig,
     ComfortAdjustmentZoneConfig,
+    ConstructionProfile,
+    RoomEnvelopeConfig,
+    WindowConfig,
 )
 from .models import ControlScheme, SystemConfig, ZoneConfig
 
@@ -259,6 +262,8 @@ DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES = {
     "dining": "input_number.comfort_adjustment_dining",
 }
 
+GLOBAL_SETPOINT_ADJUSTMENT_ENTITY = "input_number.temptamer_setpoint_adjustment"
+
 DEFAULT_SYSTEM_CONFIG = SystemConfig(
     house_temperature_sensor="sensor.home_temperature",
     comfort_mode_entity="input_select.temptamer_comfort_mode",
@@ -270,7 +275,21 @@ DEFAULT_SYSTEM_CONFIG = SystemConfig(
     heat_control_schemes=DEFAULT_HEAT_CONTROL_SCHEMES,
     cool_control_schemes=DEFAULT_COOL_CONTROL_SCHEMES,
     zone_comfort_adjustment_entities=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES,
+    global_setpoint_adjustment_entity=GLOBAL_SETPOINT_ADJUSTMENT_ENTITY,
 )
+
+DEFAULT_CONSTRUCTION_PROFILES = {
+    "upstairs_brick_veneer": ConstructionProfile(
+        key="upstairs_brick_veneer",
+        wall_u_value=1.50,
+        wall_filter_time_constant_seconds=3 * 60 * 60,
+    ),
+    "downstairs_double_brick": ConstructionProfile(
+        key="downstairs_double_brick",
+        wall_u_value=1.45,
+        wall_filter_time_constant_seconds=8 * 60 * 60,
+    ),
+}
 
 DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
     zones=(
@@ -282,15 +301,28 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.rumpus_average_temperature",
                     fallback_temperature_entity_id="sensor.develco_products_a_s_moszb_140_temperature_2",
-                    solar_access_when_exposed=0.05,
-                    solar_access_when_unexposed=0.05,
+                    envelope=RoomEnvelopeConfig(
+                        windows=(
+                            WindowConfig(
+                                facade="w",
+                                direct_shade_factor=0.0,
+                                diffuse_shade_factor=0.10,
+                            ),
+                        ),
+                        opaque_wall_view_factor=0.20,
+                        construction_profile="downstairs_double_brick",
+                        comfort_weight=0.5,
+                    ),
                 ),
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.kitchen_average_temperature",
                     fallback_temperature_entity_id="sensor.kitchen_motion_temperature",
-                    facade="e",
-                    solar_access_when_exposed=1.0,
-                    solar_access_when_unexposed=0.25,
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="e"),),
+                        opaque_wall_view_factor=0.20,
+                        construction_profile="downstairs_double_brick",
+                        comfort_weight=0.5,
+                    ),
                 ),
             ),
             upstairs=False,
@@ -302,11 +334,21 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_1_average_temperature",
-                    cover_entity_id="cover.bed1shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="e", cover_entity_id="cover.bed1shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.5,
+                    ),
                 ),
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_2_average_temperature",
-                    cover_entity_id="cover.bed_2_shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="e", cover_entity_id="cover.bed_2_shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.5,
+                    ),
                 ),
             ),
             upstairs=True,
@@ -318,17 +360,39 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_3_average_temperature",
-                    cover_entity_id="cover.bed_3_shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="e", cover_entity_id="cover.bed_3_shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.4,
+                    ),
                 ),
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_4_average_temperature",
-                    cover_entity_id="cover.bed_4_shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="e", cover_entity_id="cover.bed_4_shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.4,
+                    ),
                 ),
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bathroom_average_temperature",
                     fallback_temperature_entity_id="sensor.bathroom_motion_temperature",
-                    solar_access_when_exposed=0.60,
-                    solar_access_when_unexposed=0.60,
+                    # Bathroom façade is unknown; retain diffuse-only gain
+                    # until its actual façade can be configured.
+                    envelope=RoomEnvelopeConfig(
+                        windows=(
+                            WindowConfig(
+                                facade=None,
+                                direct_shade_factor=0.0,
+                                diffuse_shade_factor=0.60,
+                            ),
+                        ),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.2,
+                    ),
                 ),
             ),
             upstairs=True,
@@ -340,7 +404,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.office_average_temperature",
-                    cover_entity_id="cover.officeshutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="s", cover_entity_id="cover.officeshutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=1.0,
+                    ),
                 ),
             ),
             upstairs=True,
@@ -352,11 +421,21 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.dining_average_temperature",
-                    cover_entity_id="cover.kitchen_shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="w", cover_entity_id="cover.kitchen_shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.5,
+                    ),
                 ),
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.lego_room_average_temperature",
-                    cover_entity_id="cover.lego_shutters",
+                    envelope=RoomEnvelopeConfig(
+                        windows=(WindowConfig(facade="w", cover_entity_id="cover.lego_shutters"),),
+                        opaque_wall_view_factor=0.15,
+                        construction_profile="upstairs_brick_veneer",
+                        comfort_weight=0.5,
+                    ),
                 ),
             ),
             upstairs=True,
@@ -372,9 +451,8 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
     awning_min_sun_elevation_entity_id="input_number.awning_min_sun_elevation",
     awning_exposure_half_band_entity_id="input_number.awning_exposure_half_band",
     facade_labels={"awning_n": "n", "awning_e": "e", "awning_s": "s", "awning_w": "w"},
-    outdoor_filter_time_constant_seconds=10 * 60,
-    downstairs_outdoor_filter_time_constant_seconds=30 * 60,
     output_hysteresis=0.025,
+    construction_profiles=DEFAULT_CONSTRUCTION_PROFILES,
 )
 
 _comfort_adjustment_trigger_entities: list[str] = []
@@ -401,8 +479,10 @@ for comfort_adjustment_zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
     for comfort_adjustment_room in comfort_adjustment_zone.rooms:
         _add_comfort_adjustment_trigger_entity(comfort_adjustment_room.primary_temperature_entity_id)
         _add_comfort_adjustment_trigger_entity(comfort_adjustment_room.fallback_temperature_entity_id)
-        if comfort_adjustment_room.cover_entity_id:
-            _add_comfort_adjustment_trigger_entity(f"{comfort_adjustment_room.cover_entity_id}.current_position")
+        if comfort_adjustment_room.envelope is not None:
+            for comfort_adjustment_window in comfort_adjustment_room.envelope.windows:
+                if comfort_adjustment_window.cover_entity_id:
+                    _add_comfort_adjustment_trigger_entity(f"{comfort_adjustment_window.cover_entity_id}.current_position")
 
 COMFORT_ADJUSTMENT_TRIGGER_ENTITIES = tuple(_comfort_adjustment_trigger_entities)
 
@@ -440,6 +520,7 @@ for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values():
     _add_mode_trigger_entity(entity_id)
 for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_adjustment_entities.values():
     _add_mode_trigger_entity(entity_id)
+_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.global_setpoint_adjustment_entity)
 for comfort_mode in DEFAULT_SYSTEM_CONFIG.comfort_modes.values():
     for entity_id in comfort_mode.trigger_entity_ids:
         _add_mode_trigger_entity(entity_id)

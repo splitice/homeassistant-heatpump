@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import ceil, exp, floor, isfinite, radians, sin
+from math import ceil, cos, exp, floor, isfinite, radians, sin
 from typing import Mapping, Protocol
 
 
@@ -16,13 +16,38 @@ class StateReaderLike(Protocol):
 
 
 @dataclass(frozen=True)
+class ConstructionProfile:
+    key: str
+    wall_u_value: float
+    wall_filter_time_constant_seconds: int
+
+
+@dataclass(frozen=True)
+class WindowConfig:
+    facade: str | None
+    view_factor: float = 0.20
+    u_value: float = 6.9
+    shgc: float = 0.77
+    cover_entity_id: str | None = None
+    direct_shade_factor: float = 1.0
+    diffuse_shade_factor: float = 1.0
+
+
+@dataclass(frozen=True)
+class RoomEnvelopeConfig:
+    windows: tuple[WindowConfig, ...]
+    opaque_wall_view_factor: float
+    construction_profile: str
+    comfort_weight: float = 1.0
+
+
+@dataclass(frozen=True)
 class ComfortAdjustmentRoomConfig:
     primary_temperature_entity_id: str
     fallback_temperature_entity_id: str | None = None
-    cover_entity_id: str | None = None
-    facade: str | None = None
-    solar_access_when_exposed: float | None = None
-    solar_access_when_unexposed: float | None = None
+    # PyScript evaluates dataclass field annotations at runtime and cannot
+    # evaluate a local class in a ``Type | None`` expression.
+    envelope: object = None
 
 
 @dataclass(frozen=True)
@@ -31,7 +56,7 @@ class ComfortAdjustmentZoneConfig:
     output_entity_id: str
     fallback_temperature_entity_id: str | None
     rooms: tuple[ComfortAdjustmentRoomConfig, ...]
-    upstairs: bool
+    upstairs: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,19 +72,39 @@ class ComfortAdjustmentConfig:
     awning_min_sun_elevation_entity_id: str
     awning_exposure_half_band_entity_id: str
     facade_labels: Mapping[str, str]
-    outdoor_filter_time_constant_seconds: int
-    downstairs_outdoor_filter_time_constant_seconds: int
     output_hysteresis: float
-    # Phase 1 guardrails and diagnostics.  The window U-value is diagnostic
-    # only until the Phase 2 envelope calculation replaces the legacy model.
+    construction_profiles: Mapping[str, ConstructionProfile]
+    # Input validation and short-term availability guardrails.
     last_valid_hold_seconds: int = 5 * 60
     indoor_temperature_min_celsius: float = -10.0
     indoor_temperature_max_celsius: float = 50.0
     outdoor_temperature_min_celsius: float = -30.0
     outdoor_temperature_max_celsius: float = 60.0
     input_stale_after_seconds: int = 30 * 60
-    diagnostic_window_u_value: float = 6.9
-    diagnostic_shutter_closed_u_multiplier: float = 0.75
+    last_valid_operating_mode_hold_seconds: int = 5 * 60
+    # Set to ``legacy`` only as an immediate live rollback; production uses
+    # the room-level operative model.
+    calculation_model: str = "operative"
+    indoor_surface_resistance: float = 0.12
+    operative_air_weight: float = 0.5
+    maximum_total_k: float = 0.8
+    minimum_operative_denominator: float = 0.55
+    window_outdoor_filter_time_constant_seconds: int = 15 * 60
+    upstairs_wall_outdoor_filter_time_constant_seconds: int = 3 * 60 * 60
+    downstairs_wall_outdoor_filter_time_constant_seconds: int = 8 * 60 * 60
+    shutter_resistance: float = 0.05
+    shutter_closed_direct_transmission: float = 0.02
+    shutter_closed_diffuse_transmission: float = 0.05
+    shutter_position_fallback: float = 0.5
+    solar_direct_fraction_minimum: float = 0.20
+    solar_direct_fraction_maximum: float = 0.80
+    solar_maximum_direct_normal_irradiance: float = 1100.0
+    solar_ground_reflection_fraction: float = 0.10
+    solar_mrt_coefficient: float = 0.012
+    solar_adjustment_limit: float = 0.4
+    output_rate_limit_celsius: float = 0.2
+    output_rate_limit_seconds: int = 15 * 60
+    outdoor_filter_warmup_fraction: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -83,6 +128,10 @@ class ComfortAdjustmentResult:
     calculation_validity: Mapping[str, bool]
     zone_diagnostics: Mapping[str, Mapping[str, object]]
     global_input_issues: tuple[str, ...]
+    filter_warming_up: Mapping[str, bool]
+    room_adjustment_minimums: Mapping[str, float | None]
+    room_adjustment_maximums: Mapping[str, float | None]
+    room_adjustment_spreads: Mapping[str, float | None]
 
 
 @dataclass(frozen=True)
@@ -228,7 +277,7 @@ def _resolve_zone_temperature_details(
                 "primary_age_seconds": primary.age_seconds,
                 "fallback_status": fallback.status if fallback is not None else "not_used",
                 "fallback_age_seconds": fallback.age_seconds if fallback is not None else None,
-                "aggregation_weight": 0.0,
+                "temperature_weight": 0.0,
             }
         )
 
@@ -236,7 +285,7 @@ def _resolve_zone_temperature_details(
         aggregation_weight = 1.0 / len(room_values)
         for room_diagnostic in room_diagnostics:
             if room_diagnostic["temperature"] is not None:
-                room_diagnostic["aggregation_weight"] = aggregation_weight
+                room_diagnostic["temperature_weight"] = aggregation_weight
         return sum(room_values) / len(room_values), "room_mean", room_diagnostics, issues
 
     if zone.fallback_temperature_entity_id is not None:
@@ -292,6 +341,10 @@ def resolve_operating_mode_with_source(
     user_mode: object | None,
     hvac_action: object | None,
     configured_hvac_mode: object | None,
+    last_valid_mode: object | None = None,
+    last_valid_mode_at: object | None = None,
+    now: object | None = None,
+    last_valid_mode_hold_seconds: int = 0,
     zone_temperature: float | None,
     outdoor_temperature: float | None,
 ) -> tuple[str | None, str]:
@@ -305,6 +358,21 @@ def resolve_operating_mode_with_source(
 
     if zone_temperature is None or outdoor_temperature is None:
         return None, "unavailable"
+
+    previous_mode = _normalized_mode(last_valid_mode)
+    last_valid_at = _normalize_datetime(last_valid_mode_at)
+    resolved_now = _normalize_datetime(now)
+    last_valid_age_seconds = (
+        (resolved_now - last_valid_at).total_seconds()
+        if resolved_now is not None and last_valid_at is not None
+        else None
+    )
+    if (
+        previous_mode is not None
+        and last_valid_age_seconds is not None
+        and 0.0 <= last_valid_age_seconds <= max(0, last_valid_mode_hold_seconds)
+    ):
+        return previous_mode, "last_valid_mode"
 
     if outdoor_temperature <= zone_temperature - 0.5:
         return "heat", "temperature_inference"
@@ -322,6 +390,10 @@ def resolve_operating_mode(
     user_mode: object | None,
     hvac_action: object | None,
     configured_hvac_mode: object | None,
+    last_valid_mode: object | None = None,
+    last_valid_mode_at: object | None = None,
+    now: object | None = None,
+    last_valid_mode_hold_seconds: int = 0,
     zone_temperature: float | None,
     outdoor_temperature: float | None,
 ) -> str | None:
@@ -330,6 +402,10 @@ def resolve_operating_mode(
         user_mode=user_mode,
         hvac_action=hvac_action,
         configured_hvac_mode=configured_hvac_mode,
+        last_valid_mode=last_valid_mode,
+        last_valid_mode_at=last_valid_mode_at,
+        now=now,
+        last_valid_mode_hold_seconds=last_valid_mode_hold_seconds,
         zone_temperature=zone_temperature,
         outdoor_temperature=outdoor_temperature,
     )
@@ -419,11 +495,12 @@ def _facade_azimuth(facade: str | None) -> float | None:
     return None
 
 
-def facade_direct_gain_factor(
+def facade_direct_gain_components(
     reader: StateReaderLike,
     config: ComfortAdjustmentConfig,
     facade: str | None,
-) -> float:
+) -> tuple[float, float, float]:
+    """Return direct incidence, awning mask, and their combined gain factor."""
     facade_azimuth = _facade_azimuth(facade)
     sun_elevation = _parse_float(reader.get_attr(config.sun_entity_id, "elevation"))
     sun_azimuth = _parse_float(reader.get_attr(config.sun_entity_id, "azimuth"))
@@ -436,130 +513,367 @@ def facade_direct_gain_factor(
         or minimum_elevation is None
         or exposure_half_band is None
     ):
-        return 0.0
-    if sun_elevation <= minimum_elevation:
-        return 0.0
+        return 0.0, 0.0, 0.0
+    if sun_elevation <= 0.0 or sun_elevation <= minimum_elevation:
+        return 0.0, 0.0, 0.0
 
     azimuth_difference = _azimuth_difference(sun_azimuth, facade_azimuth)
     if exposure_half_band <= 0.0:
-        return 1.0 if azimuth_difference == 0.0 else 0.0
-    if azimuth_difference > exposure_half_band:
-        return 0.0
-    return 1.0 - azimuth_difference / exposure_half_band
+        awning_mask = 1.0 if azimuth_difference == 0.0 else 0.0
+    elif azimuth_difference > exposure_half_band:
+        return 0.0, 0.0, 0.0
+    else:
+        awning_mask = 1.0 - azimuth_difference / exposure_half_band
+
+    direct_incidence = max(
+        0.0,
+        cos(radians(sun_elevation)) * cos(radians(azimuth_difference)),
+    )
+    return direct_incidence, awning_mask, direct_incidence * awning_mask
 
 
-def _cover_details(
+def facade_direct_gain_factor(
     reader: StateReaderLike,
     config: ComfortAdjustmentConfig,
-    cover_entity_id: str | None,
+    facade: str | None,
+) -> float:
+    """Return incidence geometry after the configured awning shading mask."""
+    _incidence, _awning_mask, direct_gain = facade_direct_gain_components(reader, config, facade)
+    return direct_gain
+
+
+def _room_envelope_config(room: ComfortAdjustmentRoomConfig) -> RoomEnvelopeConfig | None:
+    return room.envelope
+
+
+def _has_valid_room_envelope(
+    config: ComfortAdjustmentConfig,
+    envelope: RoomEnvelopeConfig,
+    profile: ConstructionProfile,
+) -> bool:
+    if (
+        not envelope.windows
+        or not isfinite(envelope.opaque_wall_view_factor)
+        or envelope.opaque_wall_view_factor < 0.0
+        or not isfinite(envelope.comfort_weight)
+        or envelope.comfort_weight <= 0.0
+        or not isfinite(profile.wall_u_value)
+        or profile.wall_u_value < 0.0
+        or not isfinite(config.indoor_surface_resistance)
+        or config.indoor_surface_resistance <= 0.0
+        or not 0.0 <= config.operative_air_weight <= 1.0
+        or not isfinite(config.shutter_resistance)
+        or config.shutter_resistance < 0.0
+        or not isfinite(config.maximum_total_k)
+        or config.maximum_total_k <= 0.0
+        or not isfinite(config.minimum_operative_denominator)
+        or config.minimum_operative_denominator <= 0.0
+    ):
+        return False
+    for window in envelope.windows:
+        if (
+            not isfinite(window.view_factor)
+            or window.view_factor < 0.0
+            or not isfinite(window.u_value)
+            or window.u_value <= 0.0
+            or not isfinite(window.shgc)
+            or window.shgc < 0.0
+            or not isfinite(window.direct_shade_factor)
+            or window.direct_shade_factor < 0.0
+            or not isfinite(window.diffuse_shade_factor)
+            or window.diffuse_shade_factor < 0.0
+        ):
+            return False
+    return True
+
+
+def _window_facade(
+    window: WindowConfig,
+    cover_facades: Mapping[str, str | None],
+) -> tuple[str | None, str]:
+    if window.cover_entity_id is not None:
+        # Cover-device labels are authoritative for shuttered windows.  A
+        # present-but-empty entry represents a missing or ambiguous label and
+        # deliberately leaves direct solar unexposed.
+        if window.cover_entity_id in cover_facades:
+            return cover_facades[window.cover_entity_id], "cover_device_label"
+    if window.facade is not None:
+        return window.facade, "configured_fallback"
+    return None, "unconfigured"
+
+
+def _window_shutter_details(
+    reader: StateReaderLike,
+    config: ComfortAdjustmentConfig,
+    window: WindowConfig,
+    cover_position_overrides: Mapping[str, tuple[float, str]] | None,
 ) -> dict[str, object]:
-    if cover_entity_id is None:
-        return {
-            "cover_entity_id": None,
-            "cover_state": "unshuttered",
-            "cover_position": None,
-            "cover_position_status": "not_applicable",
-            "openness": 1.0,
-            "effective_u_value": config.diagnostic_window_u_value,
-            "effective_u_value_model": "phase_1_legacy_transmission_proxy",
-        }
-
-    position = _parse_float(reader.get_attr(cover_entity_id, "current_position"))
-    if position is None:
-        openness = 0.5
-        position_status = "missing_or_rejected_defaulted"
-    elif position < 0.0 or position > 100.0:
-        openness = 0.5
-        position_status = "rejected_implausible_defaulted"
+    if window.cover_entity_id is None:
+        openness = 1.0
+        position_status = "unshuttered"
+        cover_state = "unshuttered"
     else:
-        openness = position / 100.0
-        position_status = "valid"
+        override = cover_position_overrides.get(window.cover_entity_id) if cover_position_overrides is not None else None
+        position = _parse_float(reader.get_attr(window.cover_entity_id, "current_position"))
+        if position is not None and 0.0 <= position <= 100.0:
+            openness = position / 100.0
+            position_status = "live"
+        elif override is not None:
+            openness = _clamp(override[0], 0.0, 1.0)
+            position_status = override[1]
+        else:
+            openness = _clamp(config.shutter_position_fallback, 0.0, 1.0)
+            position_status = "configured_fallback"
+        if openness <= 0.0:
+            cover_state = "closed"
+        elif openness >= 1.0:
+            cover_state = "open"
+        else:
+            cover_state = "partial"
 
-    if openness <= 0.0:
-        cover_state = "closed"
-    elif openness >= 1.0:
-        cover_state = "open"
-    else:
-        cover_state = "partial"
-    envelope_transmission = config.diagnostic_shutter_closed_u_multiplier + (
-        1.0 - config.diagnostic_shutter_closed_u_multiplier
-    ) * openness
+    closed_u_value = 1.0 / (1.0 / window.u_value + config.shutter_resistance)
+    effective_u_value = openness * window.u_value + (1.0 - openness) * closed_u_value
+    direct_shgc = window.shgc * (
+        openness + (1.0 - openness) * config.shutter_closed_direct_transmission
+    )
+    diffuse_shgc = window.shgc * (
+        openness + (1.0 - openness) * config.shutter_closed_diffuse_transmission
+    )
     return {
-        "cover_entity_id": cover_entity_id,
+        "cover_entity_id": window.cover_entity_id,
         "cover_state": cover_state,
-        "cover_position": position if position_status == "valid" else None,
+        "cover_position": openness * 100.0 if window.cover_entity_id is not None else None,
         "cover_position_status": position_status,
         "openness": openness,
-        "effective_u_value": config.diagnostic_window_u_value * envelope_transmission,
-        "effective_u_value_model": "phase_1_legacy_transmission_proxy",
+        "open_u_value": window.u_value,
+        "closed_u_value": closed_u_value,
+        "effective_u_value": effective_u_value,
+        "effective_u_value_model": "physical_shutter_resistance",
+        "effective_direct_shgc": direct_shgc,
+        "effective_diffuse_shgc": diffuse_shgc,
+        "direct_shade_factor": window.direct_shade_factor,
+        "diffuse_shade_factor": window.diffuse_shade_factor,
     }
 
 
-def _room_envelope_and_solar_access(
+def _solar_irradiance_components(
+    reader: StateReaderLike,
+    config: ComfortAdjustmentConfig,
+    solar_index: float,
+) -> tuple[float, float, float, str]:
+    """Return direct-normal, diffuse-horizontal, ground-reflected irradiance."""
+    elevation = _parse_float(reader.get_attr(config.sun_entity_id, "elevation"))
+    measured_irradiance = _parse_float(reader.get_state(config.solar_radiation_entity_id))
+    if measured_irradiance is None or measured_irradiance < 0.0:
+        measured_irradiance = _clamp(solar_index, 0.0, 1.0) * 600.0
+        source = "weather_or_elevation_fallback"
+    else:
+        source = "global_horizontal_irradiance_estimate"
+
+    if elevation is None:
+        diffuse_horizontal = measured_irradiance
+        return (
+            0.0,
+            diffuse_horizontal,
+            diffuse_horizontal * config.solar_ground_reflection_fraction,
+            "elevation_unavailable_diffuse_fallback",
+        )
+    if elevation <= 0.0:
+        return 0.0, 0.0, 0.0, "below_horizon"
+
+    elevation_sine = max(sin(radians(elevation)), 1e-6)
+    direct_fraction = _clamp(
+        config.solar_direct_fraction_minimum
+        + (config.solar_direct_fraction_maximum - config.solar_direct_fraction_minimum) * solar_index,
+        config.solar_direct_fraction_minimum,
+        config.solar_direct_fraction_maximum,
+    )
+    direct_horizontal = measured_irradiance * direct_fraction
+    diffuse_horizontal = max(0.0, measured_irradiance - direct_horizontal)
+    direct_normal = min(
+        direct_horizontal / elevation_sine,
+        config.solar_maximum_direct_normal_irradiance,
+    )
+    ground_reflected = measured_irradiance * config.solar_ground_reflection_fraction
+    return direct_normal, diffuse_horizontal, ground_reflected, source
+
+
+def _calculate_room_operative_adjustment(
     reader: StateReaderLike,
     config: ComfortAdjustmentConfig,
     room: ComfortAdjustmentRoomConfig,
+    *,
+    target_temperature: float,
+    effective_window_outdoor_temperature: float,
+    effective_wall_outdoor_temperature: float,
+    solar_index: float,
     cover_facades: Mapping[str, str | None],
-) -> tuple[float, float, dict[str, object]]:
-    if room.cover_entity_id is not None:
-        cover_details = _cover_details(reader, config, room.cover_entity_id)
-        openness = float(cover_details["openness"])
-        envelope_transmission = config.diagnostic_shutter_closed_u_multiplier + (
-            1.0 - config.diagnostic_shutter_closed_u_multiplier
-        ) * openness
-        facade = cover_facades.get(room.cover_entity_id)
-        direct_gain_factor = facade_direct_gain_factor(reader, config, facade)
-        solar_access = 0.25 + 0.75 * openness * direct_gain_factor
-        cover_details["facade"] = facade
-        cover_details["direct_gain_factor"] = direct_gain_factor
-        cover_details["envelope_transmission"] = envelope_transmission
-        cover_details["solar_access"] = solar_access
-        return envelope_transmission, solar_access, cover_details
+    cover_position_overrides: Mapping[str, tuple[float, str]] | None,
+) -> tuple[float, float, float, dict[str, object]] | None:
+    envelope = _room_envelope_config(room)
+    if envelope is None:
+        return None
+    profile = config.construction_profiles.get(envelope.construction_profile)
+    if profile is None or not _has_valid_room_envelope(config, envelope, profile):
+        return None
 
-    direct_gain_factor = facade_direct_gain_factor(reader, config, room.facade)
-    room_details = _cover_details(reader, config, None)
-    room_details["facade"] = room.facade
-    room_details["direct_gain_factor"] = direct_gain_factor
-    if room.solar_access_when_exposed is not None and room.solar_access_when_unexposed is not None:
-        solar_access = room.solar_access_when_unexposed + (
-            room.solar_access_when_exposed - room.solar_access_when_unexposed
-        ) * direct_gain_factor
-        room_details["envelope_transmission"] = 1.0
-        room_details["solar_access"] = solar_access
-        return 1.0, solar_access, room_details
-    if room.solar_access_when_unexposed is not None:
-        room_details["envelope_transmission"] = 1.0
-        room_details["solar_access"] = room.solar_access_when_unexposed
-        return 1.0, room.solar_access_when_unexposed, room_details
-    room_details["envelope_transmission"] = 1.0
-    room_details["solar_access"] = 0.25
-    return 1.0, 0.25, room_details
-
-
-def _zone_envelope_and_solar_access(
-    reader: StateReaderLike,
-    config: ComfortAdjustmentConfig,
-    zone: ComfortAdjustmentZoneConfig,
-    cover_facades: Mapping[str, str | None],
-) -> tuple[float, float, list[dict[str, object]]]:
-    envelope_transmissions: list[float] = []
-    solar_accesses: list[float] = []
-    room_details: list[dict[str, object]] = []
-    for room in zone.rooms:
-        envelope_transmission, solar_access, details = _room_envelope_and_solar_access(
+    direct_normal, diffuse_horizontal, ground_reflected, irradiance_source = _solar_irradiance_components(
+        reader,
+        config,
+        solar_index,
+    )
+    window_k = 0.0
+    conductive_drive = 0.0
+    solar_drive = 0.0
+    window_details: list[dict[str, object]] = []
+    for window in envelope.windows:
+        shutter_details = _window_shutter_details(reader, config, window, cover_position_overrides)
+        facade, facade_source = _window_facade(window, cover_facades)
+        direct_incidence_factor, awning_shading_factor, direct_factor = facade_direct_gain_components(
             reader,
             config,
-            room,
-            cover_facades,
+            facade,
         )
-        envelope_transmissions.append(envelope_transmission)
-        solar_accesses.append(solar_access)
-        room_details.append(details)
-    return (
-        sum(envelope_transmissions) / len(envelope_transmissions),
-        sum(solar_accesses) / len(solar_accesses),
-        room_details,
+        current_window_k = window.view_factor * float(shutter_details["effective_u_value"]) * config.indoor_surface_resistance
+        window_k += current_window_k
+        conductive_drive += current_window_k * (target_temperature - effective_window_outdoor_temperature)
+        direct_irradiance = direct_normal * direct_factor * window.direct_shade_factor
+        diffuse_irradiance = (
+            0.5 * diffuse_horizontal + ground_reflected
+        ) * window.diffuse_shade_factor
+        transmitted_direct = direct_irradiance * float(shutter_details["effective_direct_shgc"])
+        transmitted_diffuse = diffuse_irradiance * float(shutter_details["effective_diffuse_shgc"])
+        current_solar_drive = (transmitted_direct + transmitted_diffuse) * window.view_factor
+        solar_drive += current_solar_drive
+        shutter_details.update(
+            {
+                "facade": facade,
+                "facade_source": facade_source,
+                "window_view_factor": window.view_factor,
+                "window_k": current_window_k,
+                "direct_incidence_factor": direct_incidence_factor,
+                "awning_shading_factor": awning_shading_factor,
+                "direct_gain_factor": direct_factor,
+                "direct_irradiance": direct_irradiance,
+                "diffuse_irradiance": diffuse_irradiance,
+                "solar_drive": current_solar_drive,
+            }
+        )
+        window_details.append(shutter_details)
+
+    wall_k = envelope.opaque_wall_view_factor * profile.wall_u_value * config.indoor_surface_resistance
+    conductive_drive += wall_k * (target_temperature - effective_wall_outdoor_temperature)
+    unclamped_total_k = window_k + wall_k
+    total_k = min(unclamped_total_k, config.maximum_total_k)
+    if unclamped_total_k > 0.0 and total_k < unclamped_total_k:
+        conductive_drive *= total_k / unclamped_total_k
+    operative_denominator = 1.0 - (1.0 - config.operative_air_weight) * total_k
+    if operative_denominator < config.minimum_operative_denominator:
+        return None
+
+    envelope_adjustment = (1.0 - config.operative_air_weight) * conductive_drive / operative_denominator
+    solar_mrt_increase = config.solar_mrt_coefficient * solar_drive
+    solar_adjustment = -(
+        (1.0 - config.operative_air_weight) * solar_mrt_increase / operative_denominator
     )
+    solar_adjustment = _clamp(solar_adjustment, -config.solar_adjustment_limit, config.solar_adjustment_limit)
+    room_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
+    return envelope_adjustment, solar_adjustment, room_adjustment, {
+        "comfort_weight": envelope.comfort_weight,
+        "construction_profile": profile.key,
+        "wall_u_value": profile.wall_u_value,
+        "window_k": window_k,
+        "wall_k": wall_k,
+        "total_k": total_k,
+        "operative_denominator": operative_denominator,
+        "window_envelope_adjustment": (
+            (1.0 - config.operative_air_weight)
+            * window_k
+            * (target_temperature - effective_window_outdoor_temperature)
+            / operative_denominator
+        ),
+        "wall_envelope_adjustment": (
+            (1.0 - config.operative_air_weight)
+            * wall_k
+            * (target_temperature - effective_wall_outdoor_temperature)
+            / operative_denominator
+        ),
+        "solar_mrt_increase": solar_mrt_increase,
+        "solar_drive": solar_drive,
+        "solar_irradiance_source": irradiance_source,
+        "windows": window_details,
+        "room_envelope_adjustment": envelope_adjustment,
+        "room_solar_adjustment": solar_adjustment,
+        "room_raw_adjustment": room_adjustment,
+    }
+
+
+def _calculate_room_legacy_adjustment(
+    reader: StateReaderLike,
+    config: ComfortAdjustmentConfig,
+    room: ComfortAdjustmentRoomConfig,
+    *,
+    target_temperature: float,
+    effective_outdoor_temperature: float,
+    upstairs: bool,
+    operating_mode: str,
+    solar_index: float,
+    cover_facades: Mapping[str, str | None],
+    cover_position_overrides: Mapping[str, tuple[float, str]] | None,
+) -> tuple[float, float, float, dict[str, object]] | None:
+    envelope = _room_envelope_config(room)
+    if envelope is None or not envelope.windows:
+        return None
+    profile = config.construction_profiles.get(envelope.construction_profile)
+    if profile is None or not _has_valid_room_envelope(config, envelope, profile):
+        return None
+    envelope_transmission = 0.0
+    solar_access = 0.0
+    window_details: list[dict[str, object]] = []
+    for window in envelope.windows:
+        shutter_details = _window_shutter_details(reader, config, window, cover_position_overrides)
+        facade, facade_source = _window_facade(window, cover_facades)
+        direct_incidence_factor, awning_shading_factor, direct_factor = facade_direct_gain_components(
+            reader,
+            config,
+            facade,
+        )
+        openness = float(shutter_details["openness"])
+        envelope_transmission += float(shutter_details["effective_u_value"]) / window.u_value
+        if window.cover_entity_id is None:
+            solar_access += 0.25 + 0.75 * direct_factor * window.direct_shade_factor
+        else:
+            solar_access += 0.25 + 0.75 * openness * direct_factor * window.direct_shade_factor
+        shutter_details.update(
+            {
+                "facade": facade,
+                "facade_source": facade_source,
+                "direct_incidence_factor": direct_incidence_factor,
+                "awning_shading_factor": awning_shading_factor,
+                "direct_gain_factor": direct_factor,
+            }
+        )
+        window_details.append(shutter_details)
+    envelope_transmission /= len(envelope.windows)
+    solar_access /= len(envelope.windows)
+    temperature_gap = _clamp((target_temperature - effective_outdoor_temperature) / 10.0, -1.0, 1.0)
+    if upstairs:
+        solar_coefficient = 1.35 if operating_mode == "heat" else 1.50
+        envelope_adjustment = 1.10 * envelope_transmission * temperature_gap
+    else:
+        solar_coefficient = 1.00 if operating_mode == "heat" else 1.20
+        envelope_adjustment = 1.25 * temperature_gap
+    solar_adjustment = -solar_coefficient * solar_access * solar_index
+    room_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
+    return envelope_adjustment, solar_adjustment, room_adjustment, {
+        "comfort_weight": envelope.comfort_weight,
+        "legacy_envelope_transmission": envelope_transmission,
+        "legacy_solar_access": solar_access,
+        "windows": window_details,
+        "room_envelope_adjustment": envelope_adjustment,
+        "room_solar_adjustment": solar_adjustment,
+        "room_raw_adjustment": room_adjustment,
+    }
 
 
 def round_comfort_adjustment(value: float) -> float:
@@ -630,6 +944,12 @@ def calculate_comfort_adjustments(
     effective_outdoor_temperatures: Mapping[str, float | None] | None = None,
     reference_zone_targets: Mapping[str, tuple[float, float]] | None = None,
     now: datetime | None = None,
+    effective_window_outdoor_temperatures: Mapping[str, float | None] | None = None,
+    effective_wall_outdoor_temperatures: Mapping[str, float | None] | None = None,
+    filter_warming_up: Mapping[str, bool] | None = None,
+    cover_position_overrides: Mapping[str, tuple[float, str]] | None = None,
+    last_valid_operating_mode: object | None = None,
+    last_valid_operating_mode_at: object | None = None,
 ) -> ComfortAdjustmentResult:
     house_temperature_reading = _read_temperature(
         reader,
@@ -685,6 +1005,10 @@ def calculate_comfort_adjustments(
         user_mode=user_mode,
         hvac_action=hvac_action,
         configured_hvac_mode=configured_hvac_mode,
+        last_valid_mode=last_valid_operating_mode,
+        last_valid_mode_at=last_valid_operating_mode_at,
+        now=now,
+        last_valid_mode_hold_seconds=config.last_valid_operating_mode_hold_seconds,
         zone_temperature=operating_indoor_temperature,
         outdoor_temperature=outdoor_temperature,
     )
@@ -698,30 +1022,52 @@ def calculate_comfort_adjustments(
     adjustments: dict[str, float] = {}
     calculation_validity: dict[str, bool] = {}
     zone_diagnostics: dict[str, Mapping[str, object]] = {}
+    resolved_window_outdoor_temperatures: dict[str, float | None] = {}
+    resolved_wall_outdoor_temperatures: dict[str, float | None] = {}
+    resolved_filter_warming_up: dict[str, bool] = {}
+    room_adjustment_minimums: dict[str, float | None] = {}
+    room_adjustment_maximums: dict[str, float | None] = {}
+    room_adjustment_spreads: dict[str, float | None] = {}
     for zone in config.zones:
         zone_temperature = zone_temperatures[zone.key]
         effective_outdoor_temperature = outdoor_temperature
         if effective_outdoor_temperatures is not None and zone.key in effective_outdoor_temperatures:
             effective_outdoor_temperature = effective_outdoor_temperatures[zone.key]
+        effective_window_outdoor_temperature = effective_outdoor_temperature
+        if effective_window_outdoor_temperatures is not None and zone.key in effective_window_outdoor_temperatures:
+            effective_window_outdoor_temperature = effective_window_outdoor_temperatures[zone.key]
+        effective_wall_outdoor_temperature = effective_outdoor_temperature
+        if effective_wall_outdoor_temperatures is not None and zone.key in effective_wall_outdoor_temperatures:
+            effective_wall_outdoor_temperature = effective_wall_outdoor_temperatures[zone.key]
         resolved_effective_outdoor_temperatures[zone.key] = effective_outdoor_temperature
+        resolved_window_outdoor_temperatures[zone.key] = effective_window_outdoor_temperature
+        resolved_wall_outdoor_temperatures[zone.key] = effective_wall_outdoor_temperature
+        resolved_filter_warming_up[zone.key] = bool(filter_warming_up.get(zone.key)) if filter_warming_up is not None else False
         operating_modes[zone.key] = operating_mode
         input_issues = list(input_issues_by_zone[zone.key])
         _append_issue(input_issues, outdoor_sensor_reading)
         _append_issue(input_issues, weather_temperature_reading)
-        if zone_temperature is None or effective_outdoor_temperature is None or operating_mode is None:
+        if (
+            effective_window_outdoor_temperature is None
+            or effective_wall_outdoor_temperature is None
+            or operating_mode is None
+        ):
             reference_temperatures[zone.key] = None
             envelope_adjustments[zone.key] = 0.0
             solar_adjustments[zone.key] = 0.0
             raw_adjustments[zone.key] = 0.0
             adjustments[zone.key] = 0.0
             calculation_validity[zone.key] = False
+            room_adjustment_minimums[zone.key] = None
+            room_adjustment_maximums[zone.key] = None
+            room_adjustment_spreads[zone.key] = None
             zone_diagnostics[zone.key] = {
                 "calculation_status": "unavailable",
                 "zone_temperature_source": zone_temperature_sources[zone.key],
                 "room_values": room_diagnostics_by_zone[zone.key],
                 "input_issues": tuple(input_issues),
                 "outdoor_temperature_source": outdoor_temperature_source,
-                "effective_outdoor_model": "phase_1_shared_filter",
+                "effective_outdoor_model": "separate_window_and_wall_filters",
             }
             continue
 
@@ -732,40 +1078,120 @@ def calculate_comfort_adjustments(
         )
         reference_temperatures[zone.key] = reference_temperature
 
-        envelope_transmission, solar_access, envelope_room_details = _zone_envelope_and_solar_access(
-            reader,
-            config,
-            zone,
-            cover_facades,
-        )
         room_diagnostics = room_diagnostics_by_zone[zone.key]
-        for room_index, envelope_room_detail in enumerate(envelope_room_details):
+        weighted_envelope_adjustment = 0.0
+        weighted_solar_adjustment = 0.0
+        comfort_weight_total = 0.0
+        weighted_window_k = 0.0
+        weighted_wall_k = 0.0
+        weighted_total_k = 0.0
+        weighted_denominator = 0.0
+        room_adjustments: list[float] = []
+        room_calculation_failed = False
+        for room_index, room in enumerate(zone.rooms):
+            if config.calculation_model == "legacy":
+                room_result = _calculate_room_legacy_adjustment(
+                    reader,
+                    config,
+                    room,
+                    target_temperature=reference_temperature,
+                    effective_outdoor_temperature=effective_outdoor_temperature,
+                    upstairs=zone.upstairs,
+                    operating_mode=operating_mode,
+                    solar_index=solar_index,
+                    cover_facades=cover_facades,
+                    cover_position_overrides=cover_position_overrides,
+                )
+            else:
+                room_result = _calculate_room_operative_adjustment(
+                    reader,
+                    config,
+                    room,
+                    target_temperature=reference_temperature,
+                    effective_window_outdoor_temperature=effective_window_outdoor_temperature,
+                    effective_wall_outdoor_temperature=effective_wall_outdoor_temperature,
+                    solar_index=solar_index,
+                    cover_facades=cover_facades,
+                    cover_position_overrides=cover_position_overrides,
+                )
+            if room_result is None:
+                room_calculation_failed = True
+                continue
+            room_envelope_adjustment, room_solar_adjustment, room_adjustment, room_details = room_result
+            comfort_weight = float(room_details["comfort_weight"])
             if room_index < len(room_diagnostics):
-                room_diagnostics[room_index].update(envelope_room_detail)
-        temperature_gap = _clamp((reference_temperature - effective_outdoor_temperature) / 10.0, -1.0, 1.0)
-        if zone.upstairs:
-            solar_coefficient = 1.35 if operating_mode == "heat" else 1.50
-            envelope_adjustment = 1.10 * envelope_transmission * temperature_gap
-        else:
-            solar_coefficient = 1.00 if operating_mode == "heat" else 1.20
-            envelope_adjustment = 1.25 * temperature_gap
-        solar_adjustment = -solar_coefficient * solar_access * solar_index
-        raw_adjustment = envelope_adjustment + solar_adjustment
+                room_diagnostics[room_index].update(room_details)
+            weighted_envelope_adjustment += comfort_weight * room_envelope_adjustment
+            weighted_solar_adjustment += comfort_weight * room_solar_adjustment
+            comfort_weight_total += comfort_weight
+            weighted_window_k += comfort_weight * float(room_details.get("window_k", 0.0))
+            weighted_wall_k += comfort_weight * float(room_details.get("wall_k", 0.0))
+            weighted_total_k += comfort_weight * float(room_details.get("total_k", 0.0))
+            weighted_denominator += comfort_weight * float(room_details.get("operative_denominator", 0.0))
+            room_adjustments.append(room_adjustment)
+        if comfort_weight_total <= 0.0 or room_calculation_failed:
+            envelope_adjustments[zone.key] = 0.0
+            solar_adjustments[zone.key] = 0.0
+            raw_adjustments[zone.key] = 0.0
+            adjustments[zone.key] = 0.0
+            calculation_validity[zone.key] = False
+            room_adjustment_minimums[zone.key] = min(room_adjustments) if room_adjustments else None
+            room_adjustment_maximums[zone.key] = max(room_adjustments) if room_adjustments else None
+            room_adjustment_spreads[zone.key] = (
+                max(room_adjustments) - min(room_adjustments) if room_adjustments else None
+            )
+            zone_diagnostics[zone.key] = {
+                "calculation_status": "invalid_operative_calculation",
+                "zone_temperature_source": zone_temperature_sources[zone.key],
+                "room_values": room_diagnostics,
+                "input_issues": tuple(input_issues),
+                "outdoor_temperature_source": outdoor_temperature_source,
+                "effective_outdoor_model": "separate_window_and_wall_filters",
+            }
+            continue
+        envelope_adjustment = weighted_envelope_adjustment / comfort_weight_total
+        solar_adjustment = weighted_solar_adjustment / comfort_weight_total
+        raw_adjustment = _clamp(envelope_adjustment + solar_adjustment, -1.5, 1.5)
         envelope_adjustments[zone.key] = envelope_adjustment
         solar_adjustments[zone.key] = solar_adjustment
         raw_adjustments[zone.key] = raw_adjustment
         adjustments[zone.key] = round_comfort_adjustment(raw_adjustment)
         calculation_validity[zone.key] = True
+        room_adjustment_minimums[zone.key] = min(room_adjustments)
+        room_adjustment_maximums[zone.key] = max(room_adjustments)
+        room_adjustment_spreads[zone.key] = max(room_adjustments) - min(room_adjustments)
         zone_diagnostics[zone.key] = {
             "calculation_status": "calculated",
             "zone_temperature_source": zone_temperature_sources[zone.key],
             "room_values": room_diagnostics,
-            "room_aggregation": "equal_mean_of_available_rooms",
+            "room_aggregation": "comfort_weighted_mean",
             "input_issues": tuple(input_issues),
             "outdoor_temperature_source": outdoor_temperature_source,
-            "effective_outdoor_model": "phase_1_shared_filter",
-            "envelope_transmission": envelope_transmission,
-            "solar_access": solar_access,
+            "effective_outdoor_model": "separate_window_and_wall_filters",
+            "window_k": weighted_window_k / comfort_weight_total,
+            "wall_k": weighted_wall_k / comfort_weight_total,
+            "total_k": weighted_total_k / comfort_weight_total,
+            "operative_denominator": weighted_denominator / comfort_weight_total,
+            "window_envelope_adjustment": sum(
+                [
+                    float(room_diagnostic.get("window_envelope_adjustment", 0.0))
+                    * float(room_diagnostic.get("comfort_weight", 0.0))
+                    for room_diagnostic in room_diagnostics
+                ]
+            )
+            / comfort_weight_total,
+            "wall_envelope_adjustment": sum(
+                [
+                    float(room_diagnostic.get("wall_envelope_adjustment", 0.0))
+                    * float(room_diagnostic.get("comfort_weight", 0.0))
+                    for room_diagnostic in room_diagnostics
+                ]
+            )
+            / comfort_weight_total,
+            "room_adjustment_minimum": room_adjustment_minimums[zone.key],
+            "room_adjustment_maximum": room_adjustment_maximums[zone.key],
+            "room_adjustment_spread": room_adjustment_spreads[zone.key],
+            "filter_warming_up": resolved_filter_warming_up[zone.key],
         }
 
     global_input_issues: list[str] = []
@@ -777,11 +1203,8 @@ def calculate_comfort_adjustments(
         zone_temperatures=zone_temperatures,
         outdoor_temperature=outdoor_temperature,
         effective_outdoor_temperatures=resolved_effective_outdoor_temperatures,
-        # Phase 1 records both elements explicitly while preserving the
-        # existing shared filter.  Phase 3 gives windows and walls separate
-        # thermal response filters.
-        effective_window_outdoor_temperatures=resolved_effective_outdoor_temperatures,
-        effective_wall_outdoor_temperatures=resolved_effective_outdoor_temperatures,
+        effective_window_outdoor_temperatures=resolved_window_outdoor_temperatures,
+        effective_wall_outdoor_temperatures=resolved_wall_outdoor_temperatures,
         solar_index=solar_index,
         operating_modes=operating_modes,
         operating_mode=operating_mode,
@@ -796,4 +1219,8 @@ def calculate_comfort_adjustments(
         calculation_validity=calculation_validity,
         zone_diagnostics=zone_diagnostics,
         global_input_issues=tuple(global_input_issues),
+        filter_warming_up=resolved_filter_warming_up,
+        room_adjustment_minimums=room_adjustment_minimums,
+        room_adjustment_maximums=room_adjustment_maximums,
+        room_adjustment_spreads=room_adjustment_spreads,
     )

@@ -38,6 +38,7 @@ class SystemConfig:
     heat_control_schemes: dict[str, ControlScheme]
     cool_control_schemes: dict[str, ControlScheme]
     zone_comfort_adjustment_entities: dict[str, str] = field(default_factory=dict)
+    global_setpoint_adjustment_entity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,10 +76,11 @@ class DemandSnapshot:
     above_ideal_zones: tuple[str, ...]
     at_or_below_ideal_zones: tuple[str, ...]
     poweroff_forced_off: bool = False
-    # Heat and cool ideal targets before the per-zone comfort adjustment is
-    # applied.  The independent publisher uses these values as its reference
-    # temperature, avoiding a feedback loop through the adjusted schemes.
+    # Heat and cool ideal targets before per-zone comfort and global setpoint
+    # adjustments are applied. The independent publisher uses these values as
+    # its reference temperature, avoiding a feedback loop through adjusted schemes.
     base_zone_targets: dict[str, tuple[float, float]] = field(default_factory=dict)
+    global_setpoint_adjustment: float = 0.0
 
 
 @dataclass(frozen=True)

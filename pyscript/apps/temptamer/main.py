@@ -39,6 +39,7 @@ from .comfort_adjustments import (
     apply_adjustment_hysteresis,
     calculate_comfort_adjustments,
     filter_outdoor_temperature,
+    round_comfort_adjustment,
     resolve_outdoor_temperature,
 )
 from .constants import (
@@ -236,9 +237,14 @@ RUNTIME_STATE: dict[str, Any] = {
     "poweroff_reason": None,
     "comfort_adjustment_label_warnings": set(),
     "comfort_adjustment_last_error": None,
-    "comfort_adjustment_effective_outdoor_temperatures": {},
-    "comfort_adjustment_effective_outdoor_updated_at": {},
+    "comfort_adjustment_outdoor_filter_values": {},
+    "comfort_adjustment_outdoor_filter_updated_at": {},
+    "comfort_adjustment_outdoor_filter_seeded_at": {},
+    "comfort_adjustment_last_valid_cover_positions": {},
+    "comfort_adjustment_last_published_adjustments": {},
     "comfort_adjustment_last_valid": {},
+    "comfort_adjustment_last_valid_mode": None,
+    "comfort_adjustment_calibration_parameters": None,
 }
 
 
@@ -305,8 +311,11 @@ def _resolve_cover_facades() -> dict[str, str | None]:
     cover_entity_ids: list[str] = []
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         for room in zone.rooms:
-            if room.cover_entity_id and room.cover_entity_id not in cover_entity_ids:
-                cover_entity_ids.append(room.cover_entity_id)
+            if room.envelope is None:
+                continue
+            for window in room.envelope.windows:
+                if window.cover_entity_id and window.cover_entity_id not in cover_entity_ids:
+                    cover_entity_ids.append(window.cover_entity_id)
 
     resolved_facades: dict[str, str | None] = {}
     try:
@@ -372,37 +381,210 @@ def _comfort_adjustment_runtime_mapping(key: str) -> dict[str, object]:
     return values
 
 
+def _update_outdoor_temperature_filter(
+    *,
+    filter_key: str,
+    outdoor_temperature: float,
+    now: datetime,
+    time_constant_seconds: int,
+    warmup_fraction: float,
+    previous_temperatures: dict[str, object],
+    previous_updated_at: dict[str, object],
+    filter_seeded_at: dict[str, object],
+) -> tuple[float, bool]:
+    """Update one independent outdoor-temperature filter.
+
+    This is deliberately a module-level function: PyScript does not resolve
+    local variables captured by a nested helper function reliably.
+    """
+    previous_temperature = parse_float(previous_temperatures.get(filter_key))
+    updated_at = _normalize_runtime_datetime(previous_updated_at.get(filter_key))
+    elapsed_seconds = (now - updated_at).total_seconds() if updated_at is not None else None
+    effective_temperature = filter_outdoor_temperature(
+        outdoor_temperature,
+        previous_temperature,
+        elapsed_seconds,
+        time_constant_seconds,
+    )
+    previous_temperatures[filter_key] = effective_temperature
+    previous_updated_at[filter_key] = now
+    seeded_at = _normalize_runtime_datetime(filter_seeded_at.get(filter_key))
+    if seeded_at is None:
+        seeded_at = now
+        filter_seeded_at[filter_key] = now
+    warmup_seconds = max(0.0, time_constant_seconds * max(0.0, warmup_fraction))
+    seed_age_seconds = max(0.0, (now - seeded_at).total_seconds())
+    return effective_temperature, seed_age_seconds < warmup_seconds
+
+
 def _resolve_effective_outdoor_temperatures(
     outdoor_temperature: float | None,
     now: datetime,
-) -> dict[str, float | None]:
-    effective_temperatures: dict[str, float | None] = {}
+) -> tuple[dict[str, float | None], dict[str, float | None], dict[str, bool]]:
+    window_temperatures: dict[str, float | None] = {}
+    wall_temperatures: dict[str, float | None] = {}
+    filter_warming_up: dict[str, bool] = {}
     if outdoor_temperature is None:
         for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
-            effective_temperatures[zone.key] = None
-        return effective_temperatures
+            window_temperatures[zone.key] = None
+            wall_temperatures[zone.key] = None
+            filter_warming_up[zone.key] = False
+        return window_temperatures, wall_temperatures, filter_warming_up
 
-    previous_temperatures = _comfort_adjustment_runtime_mapping("comfort_adjustment_effective_outdoor_temperatures")
-    previous_updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_effective_outdoor_updated_at")
+    previous_temperatures = _comfort_adjustment_runtime_mapping("comfort_adjustment_outdoor_filter_values")
+    previous_updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_outdoor_filter_updated_at")
+    filter_seeded_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_outdoor_filter_seeded_at")
+    window_temperature, window_warming_up = _update_outdoor_temperature_filter(
+        filter_key="windows",
+        outdoor_temperature=outdoor_temperature,
+        now=now,
+        time_constant_seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.window_outdoor_filter_time_constant_seconds,
+        warmup_fraction=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_filter_warmup_fraction,
+        previous_temperatures=previous_temperatures,
+        previous_updated_at=previous_updated_at,
+        filter_seeded_at=filter_seeded_at,
+    )
+    resolved_wall_filters: dict[str, tuple[float, bool]] = {}
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
-        previous_temperature = parse_float(previous_temperatures.get(zone.key))
-        updated_at = _normalize_runtime_datetime(previous_updated_at.get(zone.key))
-        elapsed_seconds = (now - updated_at).total_seconds() if updated_at is not None else None
-        time_constant_seconds = (
-            DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_filter_time_constant_seconds
-            if zone.upstairs
-            else DEFAULT_COMFORT_ADJUSTMENT_CONFIG.downstairs_outdoor_filter_time_constant_seconds
-        )
-        effective_temperature = filter_outdoor_temperature(
-            outdoor_temperature,
-            previous_temperature,
-            elapsed_seconds,
-            time_constant_seconds,
-        )
-        effective_temperatures[zone.key] = effective_temperature
-        previous_temperatures[zone.key] = effective_temperature
-        previous_updated_at[zone.key] = now
-    return effective_temperatures
+        wall_profile_key = None
+        for room in zone.rooms:
+            if room.envelope is not None:
+                wall_profile_key = room.envelope.construction_profile
+                break
+        profile = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.construction_profiles.get(str(wall_profile_key))
+        if profile is not None:
+            wall_time_constant_seconds = profile.wall_filter_time_constant_seconds
+            wall_filter_key = f"walls_{profile.key}"
+        elif zone.upstairs:
+            wall_time_constant_seconds = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.upstairs_wall_outdoor_filter_time_constant_seconds
+            wall_filter_key = "walls_upstairs"
+        else:
+            wall_time_constant_seconds = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.downstairs_wall_outdoor_filter_time_constant_seconds
+            wall_filter_key = "walls_downstairs"
+        wall_filter_result = resolved_wall_filters.get(wall_filter_key)
+        if wall_filter_result is None:
+            wall_filter_result = _update_outdoor_temperature_filter(
+                filter_key=wall_filter_key,
+                outdoor_temperature=outdoor_temperature,
+                now=now,
+                time_constant_seconds=wall_time_constant_seconds,
+                warmup_fraction=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_filter_warmup_fraction,
+                previous_temperatures=previous_temperatures,
+                previous_updated_at=previous_updated_at,
+                filter_seeded_at=filter_seeded_at,
+            )
+            resolved_wall_filters[wall_filter_key] = wall_filter_result
+        wall_temperature, wall_warming_up = wall_filter_result
+        window_temperatures[zone.key] = window_temperature
+        wall_temperatures[zone.key] = wall_temperature
+        filter_warming_up[zone.key] = window_warming_up or wall_warming_up
+    return window_temperatures, wall_temperatures, filter_warming_up
+
+
+def _resolve_cover_position_overrides(controller: PyscriptController, now: datetime) -> dict[str, tuple[float, str]]:
+    overrides: dict[str, tuple[float, str]] = {}
+    cached_positions = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid_cover_positions")
+    cover_entity_ids: list[str] = []
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        for room in zone.rooms:
+            if room.envelope is None:
+                continue
+            for window in room.envelope.windows:
+                if window.cover_entity_id and window.cover_entity_id not in cover_entity_ids:
+                    cover_entity_ids.append(window.cover_entity_id)
+    for cover_entity_id in cover_entity_ids:
+        position = parse_float(controller.get_attr(cover_entity_id, "current_position"))
+        if position is not None and 0.0 <= position <= 100.0:
+            openness = position / 100.0
+            cached_positions[cover_entity_id] = {"at": now, "openness": openness}
+            overrides[cover_entity_id] = (openness, "live")
+            continue
+        cached_position = cached_positions.get(cover_entity_id)
+        cached_at = _normalize_runtime_datetime(cached_position.get("at") if isinstance(cached_position, dict) else None)
+        cached_openness = parse_float(cached_position.get("openness") if isinstance(cached_position, dict) else None)
+        if (
+            cached_at is not None
+            and cached_openness is not None
+            and 0.0 <= (now - cached_at).total_seconds() <= DEFAULT_COMFORT_ADJUSTMENT_CONFIG.last_valid_hold_seconds
+        ):
+            overrides[cover_entity_id] = (cached_openness, "held_last_valid")
+    return overrides
+
+
+def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
+    """Return the live-tunable model settings in a log-friendly form."""
+    config = DEFAULT_COMFORT_ADJUSTMENT_CONFIG
+    rooms: dict[str, tuple[dict[str, object], ...]] = {}
+    for zone in config.zones:
+        room_parameters: list[dict[str, object]] = []
+        for room in zone.rooms:
+            envelope = room.envelope
+            if envelope is None:
+                continue
+            room_parameters.append(
+                {
+                    "temperature_entity": room.primary_temperature_entity_id,
+                    "comfort_weight": envelope.comfort_weight,
+                    "wall_view_factor": envelope.opaque_wall_view_factor,
+                    "construction_profile": envelope.construction_profile,
+                    "windows": tuple(
+                        [
+                            {
+                                "facade": window.facade,
+                                "view_factor": window.view_factor,
+                                "u_value": window.u_value,
+                                "shgc": window.shgc,
+                                "cover": window.cover_entity_id,
+                                "direct_shade_factor": window.direct_shade_factor,
+                                "diffuse_shade_factor": window.diffuse_shade_factor,
+                            }
+                            for window in envelope.windows
+                        ]
+                    ),
+                }
+            )
+        rooms[zone.key] = tuple(room_parameters)
+    return {
+        "model": config.calculation_model,
+        "operative_air_weight": config.operative_air_weight,
+        "indoor_surface_resistance": config.indoor_surface_resistance,
+        "maximum_total_k": config.maximum_total_k,
+        "minimum_operative_denominator": config.minimum_operative_denominator,
+        "last_valid_operating_mode_hold_seconds": config.last_valid_operating_mode_hold_seconds,
+        "window_filter_seconds": config.window_outdoor_filter_time_constant_seconds,
+        "outdoor_filter_warmup_fraction": config.outdoor_filter_warmup_fraction,
+        "profiles": {
+            key: {
+                "wall_u_value": profile.wall_u_value,
+                "wall_filter_seconds": profile.wall_filter_time_constant_seconds,
+            }
+            for key, profile in config.construction_profiles.items()
+        },
+        "shutter_resistance": config.shutter_resistance,
+        "closed_direct_transmission": config.shutter_closed_direct_transmission,
+        "closed_diffuse_transmission": config.shutter_closed_diffuse_transmission,
+        "solar_direct_fraction": (
+            config.solar_direct_fraction_minimum,
+            config.solar_direct_fraction_maximum,
+        ),
+        "solar_mrt_coefficient": config.solar_mrt_coefficient,
+        "solar_maximum_direct_normal_irradiance": config.solar_maximum_direct_normal_irradiance,
+        "solar_adjustment_limit": config.solar_adjustment_limit,
+        "output_rate_limit": (
+            config.output_rate_limit_celsius,
+            config.output_rate_limit_seconds,
+        ),
+        "rooms": rooms,
+    }
+
+
+def _log_comfort_adjustment_calibration_parameters() -> None:
+    parameters = _comfort_adjustment_calibration_parameters()
+    previous_parameters = RUNTIME_STATE.get("comfort_adjustment_calibration_parameters")
+    if previous_parameters == parameters:
+        return
+    RUNTIME_STATE["comfort_adjustment_calibration_parameters"] = parameters
+    LOGGER.info("COMFORT ADJUSTMENT: calibration_parameters=%s", parameters)
 
 
 def _reference_zone_targets_for_comfort_adjustments(
@@ -434,6 +616,7 @@ def _reference_zone_targets_for_comfort_adjustments(
 def _resolve_published_comfort_adjustments(result, now: datetime, controller: PyscriptController) -> dict[str, dict[str, object]]:
     """Apply output hysteresis and retain a short, explicit last-valid hold."""
     last_valid = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid")
+    last_published = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_published_adjustments")
     publications: dict[str, dict[str, object]] = {}
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         zone_key = zone.key
@@ -446,16 +629,60 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
                 previous_adjustment,
                 DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
             )
+            previous_published = last_published.get(zone_key)
+            previous_published_at = _normalize_runtime_datetime(
+                previous_published.get("at") if isinstance(previous_published, dict) else None
+            )
+            previous_rate_limited_value = parse_float(
+                previous_published.get("unrounded_value") if isinstance(previous_published, dict) else previous_adjustment
+            )
+            if previous_rate_limited_value is None:
+                previous_rate_limited_value = parse_float(
+                    previous_published.get("value") if isinstance(previous_published, dict) else previous_adjustment
+                )
+            if previous_rate_limited_value is None and result.filter_warming_up.get(zone_key, False):
+                previous_rate_limited_value = 0.0
+            elapsed_seconds = (
+                (now - previous_published_at).total_seconds() if previous_published_at is not None else None
+            )
+            if previous_rate_limited_value is not None:
+                if elapsed_seconds is None:
+                    allowed_change = (
+                        DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_celsius
+                        if result.filter_warming_up.get(zone_key, False)
+                        else None
+                    )
+                else:
+                    allowed_change = (
+                        DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_celsius
+                        * max(0.0, elapsed_seconds)
+                        / DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_seconds
+                    )
+                if allowed_change is not None:
+                    filtered_adjustment = _clamp_comfort_adjustment_change(
+                        filtered_adjustment,
+                        previous_rate_limited_value,
+                        allowed_change,
+                    )
+            rate_limited_adjustment = filtered_adjustment
+            filtered_adjustment = round_comfort_adjustment(rate_limited_adjustment)
+            last_published[zone_key] = {
+                "at": now,
+                "unrounded_value": rate_limited_adjustment,
+                "value": filtered_adjustment,
+            }
             last_valid[zone_key] = {
                 "at": now,
                 "raw_adjustment": raw_adjustment,
                 "rounded_adjustment": rounded_adjustment,
                 "filtered_adjustment": filtered_adjustment,
+                "unrounded_rate_limited_adjustment": rate_limited_adjustment,
             }
             publications[zone_key] = {
                 "raw_adjustment": raw_adjustment,
                 "rounded_adjustment": rounded_adjustment,
                 "filtered_adjustment": filtered_adjustment,
+                "unrounded_rate_limited_adjustment": rate_limited_adjustment,
                 "calculation_status": "calculated",
                 "last_valid_age_seconds": 0.0,
             }
@@ -474,11 +701,19 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
             raw_adjustment = parse_float(previous_calculation.get("raw_adjustment"))
             rounded_adjustment = parse_float(previous_calculation.get("rounded_adjustment"))
             filtered_adjustment = parse_float(previous_calculation.get("filtered_adjustment"))
+            unrounded_rate_limited_adjustment = parse_float(
+                previous_calculation.get("unrounded_rate_limited_adjustment")
+            )
             if raw_adjustment is not None and rounded_adjustment is not None and filtered_adjustment is not None:
                 publications[zone_key] = {
                     "raw_adjustment": raw_adjustment,
                     "rounded_adjustment": rounded_adjustment,
                     "filtered_adjustment": filtered_adjustment,
+                    "unrounded_rate_limited_adjustment": (
+                        unrounded_rate_limited_adjustment
+                        if unrounded_rate_limited_adjustment is not None
+                        else filtered_adjustment
+                    ),
                     "calculation_status": "held_last_valid",
                     "last_valid_age_seconds": hold_age_seconds,
                 }
@@ -488,14 +723,21 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
             "raw_adjustment": 0.0,
             "rounded_adjustment": 0.0,
             "filtered_adjustment": 0.0,
+            "unrounded_rate_limited_adjustment": 0.0,
             "calculation_status": "unavailable",
             "last_valid_age_seconds": hold_age_seconds,
         }
     return publications
 
 
+def _clamp_comfort_adjustment_change(target: float, previous: float, maximum_change: float) -> float:
+    if maximum_change <= 0.0:
+        return previous
+    return max(previous - maximum_change, min(previous + maximum_change, target))
+
+
 def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str, object]], now: datetime) -> None:
-    """Emit Phase 1 inputs and components when its log category is enabled."""
+    """Emit physical comfort-model components when the diagnostic category is enabled."""
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         zone_key = zone.key
         zone_diagnostics = dict(result.zone_diagnostics[zone_key])
@@ -503,20 +745,22 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         calculation_status = str(publication["calculation_status"])
         source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
         LOGGER.info(
-            "COMFORT DIAGNOSTICS: at=%s zone=%s status=%s source_status=%s envelope=%s solar=%s raw=%s rounded=%s filtered=%s target=%s window_outdoor=%s wall_outdoor=%s effective_outdoor_model=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s envelope_transmission=%s solar_access=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope=%s solar=%s raw=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
             now.isoformat(),
             zone_key,
+            DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
             calculation_status,
             source_status,
             result.envelope_adjustments[zone_key],
             result.solar_adjustments[zone_key],
             publication["raw_adjustment"],
             publication["rounded_adjustment"],
+            publication["unrounded_rate_limited_adjustment"],
             publication["filtered_adjustment"],
             result.reference_temperatures[zone_key],
             result.effective_window_outdoor_temperatures[zone_key],
             result.effective_wall_outdoor_temperatures[zone_key],
-            zone_diagnostics.get("effective_outdoor_model"),
+            zone_diagnostics.get("filter_warming_up", result.filter_warming_up.get(zone_key, False)),
             result.operating_mode,
             result.operating_mode_source,
             result.operating_indoor_temperature,
@@ -524,8 +768,15 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
             result.zone_temperatures[zone_key],
             zone_diagnostics.get("zone_temperature_source"),
             zone_diagnostics.get("room_aggregation", "not_available"),
-            zone_diagnostics.get("envelope_transmission"),
-            zone_diagnostics.get("solar_access"),
+            zone_diagnostics.get("window_k"),
+            zone_diagnostics.get("wall_k"),
+            zone_diagnostics.get("total_k"),
+            zone_diagnostics.get("operative_denominator"),
+            zone_diagnostics.get("window_envelope_adjustment"),
+            zone_diagnostics.get("wall_envelope_adjustment"),
+            result.room_adjustment_minimums[zone_key],
+            result.room_adjustment_maximums[zone_key],
+            result.room_adjustment_spreads[zone_key],
             zone_diagnostics.get("room_values", ()),
             zone_diagnostics.get("input_issues", ()),
             result.global_input_issues,
@@ -539,17 +790,38 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
 
     controller = PyscriptController()
     now = _system_now()
+    _log_comfort_adjustment_calibration_parameters()
     outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG, now=now)
-    effective_outdoor_temperatures = _resolve_effective_outdoor_temperatures(outdoor_temperature, now)
+    window_outdoor_temperatures, wall_outdoor_temperatures, filter_warming_up = _resolve_effective_outdoor_temperatures(
+        outdoor_temperature,
+        now,
+    )
     reference_zone_targets = _reference_zone_targets_for_comfort_adjustments(controller, now)
+    cover_position_overrides = _resolve_cover_position_overrides(controller, now)
     result = calculate_comfort_adjustments(
         controller,
         config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
         cover_facades=_resolve_cover_facades(),
-        effective_outdoor_temperatures=effective_outdoor_temperatures,
+        effective_outdoor_temperatures=window_outdoor_temperatures,
+        effective_window_outdoor_temperatures=window_outdoor_temperatures,
+        effective_wall_outdoor_temperatures=wall_outdoor_temperatures,
+        filter_warming_up=filter_warming_up,
+        cover_position_overrides=cover_position_overrides,
         reference_zone_targets=reference_zone_targets,
+        last_valid_operating_mode=(
+            RUNTIME_STATE["comfort_adjustment_last_valid_mode"].get("mode")
+            if isinstance(RUNTIME_STATE.get("comfort_adjustment_last_valid_mode"), dict)
+            else None
+        ),
+        last_valid_operating_mode_at=(
+            RUNTIME_STATE["comfort_adjustment_last_valid_mode"].get("at")
+            if isinstance(RUNTIME_STATE.get("comfort_adjustment_last_valid_mode"), dict)
+            else None
+        ),
         now=now,
     )
+    if result.operating_mode is not None and result.operating_mode_source != "last_valid_mode":
+        RUNTIME_STATE["comfort_adjustment_last_valid_mode"] = {"mode": result.operating_mode, "at": now}
     publications = _resolve_published_comfort_adjustments(result, now, controller)
     published_adjustments: list[str] = []
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
@@ -566,16 +838,23 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
 
     RUNTIME_STATE["comfort_adjustment_last_error"] = None
     LOGGER.info(
-        "COMFORT ADJUSTMENT: trigger=%s mode=%s mode_source=%s outdoor=%s downstairs_effective_outdoor=%s solar_index=%.2f reference_targets=%s values=%s",
+        "COMFORT ADJUSTMENT: trigger=%s model=%s mode=%s mode_source=%s outdoor=%s downstairs_window_outdoor=%s downstairs_wall_outdoor=%s filter_warming_up=%s solar_index=%.2f reference_targets=%s values=%s",
         reason,
+        DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
         result.operating_mode or "unavailable",
         result.operating_mode_source,
         f"{result.outdoor_temperature:.1f}" if result.outdoor_temperature is not None else "unavailable",
         (
-            f"{result.effective_outdoor_temperatures['downstairs']:.1f}"
-            if result.effective_outdoor_temperatures.get("downstairs") is not None
+            f"{result.effective_window_outdoor_temperatures['downstairs']:.1f}"
+            if result.effective_window_outdoor_temperatures.get("downstairs") is not None
             else "unavailable"
         ),
+        (
+            f"{result.effective_wall_outdoor_temperatures['downstairs']:.1f}"
+            if result.effective_wall_outdoor_temperatures.get("downstairs") is not None
+            else "unavailable"
+        ),
+        result.filter_warming_up.get("downstairs", False),
         result.solar_index,
         ",".join(
             [
