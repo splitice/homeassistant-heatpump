@@ -66,6 +66,7 @@ from .heatpump_dispatcher import (
     resolve_heat_demand_fan_boost,
     resolve_idle_started_at,
 )
+from .logging_control import install_temptamer_log_filter
 from .state_reader import build_snapshot, is_switch_on, parse_float
 from .zone_control import describe_zone_predictions, resolve_zone_actions
 
@@ -166,6 +167,7 @@ if USING_PYTHON_IMPORTS and "state" not in globals():  # pragma: no cover - used
 
 
 LOGGER = logging.getLogger(LOGGER_NAME)
+install_temptamer_log_filter()
 
 CONTROL_PASS_TASK_NAME = f"{APP_NAME}_control_pass"
 COMFORT_ADJUSTMENT_PASS_TASK_NAME = f"{APP_NAME}_comfort_adjustment_pass"
@@ -236,6 +238,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_adjustment_last_error": None,
     "comfort_adjustment_effective_outdoor_temperatures": {},
     "comfort_adjustment_effective_outdoor_updated_at": {},
+    "comfort_adjustment_last_valid": {},
 }
 
 
@@ -428,13 +431,115 @@ def _reference_zone_targets_for_comfort_adjustments(
     return snapshot.base_zone_targets
 
 
+def _resolve_published_comfort_adjustments(result, now: datetime, controller: PyscriptController) -> dict[str, dict[str, object]]:
+    """Apply output hysteresis and retain a short, explicit last-valid hold."""
+    last_valid = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid")
+    publications: dict[str, dict[str, object]] = {}
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        zone_key = zone.key
+        previous_adjustment = parse_float(controller.get_state(zone.output_entity_id))
+        if result.calculation_validity[zone_key]:
+            raw_adjustment = result.raw_adjustments[zone_key]
+            rounded_adjustment = result.adjustments[zone_key]
+            filtered_adjustment = apply_adjustment_hysteresis(
+                raw_adjustment,
+                previous_adjustment,
+                DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
+            )
+            last_valid[zone_key] = {
+                "at": now,
+                "raw_adjustment": raw_adjustment,
+                "rounded_adjustment": rounded_adjustment,
+                "filtered_adjustment": filtered_adjustment,
+            }
+            publications[zone_key] = {
+                "raw_adjustment": raw_adjustment,
+                "rounded_adjustment": rounded_adjustment,
+                "filtered_adjustment": filtered_adjustment,
+                "calculation_status": "calculated",
+                "last_valid_age_seconds": 0.0,
+            }
+            continue
+
+        previous_calculation = last_valid.get(zone_key)
+        held_at = _normalize_runtime_datetime(
+            previous_calculation.get("at") if isinstance(previous_calculation, dict) else None
+        )
+        hold_age_seconds = (now - held_at).total_seconds() if held_at is not None else None
+        if (
+            isinstance(previous_calculation, dict)
+            and hold_age_seconds is not None
+            and 0.0 <= hold_age_seconds <= DEFAULT_COMFORT_ADJUSTMENT_CONFIG.last_valid_hold_seconds
+        ):
+            raw_adjustment = parse_float(previous_calculation.get("raw_adjustment"))
+            rounded_adjustment = parse_float(previous_calculation.get("rounded_adjustment"))
+            filtered_adjustment = parse_float(previous_calculation.get("filtered_adjustment"))
+            if raw_adjustment is not None and rounded_adjustment is not None and filtered_adjustment is not None:
+                publications[zone_key] = {
+                    "raw_adjustment": raw_adjustment,
+                    "rounded_adjustment": rounded_adjustment,
+                    "filtered_adjustment": filtered_adjustment,
+                    "calculation_status": "held_last_valid",
+                    "last_valid_age_seconds": hold_age_seconds,
+                }
+                continue
+
+        publications[zone_key] = {
+            "raw_adjustment": 0.0,
+            "rounded_adjustment": 0.0,
+            "filtered_adjustment": 0.0,
+            "calculation_status": "unavailable",
+            "last_valid_age_seconds": hold_age_seconds,
+        }
+    return publications
+
+
+def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str, object]], now: datetime) -> None:
+    """Emit Phase 1 inputs and components when its log category is enabled."""
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        zone_key = zone.key
+        zone_diagnostics = dict(result.zone_diagnostics[zone_key])
+        publication = publications[zone_key]
+        calculation_status = str(publication["calculation_status"])
+        source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
+        LOGGER.info(
+            "COMFORT DIAGNOSTICS: at=%s zone=%s status=%s source_status=%s envelope=%s solar=%s raw=%s rounded=%s filtered=%s target=%s window_outdoor=%s wall_outdoor=%s effective_outdoor_model=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s envelope_transmission=%s solar_access=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            now.isoformat(),
+            zone_key,
+            calculation_status,
+            source_status,
+            result.envelope_adjustments[zone_key],
+            result.solar_adjustments[zone_key],
+            publication["raw_adjustment"],
+            publication["rounded_adjustment"],
+            publication["filtered_adjustment"],
+            result.reference_temperatures[zone_key],
+            result.effective_window_outdoor_temperatures[zone_key],
+            result.effective_wall_outdoor_temperatures[zone_key],
+            zone_diagnostics.get("effective_outdoor_model"),
+            result.operating_mode,
+            result.operating_mode_source,
+            result.operating_indoor_temperature,
+            result.operating_indoor_temperature_source,
+            result.zone_temperatures[zone_key],
+            zone_diagnostics.get("zone_temperature_source"),
+            zone_diagnostics.get("room_aggregation", "not_available"),
+            zone_diagnostics.get("envelope_transmission"),
+            zone_diagnostics.get("solar_access"),
+            zone_diagnostics.get("room_values", ()),
+            zone_diagnostics.get("input_issues", ()),
+            result.global_input_issues,
+            publication["last_valid_age_seconds"],
+        )
+
+
 def run_comfort_adjustment_pass(*, reason: str) -> None:
     """Calculate and publish independent per-zone comfort adjustments."""
     task.unique(COMFORT_ADJUSTMENT_PASS_TASK_NAME)
 
     controller = PyscriptController()
     now = _system_now()
-    outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG)
+    outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG, now=now)
     effective_outdoor_temperatures = _resolve_effective_outdoor_temperatures(outdoor_temperature, now)
     reference_zone_targets = _reference_zone_targets_for_comfort_adjustments(controller, now)
     result = calculate_comfort_adjustments(
@@ -443,27 +548,28 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
         cover_facades=_resolve_cover_facades(),
         effective_outdoor_temperatures=effective_outdoor_temperatures,
         reference_zone_targets=reference_zone_targets,
+        now=now,
     )
+    publications = _resolve_published_comfort_adjustments(result, now, controller)
     published_adjustments: list[str] = []
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
-        previous_adjustment = parse_float(controller.get_state(zone.output_entity_id))
-        adjustment = apply_adjustment_hysteresis(
-            result.raw_adjustments[zone.key],
-            previous_adjustment,
-            DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
-        )
+        adjustment = publications[zone.key]["filtered_adjustment"]
         controller.call_service(
             "input_number",
             "set_value",
             entity_id=zone.output_entity_id,
             value=adjustment,
         )
-        published_adjustments.append(f"{zone.key}={adjustment:.1f}")
+        published_adjustments.append(f"{zone.key}={float(adjustment):.1f}")
+
+    _log_comfort_adjustment_diagnostics(result, publications, now)
 
     RUNTIME_STATE["comfort_adjustment_last_error"] = None
     LOGGER.info(
-        "COMFORT ADJUSTMENT: trigger=%s outdoor=%s downstairs_effective_outdoor=%s solar_index=%.2f reference_targets=%s values=%s",
+        "COMFORT ADJUSTMENT: trigger=%s mode=%s mode_source=%s outdoor=%s downstairs_effective_outdoor=%s solar_index=%.2f reference_targets=%s values=%s",
         reason,
+        result.operating_mode or "unavailable",
+        result.operating_mode_source,
         f"{result.outdoor_temperature:.1f}" if result.outdoor_temperature is not None else "unavailable",
         (
             f"{result.effective_outdoor_temperatures['downstairs']:.1f}"

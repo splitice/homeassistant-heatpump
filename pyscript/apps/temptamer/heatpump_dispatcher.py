@@ -48,10 +48,12 @@ from .constants import (
     MIN_HEAT_SETPOINT,
 )
 from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig, ZoneRuntimeState
+from .logging_control import install_temptamer_log_filter
 from .state_reader import parse_float
 
 
 LOGGER = logging.getLogger(LOGGER_NAME)
+install_temptamer_log_filter()
 IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7, -11)
 IDLE_HEAT_UNWIND_LADDER = (-11, -7, -6, -5, -4, -3, -2, -1)
 LEVEL_FAN_MODE_PATTERN = re.compile(r"^level\s+([1-9]\d*)$", re.IGNORECASE)

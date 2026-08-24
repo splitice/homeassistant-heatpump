@@ -56,6 +56,21 @@ POWEROFF_MIN_ACTIVATION_SECONDS = 15 * 60
 POWEROFF_DAY_START_TIME = time(8, 0)
 POWEROFF_DAY_END_TIME = time(22, 0)
 
+# Toggle TempTamer log streams independently.  Leave operational categories on
+# for normal use; enable the verbose Phase 1 comfort diagnostics only while
+# inspecting or calibrating the model.
+TEMPTAMER_LOGGING_CATEGORIES = {
+    "lifecycle": True,
+    "comfort_adjustment": True,
+    "comfort_adjustment_diagnostics": False,
+    "fan_boost": True,
+    "powerday": True,
+    "poweroff": True,
+    "zones": True,
+    "dispatch": True,
+    "setpoint": True,
+}
+
 DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
