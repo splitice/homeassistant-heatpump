@@ -39,6 +39,14 @@ EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR = "sensor.eagle_200_max_power_demand_5m"
 # A one-line runtime state file.  It lives outside the app package so updates do
 # not trigger a PyScript app reload.
 HEAT_DEMAND_FAN_BOOST_STATE_FILE = "/config/pyscript/temptamer_fan_boost.state"
+# Persist the score convention separately from the helpers themselves.  When
+# this number changes, the publisher reseeds every helper before control reads
+# one of the old-convention values.
+COMFORT_SCORE_SEMANTICS_VERSION = 2
+COMFORT_SCORE_SEMANTICS_STATE_FILE = "/config/pyscript/temptamer_comfort_score_semantics.state"
+# Fabric solar filters represent heat retained by contents and fabric, so they
+# must survive PyScript reloads and Home Assistant restarts.
+COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE = "/config/pyscript/temptamer_fabric_solar_filters.state"
 IDLE_DEMAND_FORECAST_WEATHER_ENTITY = "weather.epping_hourly"
 IDLE_DEMAND_FORECAST_REFRESH_SECONDS = 15 * 60
 IDLE_DEMAND_FORECAST_HORIZON_SECONDS = 30 * 60
@@ -338,6 +346,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ),
             ),
             upstairs=False,
+            fabric_solar=FabricSolarConfig(
+                filter_time_constant_seconds=120 * 60,
+                irradiance_threshold=30.0,
+                score_coefficient=0.0015,
+                score_limit=0.25,
+            ),
         ),
         ComfortAdjustmentZoneConfig(
             key="bedroom_1_2",
@@ -347,7 +361,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_1_average_temperature",
                     envelope=RoomEnvelopeConfig(
-                        windows=(WindowConfig(facade="e", cover_entity_id="cover.bed1shutters"),),
+                        windows=(WindowConfig(facade="s", cover_entity_id="cover.bed1shutters"),),
                         opaque_wall_view_factor=0.15,
                         construction_profile="upstairs_brick_veneer",
                         comfort_weight=0.5,
@@ -364,6 +378,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ),
             ),
             upstairs=True,
+            fabric_solar=FabricSolarConfig(
+                filter_time_constant_seconds=45 * 60,
+                irradiance_threshold=30.0,
+                score_coefficient=0.0012,
+                score_limit=0.20,
+            ),
         ),
         ComfortAdjustmentZoneConfig(
             key="bedroom_3_4",
@@ -408,6 +428,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ),
             ),
             upstairs=True,
+            fabric_solar=FabricSolarConfig(
+                filter_time_constant_seconds=45 * 60,
+                irradiance_threshold=25.0,
+                score_coefficient=0.0020,
+                score_limit=0.30,
+            ),
         ),
         ComfortAdjustmentZoneConfig(
             key="office",
@@ -457,6 +483,12 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
                 ),
             ),
             upstairs=True,
+            fabric_solar=FabricSolarConfig(
+                filter_time_constant_seconds=60 * 60,
+                irradiance_threshold=25.0,
+                score_coefficient=0.0025,
+                score_limit=0.40,
+            ),
         ),
     ),
     house_temperature_entity_id="sensor.home_temperature",

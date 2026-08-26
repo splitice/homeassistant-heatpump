@@ -1020,6 +1020,7 @@ def calculate_comfort_adjustments(
     if outdoor_temperature is None:
         outdoor_temperature = weather_temperature_reading.value
     solar_index = resolve_solar_index(reader, config)
+    sun_elevation = _parse_float(reader.get_attr(config.sun_entity_id, "elevation"))
     resolved_filtered_solar_irradiances: dict[str, float | None] = {}
     for zone in config.zones:
         filtered_irradiance = (
@@ -1030,7 +1031,7 @@ def calculate_comfort_adjustments(
         resolved_filtered_irradiance = _parse_float(filtered_irradiance)
         resolved_filtered_solar_irradiances[zone.key] = (
             max(0.0, resolved_filtered_irradiance)
-            if resolved_filtered_irradiance is not None
+            if resolved_filtered_irradiance is not None and (sun_elevation is None or sun_elevation > 0.0)
             else None
         )
     user_mode = reader.get_state(config.heatpump_mode_user_entity_id)

@@ -88,11 +88,19 @@ from pyscript.apps.temptamer.idle_demand_forecast import (
     forecast_temperature_at,
     parse_hourly_weather_forecast,
 )
-from pyscript.apps.temptamer.logging_control import _TempTamerCategoryFilter
+from pyscript.apps.temptamer.logging_control import (
+    get_temptamer_logger,
+    install_temptamer_log_filter,
+    is_temptamer_log_enabled,
+)
 from pyscript.apps.temptamer.models import ControlScheme, DispatchPlan, EquipmentDemand, SystemConfig
 import pyscript.apps.temptamer.main as temptamer_main
 from pyscript.apps.temptamer.state_reader import build_snapshot
-from pyscript.apps.temptamer.zone_control import describe_zone_predictions, resolve_zone_actions
+from pyscript.apps.temptamer.zone_control import (
+    describe_zone_predictions,
+    resolve_high_fan_office_closure,
+    resolve_zone_actions,
+)
 
 
 TEST_CLIMATE_ENTITY = "climate.wt32_hpctrl_e8dbd0_heatpump"
@@ -504,6 +512,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
                 "cover.officeshutters": {"current_position": 100.0},
                 "sun.sun": {"elevation": -1.0, "azimuth": 180.0},
             },
+            filtered_solar_irradiances={"office": 90.0},
         )
         below_window = below_horizon.zone_diagnostics["office"]["room_values"][0]["windows"][0]
         self.assertEqual(below_window["direct_irradiance"], 0.0)
@@ -511,6 +520,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
             below_horizon.zone_diagnostics["office"]["room_values"][0]["solar_irradiance_source"],
             "below_horizon",
         )
+        self.assertEqual(below_horizon.fabric_solar_scores["office"], 0.0)
 
     def test_legacy_calculation_model_remains_an_immediate_rollback(self):
         legacy = self.calculate(config=replace(DEFAULT_COMFORT_ADJUSTMENT_CONFIG, calculation_model="legacy"))
@@ -804,6 +814,21 @@ class ComfortAdjustmentTests(unittest.TestCase):
             self.assertNotIn(zone.output_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
             self.assertIn(zone.output_entity_id, MODE_TRIGGER_ENTITIES)
 
+    def test_bedroom_1_fallback_facade_matches_its_south_awning_label(self):
+        bedroom_1_2 = next(
+            zone for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones if zone.key == "bedroom_1_2"
+        )
+        bedroom_1_window = bedroom_1_2.rooms[0].envelope.windows[0]
+        cover_facades = dict(COMFORT_ADJUSTMENT_COVER_FACADES)
+        cover_facades.pop("cover.bed1shutters")
+
+        result = self.calculate(cover_facades=cover_facades)
+        resolved_window = result.zone_diagnostics["bedroom_1_2"]["room_values"][0]["windows"][0]
+
+        self.assertEqual(bedroom_1_window.facade, "s")
+        self.assertEqual(resolved_window["facade"], "s")
+        self.assertEqual(resolved_window["facade_source"], "configured_fallback")
+
 
 class ComfortAdjustmentRuntimeTests(unittest.TestCase):
     def setUp(self):
@@ -892,10 +917,131 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
 
         office = next(zone for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones if zone.key == "office")
         self.assertIsNotNone(office.fabric_solar)
-        self.assertIsNone(next(zone for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones if zone.key == "dining").fabric_solar)
+        self.assertEqual(
+            {
+                zone.key: (
+                    zone.fabric_solar.filter_time_constant_seconds,
+                    zone.fabric_solar.irradiance_threshold,
+                    zone.fabric_solar.score_coefficient,
+                    zone.fabric_solar.score_limit,
+                )
+                for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+            },
+            {
+                "downstairs": (120 * 60, 30.0, 0.0015, 0.25),
+                "bedroom_1_2": (45 * 60, 30.0, 0.0012, 0.20),
+                "bedroom_3_4": (45 * 60, 25.0, 0.0020, 0.30),
+                "office": (30 * 60, 20.0, 0.0045, 0.40),
+                "dining": (60 * 60, 25.0, 0.0025, 0.40),
+            },
+        )
         self.assertEqual(first["office"], 20.0)
-        self.assertIsNone(first["dining"])
+        self.assertEqual(first["dining"], 20.0)
         self.assertAlmostEqual(second["office"], 70.57, places=2)
+        self.assertAlmostEqual(second["downstairs"], 37.70, places=2)
+        self.assertAlmostEqual(second["bedroom_1_2"], 58.93, places=2)
+        self.assertAlmostEqual(second["bedroom_3_4"], 58.93, places=2)
+        self.assertAlmostEqual(second["dining"], 51.48, places=2)
+
+    def test_fabric_solar_filter_discards_stale_samples_and_sunset_memory(self):
+        first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        stale_now = first_now + timedelta(
+            seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.input_stale_after_seconds + 1
+        )
+        solar_entity = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id
+        sun_entity = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.sun_entity_id
+        controller = FakeReader(
+            {solar_entity: "180.0"},
+            {
+                solar_entity: {"last_updated": first_now},
+                sun_entity: {"elevation": 25.0},
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            temptamer_main,
+            "COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE",
+            str(Path(temporary_directory) / "fabric_solar.json"),
+        ):
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_values"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_updated_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_seeded_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_restore_checked"] = False
+
+            live = temptamer_main._resolve_filtered_solar_irradiances(controller, first_now)
+            stale = temptamer_main._resolve_filtered_solar_irradiances(controller, stale_now)
+
+            controller.attr_map[solar_entity]["last_updated"] = stale_now
+            controller.attr_map[sun_entity]["elevation"] = -0.1
+            below_horizon = temptamer_main._resolve_filtered_solar_irradiances(controller, stale_now)
+
+        self.assertGreater(live["office"], 0.0)
+        self.assertTrue(all(value is None for value in stale.values()))
+        self.assertTrue(all(value is None for value in below_horizon.values()))
+        self.assertEqual(temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_values"], {})
+
+    def test_fabric_solar_filter_restores_after_a_pyscript_reload(self):
+        first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        solar_entity = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id
+        sun_entity = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.sun_entity_id
+        controller = FakeReader(
+            {solar_entity: "90.0"},
+            {
+                solar_entity: {"last_updated": first_now},
+                sun_entity: {"elevation": 25.0},
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.object(
+            temptamer_main,
+            "COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE",
+            str(Path(temporary_directory) / "fabric_solar.json"),
+        ):
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_values"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_updated_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_seeded_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_restore_checked"] = False
+            saved = temptamer_main._resolve_filtered_solar_irradiances(controller, first_now)
+
+            # Simulate module reload: RUNTIME_STATE is empty but the state
+            # file remains, so the delayed solar warmth must be retained.
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_values"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_updated_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_seeded_at"] = {}
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_restore_checked"] = False
+            restored = temptamer_main._current_filtered_solar_irradiances(
+                controller,
+                first_now + timedelta(seconds=1),
+            )
+
+        self.assertEqual(restored["office"], saved["office"])
+
+    def test_forecast_comfort_provider_carries_filtered_fabric_solar_score(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = SimpleNamespace(
+            base_zone_targets={zone.key: (20.0, 20.0) for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones}
+        )
+        provider = temptamer_main._ForecastComfortAdjustmentProvider(
+            FakeReader(
+                comfort_adjustment_state_map(),
+                comfort_adjustment_attr_map(),
+            ),
+            snapshot,
+            COMFORT_ADJUSTMENT_COVER_FACADES,
+            {},
+            {"office": 90.0},
+        )
+
+        with patch.object(
+            temptamer_main,
+            "calculate_comfort_adjustments",
+            wraps=calculate_comfort_adjustments,
+        ) as calculate:
+            adjustments = provider(now, 11.0, "sunny")
+
+        self.assertIsNotNone(adjustments)
+        self.assertEqual(calculate.call_args.kwargs["filtered_solar_irradiances"]["office"], 90.0)
+        self.assertGreater(adjustments["office"], -1.5)
 
     def test_cover_position_holds_last_valid_before_configured_fallback(self):
         first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -979,6 +1125,77 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             20.0 * DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_celsius / 15.0,
             places=6,
         )
+
+    def test_score_semantics_migration_reseeds_old_helpers_without_rate_limiting(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        temptamer_main.state._values.clear()
+        temptamer_main.state._values.update(comfort_adjustment_state_map())
+        temptamer_main.state._values[temptamer_main.ENABLED_ENTITY_ID] = "off"
+        for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+            # This simulates a persisted legacy target-offset value, whose
+            # positive polarity would request more heat if control read it.
+            temptamer_main.state._values[zone.output_entity_id] = "1.5"
+        temptamer_main.state._attrs.clear()
+        temptamer_main.state._attrs.update(comfort_adjustment_attr_map())
+        temptamer_main.service.call = Mock()
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_restore_checked"] = False
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_version"] = None
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_migration_in_progress"] = False
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_published_adjustments"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid"] = {}
+        calculations = []
+
+        def capture_calculation(*args, **kwargs):
+            result = calculate_comfort_adjustments(*args, **kwargs)
+            calculations.append(result)
+            return result
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            semantics_state_file = Path(temporary_directory) / "score_semantics.state"
+            fabric_state_file = Path(temporary_directory) / "fabric_solar.json"
+            with (
+                patch.object(temptamer_main, "COMFORT_SCORE_SEMANTICS_STATE_FILE", str(semantics_state_file)),
+                patch.object(temptamer_main, "COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE", str(fabric_state_file)),
+                patch.object(temptamer_main, "_resolve_cover_facades", return_value=COMFORT_ADJUSTMENT_COVER_FACADES),
+                patch.object(temptamer_main, "_system_now", return_value=now),
+                patch.object(
+                    temptamer_main,
+                    "calculate_comfort_adjustments",
+                    side_effect=capture_calculation,
+                ),
+            ):
+                self.assertTrue(temptamer_main._run_comfort_adjustment_pass(reason="score migration"))
+
+            published_office = next(
+                service_call.kwargs["value"]
+                for service_call in temptamer_main.service.call.call_args_list
+                if service_call.kwargs["entity_id"] == "input_number.comfort_adjustment_office"
+            )
+            calculated_office = calculations[0].adjustments["office"]
+
+            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "2\n")
+
+        self.assertEqual(published_office, calculated_office)
+        self.assertNotEqual(published_office, 1.5)
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["comfort_score_semantics_version"],
+            temptamer_main.COMFORT_SCORE_SEMANTICS_VERSION,
+        )
+
+    def test_control_is_deferred_when_score_semantics_reseed_fails(self):
+        temptamer_main.state._values[temptamer_main.ENABLED_ENTITY_ID] = "on"
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_restore_checked"] = True
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_version"] = None
+        temptamer_main.RUNTIME_STATE["comfort_score_semantics_migration_in_progress"] = False
+
+        with (
+            patch.object(temptamer_main, "_run_comfort_adjustment_pass", return_value=False) as reseed,
+            patch.object(temptamer_main, "run_control_pass") as control_pass,
+        ):
+            temptamer_main._run_enabled_control_pass(reason="migration test")
+
+        reseed.assert_called_once_with(reason="score-semantics migration before control")
+        control_pass.assert_not_called()
 
     def test_runtime_retains_last_valid_mode_after_configured_mode_becomes_unavailable(self):
         first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -1153,7 +1370,6 @@ class TempTamerLoggingTests(unittest.TestCase):
         TEMPTAMER_LOGGING_CATEGORIES.update(self.original_categories)
 
     def test_configurable_log_filter_honours_each_known_category(self):
-        log_filter = _TempTamerCategoryFilter()
         category_messages = {
             "lifecycle": "TempTamer control is already enabled",
             "comfort_adjustment": "COMFORT ADJUSTMENT: pass complete",
@@ -1167,13 +1383,12 @@ class TempTamerLoggingTests(unittest.TestCase):
         }
         for category, message in category_messages.items():
             TEMPTAMER_LOGGING_CATEGORIES[category] = False
-            record = logging.LogRecord("pyscript.temptamer", logging.INFO, __file__, 0, message, (), None)
-            self.assertFalse(log_filter.filter(record), category)
+            self.assertFalse(is_temptamer_log_enabled(message), category)
             TEMPTAMER_LOGGING_CATEGORIES[category] = True
-            self.assertTrue(log_filter.filter(record), category)
+            self.assertTrue(is_temptamer_log_enabled(message), category)
 
     def test_phase_one_diagnostics_emit_only_when_enabled(self):
-        logger = logging.getLogger("pyscript.temptamer")
+        logger = get_temptamer_logger()
         TEMPTAMER_LOGGING_CATEGORIES["comfort_adjustment_diagnostics"] = False
         with self.assertNoLogs("pyscript.temptamer", level="INFO"):
             logger.info("COMFORT DIAGNOSTICS: zone=office hidden")
@@ -1182,6 +1397,17 @@ class TempTamerLoggingTests(unittest.TestCase):
         with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
             logger.info("COMFORT DIAGNOSTICS: zone=office visible")
         self.assertIn("COMFORT DIAGNOSTICS: zone=office visible", captured.output[0])
+
+    def test_reload_removes_legacy_pyscript_logging_filter_without_installing_a_callback(self):
+        raw_logger = logging.getLogger("pyscript.temptamer")
+        legacy_filter = type("_TempTamerCategoryFilter", (logging.Filter,), {})()
+        raw_logger.addFilter(legacy_filter)
+        raw_logger._temptamer_category_filter_installed = True
+
+        install_temptamer_log_filter()
+
+        self.assertNotIn(legacy_filter, raw_logger.filters)
+        self.assertFalse(hasattr(raw_logger, "_temptamer_category_filter_installed"))
 
 
 class TempTamerTests(unittest.TestCase):
@@ -2969,7 +3195,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(second_actions[0].zone_key, "office")
         self.assertTrue(second_actions[0].safety_required)
 
-    def test_high_fan_closes_office_one_degree_beyond_enable_when_another_zone_is_open(self):
+    def test_high_fan_does_not_close_office_before_its_continue_until_target(self):
         now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
         shared_overrides = {
             "input_select.temptamer_comfort_mode": "Office",
@@ -3000,10 +3226,8 @@ class TempTamerTests(unittest.TestCase):
             requested_fan_speed_level=6,
         )
 
-        self.assertEqual([(action.zone_key, action.turn_on) for action in heating_actions], [("office", False)])
-        self.assertEqual(heating_predicted_open, ("dining",))
-        self.assertFalse(heating_actions[0].discretionary)
-        self.assertIn("another zone remains open for safety", heating_actions[0].reason)
+        self.assertEqual(heating_actions, [])
+        self.assertEqual(heating_predicted_open, ("dining", "office"))
 
         threshold_actions, threshold_predicted_open = resolve_zone_actions(
             heating_snapshot,
@@ -3037,10 +3261,68 @@ class TempTamerTests(unittest.TestCase):
             requested_fan_speed_level=6,
         )
 
-        self.assertEqual([(action.zone_key, action.turn_on) for action in cooling_actions], [("office", False)])
-        self.assertEqual(cooling_predicted_open, ("dining",))
+        self.assertEqual(cooling_actions, [])
+        self.assertEqual(cooling_predicted_open, ("dining", "office"))
 
-    def test_high_fan_office_closure_requires_full_temperature_margin_and_another_open_zone(self):
+    def test_high_fan_office_closure_uses_the_continue_until_target(self):
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        shared_overrides = {
+            "input_select.temptamer_comfort_mode": "Office",
+            "input_select.temptamer_comfort_mode_downstairs": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed12": SCHEME_OFF,
+            "input_select.temptamer_comfort_mode_bed34": SCHEME_OFF,
+            "sensor.average_dining_zone_temp": "13.0",
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+            "switch.wt32_hpctrl_e8dbd0_dining": "on",
+        }
+        heating_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "sensor.office_average_temperature": "22.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+        cooling_snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        **shared_overrides,
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "sensor.office_average_temperature": "20.0",
+                        "sensor.average_dining_zone_temp": "21.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+
+        heating_action = resolve_high_fan_office_closure(
+            heating_snapshot,
+            ("dining", "office"),
+            operation_mode=HVAC_HEAT,
+            requested_fan_speed_level=6,
+        )
+        cooling_action = resolve_high_fan_office_closure(
+            cooling_snapshot,
+            ("dining", "office"),
+            operation_mode=HVAC_COOL,
+            requested_fan_speed_level=6,
+        )
+
+        self.assertIsNotNone(heating_action)
+        self.assertIsNotNone(cooling_action)
+        self.assertFalse(heating_action.turn_on)
+        self.assertFalse(cooling_action.turn_on)
+        self.assertIn("22.0>=22.0", heating_action.reason)
+        self.assertIn("20.0<=20.0", cooling_action.reason)
+
+    def test_high_fan_office_closure_requires_continue_until_and_another_open_zone(self):
         now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
         shared_overrides = {
             "input_select.temptamer_comfort_mode": "Office",

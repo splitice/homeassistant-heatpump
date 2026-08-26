@@ -156,7 +156,7 @@ def resolve_high_fan_office_closure(
     operation_mode: str | None,
     requested_fan_speed_level: int | None,
 ) -> ZoneAction | None:
-    """Close Office when high airflow would make it materially over-conditioned."""
+    """Close Office at a high fan speed without overriding its continuation target."""
     if requested_fan_speed_level is None or requested_fan_speed_level <= 5:
         return None
     if operation_mode not in {HVAC_HEAT, HVAC_COOL}:
@@ -169,15 +169,15 @@ def resolve_high_fan_office_closure(
         return None
 
     if operation_mode == HVAC_HEAT:
-        threshold = office_zone.scheme.enable_outside + 1.0
-        is_one_degree_beyond_enable = office_zone.current_temp >= threshold
+        threshold = max(office_zone.scheme.enable_outside + 1.0, office_zone.scheme.continue_until)
+        is_at_high_fan_close_threshold = office_zone.current_temp >= threshold
         comparison = ">="
     else:
-        threshold = office_zone.cool_scheme.enable_outside - 1.0
-        is_one_degree_beyond_enable = office_zone.current_temp <= threshold
+        threshold = min(office_zone.cool_scheme.enable_outside - 1.0, office_zone.cool_scheme.continue_until)
+        is_at_high_fan_close_threshold = office_zone.current_temp <= threshold
         comparison = "<="
 
-    if not is_one_degree_beyond_enable:
+    if not is_at_high_fan_close_threshold:
         return None
 
     return ZoneAction(
@@ -185,7 +185,7 @@ def resolve_high_fan_office_closure(
         turn_on=False,
         reason=(
             f"requested fan level {requested_fan_speed_level} is above 5 and Office is "
-            f"{office_zone.current_temp:.1f}{comparison}{threshold:.1f}, one degree beyond its enable threshold; "
+            f"{office_zone.current_temp:.1f}{comparison}{threshold:.1f}, at or beyond its high-fan closing threshold; "
             "another zone remains open for safety"
         ),
         discretionary=False,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import math
 import re
 from collections.abc import Iterable
@@ -44,18 +43,17 @@ from .constants import (
     INITIAL_IDLE_HEAT_BLEND_FACTOR,
     INITIAL_IDLE_HEAT_GAP_THRESHOLD,
     MIN_IDLE_SECONDS,
-    LOGGER_NAME,
     MAX_HEAT_SETPOINT,
     MIN_HEAT_SETPOINT,
 )
 from .idle_demand_forecast import IdleDemandForecast
 from .models import DemandSnapshot, DispatchPlan, EquipmentDemand, SystemConfig, ZoneRuntimeState
-from .logging_control import install_temptamer_log_filter
+from .logging_control import get_temptamer_logger, install_temptamer_log_filter
 from .state_reader import parse_float
 
 
-LOGGER = logging.getLogger(LOGGER_NAME)
 install_temptamer_log_filter()
+LOGGER = get_temptamer_logger()
 IDLE_HEAT_ALLOWED_STEPS = (0, -1, -2, -3, -4, -5, -6, -7, -11)
 IDLE_HEAT_UNWIND_LADDER = (-11, -7, -6, -5, -4, -3, -2, -1)
 LEVEL_FAN_MODE_PATTERN = re.compile(r"^level\s+([1-9]\d*)$", re.IGNORECASE)

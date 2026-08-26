@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import (
     COMFORT_ADJUSTMENT_TRIGGER_ENTITIES,
+    COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE,
+    COMFORT_SCORE_SEMANTICS_STATE_FILE,
+    COMFORT_SCORE_SEMANTICS_VERSION,
     DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
     DEFAULT_SYSTEM_CONFIG,
     EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
@@ -58,7 +60,6 @@ from .constants import (
     HVAC_START_FAN_RAMP_MIN_OFF_SECONDS,
     HVAC_COOL,
     HVAC_HEAT,
-    LOGGER_NAME,
     SWITCH_STATE_SETTLE_SECONDS,
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
@@ -71,7 +72,7 @@ from .heatpump_dispatcher import (
     resolve_heat_demand_fan_boost,
     resolve_idle_started_at,
 )
-from .logging_control import install_temptamer_log_filter
+from .logging_control import get_temptamer_logger, install_temptamer_log_filter
 from .idle_demand_forecast import (
     IdleDemandForecast,
     WeatherForecastPoint,
@@ -177,8 +178,8 @@ if USING_PYTHON_IMPORTS and "state" not in globals():  # pragma: no cover - used
     state = _StateRuntime()
 
 
-LOGGER = logging.getLogger(LOGGER_NAME)
 install_temptamer_log_filter()
+LOGGER = get_temptamer_logger()
 
 CONTROL_PASS_TASK_NAME = f"{APP_NAME}_control_pass"
 COMFORT_ADJUSTMENT_PASS_TASK_NAME = f"{APP_NAME}_comfort_adjustment_pass"
@@ -253,11 +254,15 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_adjustment_fabric_solar_filter_values": {},
     "comfort_adjustment_fabric_solar_filter_updated_at": {},
     "comfort_adjustment_fabric_solar_filter_seeded_at": {},
+    "comfort_adjustment_fabric_solar_filter_restore_checked": False,
     "comfort_adjustment_last_valid_cover_positions": {},
     "comfort_adjustment_last_published_adjustments": {},
     "comfort_adjustment_last_valid": {},
     "comfort_adjustment_last_valid_mode": None,
     "comfort_adjustment_calibration_parameters": None,
+    "comfort_score_semantics_restore_checked": False,
+    "comfort_score_semantics_version": None,
+    "comfort_score_semantics_migration_in_progress": False,
     "idle_demand_forecast_weather_points": (),
     "idle_demand_forecast_weather_fetched_at": None,
     "idle_demand_forecast_weather_error": None,
@@ -345,11 +350,16 @@ class _ForecastComfortAdjustmentProvider:
         snapshot,
         cover_facades: dict[str, str | None],
         cover_position_overrides: dict[str, tuple[float, str]],
+        filtered_solar_irradiances: dict[str, float | None],
     ):
         self._controller = controller
         self._snapshot = snapshot
         self._cover_facades = cover_facades
         self._cover_position_overrides = cover_position_overrides
+        # Weather forecasts have condition but no future irradiance.  Retain
+        # the currently filtered fabric state so a forecast does not make the
+        # delayed solar term disappear between adjacent control passes.
+        self._filtered_solar_irradiances = dict(filtered_solar_irradiances)
 
     def __call__(self, at: datetime, outdoor_temperature: float | None, condition: str | None) -> dict[str, float] | None:
         if outdoor_temperature is None:
@@ -371,6 +381,7 @@ class _ForecastComfortAdjustmentProvider:
             effective_wall_outdoor_temperatures=effective_temperatures,
             filter_warming_up={},
             cover_position_overrides=self._cover_position_overrides,
+            filtered_solar_irradiances=self._filtered_solar_irradiances,
             reference_zone_targets=self._snapshot.base_zone_targets,
             last_valid_operating_mode=RUNTIME_STATE.get("comfort_adjustment_last_valid_mode"),
             now=at,
@@ -483,6 +494,7 @@ def _resolve_idle_demand_forecast(
             snapshot,
             _resolve_cover_facades(),
             _resolve_cover_position_overrides(controller, now),
+            _current_filtered_solar_irradiances(controller, now),
         )
     return forecast_idle_demand(
         snapshot,
@@ -581,6 +593,172 @@ def _comfort_adjustment_runtime_mapping(key: str) -> dict[str, object]:
     values = {}
     RUNTIME_STATE[key] = values
     return values
+
+
+def _normalize_comfort_adjustment_timestamp(value: object | None) -> datetime | None:
+    """Accept Home Assistant and persisted ISO timestamps."""
+    normalized = _normalize_runtime_datetime(value)
+    if normalized is not None or not isinstance(value, str):
+        return normalized
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _normalize_runtime_datetime(parsed)
+
+
+@pyscript_executor
+def _read_comfort_fabric_solar_filter_state(file_path):
+    """Read persisted filter memory without importing JSON in PyScript context."""
+    import json
+
+    try:
+        with open(file_path, encoding="utf-8") as state_file:
+            persisted_state = json.load(state_file)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, str(exc)
+    except (TypeError, ValueError) as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(persisted_state, dict):
+        return None, "state must be an object"
+    return persisted_state, None
+
+
+@pyscript_executor
+def _write_comfort_fabric_solar_filter_state(file_path, persisted_state):
+    """Atomically persist the delayed fabric-solar filter memory."""
+    import json
+    import os
+
+    temporary_file_path = f"{file_path}.tmp"
+    try:
+        with open(temporary_file_path, "w", encoding="utf-8") as state_file:
+            json.dump(persisted_state, state_file, sort_keys=True, separators=(",", ":"))
+            state_file.write("\n")
+        os.replace(temporary_file_path, file_path)
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            os.unlink(temporary_file_path)
+        except OSError:
+            pass
+        return str(exc)
+    return None
+
+
+def _restore_comfort_fabric_solar_filter_state() -> None:
+    """Restore valid fabric-filter samples once per PyScript module lifetime."""
+    if RUNTIME_STATE.get("comfort_adjustment_fabric_solar_filter_restore_checked"):
+        return
+    RUNTIME_STATE["comfort_adjustment_fabric_solar_filter_restore_checked"] = True
+
+    persisted_state, read_error = _read_comfort_fabric_solar_filter_state(
+        COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE
+    )
+    if read_error is not None:
+        LOGGER.warning("COMFORT ADJUSTMENT: unable to restore fabric-solar filters: %s", read_error)
+        return
+    if persisted_state is None:
+        return
+    if persisted_state.get("version") != 1:
+        LOGGER.warning("COMFORT ADJUSTMENT: ignoring fabric-solar filters with an unsupported state version")
+        return
+
+    raw_values = persisted_state.get("values")
+    raw_updated_at = persisted_state.get("updated_at")
+    raw_seeded_at = persisted_state.get("seeded_at")
+    if not isinstance(raw_values, dict) or not isinstance(raw_updated_at, dict) or not isinstance(raw_seeded_at, dict):
+        LOGGER.warning("COMFORT ADJUSTMENT: ignoring malformed fabric-solar filter state")
+        return
+
+    values = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_values")
+    updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_updated_at")
+    seeded_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_seeded_at")
+    restored_count = 0
+    for filter_key, raw_value in raw_values.items():
+        if not isinstance(filter_key, str):
+            continue
+        value = parse_float(raw_value)
+        updated_timestamp = _normalize_comfort_adjustment_timestamp(raw_updated_at.get(filter_key))
+        seeded_timestamp = _normalize_comfort_adjustment_timestamp(raw_seeded_at.get(filter_key))
+        if value is None or value < 0.0 or updated_timestamp is None or seeded_timestamp is None:
+            continue
+        values[filter_key] = value
+        updated_at[filter_key] = updated_timestamp
+        seeded_at[filter_key] = seeded_timestamp
+        restored_count += 1
+    if restored_count:
+        LOGGER.info("COMFORT ADJUSTMENT: restored %s fabric-solar filter sample(s)", restored_count)
+
+
+def _persist_comfort_fabric_solar_filter_state() -> None:
+    """Save serializable fabric-filter memory after a live sample or reset."""
+    values = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_values")
+    updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_updated_at")
+    seeded_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_seeded_at")
+    persisted_values: dict[str, float] = {}
+    persisted_updated_at: dict[str, str] = {}
+    persisted_seeded_at: dict[str, str] = {}
+    for filter_key, raw_value in values.items():
+        if not isinstance(filter_key, str):
+            continue
+        value = parse_float(raw_value)
+        updated_timestamp = _normalize_comfort_adjustment_timestamp(updated_at.get(filter_key))
+        seeded_timestamp = _normalize_comfort_adjustment_timestamp(seeded_at.get(filter_key))
+        if value is None or value < 0.0 or updated_timestamp is None or seeded_timestamp is None:
+            continue
+        persisted_values[filter_key] = value
+        persisted_updated_at[filter_key] = updated_timestamp.isoformat()
+        persisted_seeded_at[filter_key] = seeded_timestamp.isoformat()
+
+    write_error = _write_comfort_fabric_solar_filter_state(
+        COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE,
+        {
+            "version": 1,
+            "values": persisted_values,
+            "updated_at": persisted_updated_at,
+            "seeded_at": persisted_seeded_at,
+        },
+    )
+    if write_error is not None:
+        _comfort_adjustment_warn_once(
+            "fabric-solar-filter-persist-failed",
+            f"unable to persist fabric-solar filters: {write_error}",
+        )
+
+
+def _clear_comfort_fabric_solar_filter_memory() -> bool:
+    """Forget delayed solar heat when it cannot be physically present."""
+    values = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_values")
+    updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_updated_at")
+    seeded_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_seeded_at")
+    changed = False
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        filter_key = f"fabric_solar_{zone.key}"
+        for mapping in (values, updated_at, seeded_at):
+            if filter_key in mapping:
+                mapping.pop(filter_key, None)
+                changed = True
+    return changed
+
+
+def _fabric_solar_source_is_stale(controller: PyscriptController, now: datetime) -> bool:
+    entity_id = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id
+    timestamp = _normalize_comfort_adjustment_timestamp(controller.get_attr(entity_id, "last_updated"))
+    if timestamp is None:
+        timestamp = _normalize_comfort_adjustment_timestamp(controller.get_attr(entity_id, "last_changed"))
+    if timestamp is None:
+        return False
+    age_seconds = (now - timestamp).total_seconds()
+    return age_seconds > DEFAULT_COMFORT_ADJUSTMENT_CONFIG.input_stale_after_seconds
+
+
+def _fabric_solar_is_below_horizon(controller: PyscriptController) -> bool:
+    elevation = parse_float(
+        controller.get_attr(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.sun_entity_id, "elevation")
+    )
+    return elevation is not None and elevation <= 0.0
 
 
 def _update_outdoor_temperature_filter(
@@ -688,6 +866,18 @@ def _resolve_filtered_solar_irradiances(
     now: datetime,
 ) -> dict[str, float | None]:
     """Low-pass measured irradiance for each zone with a fabric calibration."""
+    _restore_comfort_fabric_solar_filter_state()
+    filtered_irradiances: dict[str, float | None] = {
+        zone.key: None for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+    }
+    # A positive irradiance sample cannot produce retained solar warmth after
+    # sunset.  The source timestamp also protects against a weather station
+    # that froze while reporting a daytime value.
+    if _fabric_solar_is_below_horizon(controller) or _fabric_solar_source_is_stale(controller, now):
+        if _clear_comfort_fabric_solar_filter_memory():
+            _persist_comfort_fabric_solar_filter_state()
+        return filtered_irradiances
+
     irradiance = parse_float(
         controller.get_state(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id)
     )
@@ -700,11 +890,10 @@ def _resolve_filtered_solar_irradiances(
     seeded_at = _comfort_adjustment_runtime_mapping(
         "comfort_adjustment_fabric_solar_filter_seeded_at"
     )
-    filtered_irradiances: dict[str, float | None] = {}
+    has_live_filter_update = False
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         fabric_solar = zone.fabric_solar
         if fabric_solar is None or irradiance is None or irradiance < 0.0:
-            filtered_irradiances[zone.key] = None
             continue
         time_constant_seconds = int(
             getattr(fabric_solar, "filter_time_constant_seconds", 0)
@@ -720,7 +909,52 @@ def _resolve_filtered_solar_irradiances(
             filter_seeded_at=seeded_at,
         )
         filtered_irradiances[zone.key] = filtered_irradiance
+        has_live_filter_update = True
+    if has_live_filter_update:
+        _persist_comfort_fabric_solar_filter_state()
     return filtered_irradiances
+
+
+def _current_filtered_solar_irradiances(
+    controller: PyscriptController,
+    now: datetime,
+) -> dict[str, float | None]:
+    """Return usable current fabric warmth without mutating filter state.
+
+    Idle-demand forecasting has no future irradiance series.  It therefore
+    carries this live, already-filtered state through its short horizon rather
+    than treating every forecast minute as zero solar warmth.
+    """
+    _restore_comfort_fabric_solar_filter_state()
+    current: dict[str, float | None] = {
+        zone.key: None for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+    }
+    irradiance = parse_float(
+        controller.get_state(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_radiation_entity_id)
+    )
+    if (
+        irradiance is None
+        or irradiance < 0.0
+        or _fabric_solar_is_below_horizon(controller)
+        or _fabric_solar_source_is_stale(controller, now)
+    ):
+        return current
+
+    values = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_values")
+    updated_at = _comfort_adjustment_runtime_mapping("comfort_adjustment_fabric_solar_filter_updated_at")
+    for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+        if zone.fabric_solar is None:
+            continue
+        filter_key = f"fabric_solar_{zone.key}"
+        filtered_irradiance = parse_float(values.get(filter_key))
+        timestamp = _normalize_comfort_adjustment_timestamp(updated_at.get(filter_key))
+        if filtered_irradiance is None or filtered_irradiance < 0.0 or timestamp is None:
+            continue
+        age_seconds = (now - timestamp).total_seconds()
+        if age_seconds > DEFAULT_COMFORT_ADJUSTMENT_CONFIG.input_stale_after_seconds:
+            continue
+        current[zone.key] = filtered_irradiance
+    return current
 
 
 def _resolve_cover_position_overrides(controller: PyscriptController, now: datetime) -> dict[str, tuple[float, str]]:
@@ -864,7 +1098,13 @@ def _reference_zone_targets_for_comfort_adjustments(
     return snapshot.base_zone_targets
 
 
-def _resolve_published_comfort_adjustments(result, now: datetime, controller: PyscriptController) -> dict[str, dict[str, object]]:
+def _resolve_published_comfort_adjustments(
+    result,
+    now: datetime,
+    controller: PyscriptController,
+    *,
+    force_reseed: bool = False,
+) -> dict[str, dict[str, object]]:
     """Apply output hysteresis and retain a short, explicit last-valid hold."""
     last_valid = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid")
     last_published = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_published_adjustments")
@@ -875,7 +1115,7 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
         if result.calculation_validity[zone_key]:
             raw_adjustment = result.raw_adjustments[zone_key]
             rounded_adjustment = result.adjustments[zone_key]
-            filtered_adjustment = apply_adjustment_hysteresis(
+            filtered_adjustment = rounded_adjustment if force_reseed else apply_adjustment_hysteresis(
                 raw_adjustment,
                 previous_adjustment,
                 DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
@@ -896,7 +1136,7 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
             elapsed_seconds = (
                 (now - previous_published_at).total_seconds() if previous_published_at is not None else None
             )
-            if previous_rate_limited_value is not None:
+            if previous_rate_limited_value is not None and not force_reseed:
                 if elapsed_seconds is None:
                     allowed_change = (
                         DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_celsius
@@ -915,8 +1155,8 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
                         previous_rate_limited_value,
                         allowed_change,
                     )
-            rate_limited_adjustment = filtered_adjustment
-            filtered_adjustment = round_comfort_adjustment(rate_limited_adjustment)
+            rate_limited_adjustment = raw_adjustment if force_reseed else filtered_adjustment
+            filtered_adjustment = rounded_adjustment if force_reseed else round_comfort_adjustment(rate_limited_adjustment)
             last_published[zone_key] = {
                 "at": now,
                 "unrounded_value": rate_limited_adjustment,
@@ -934,8 +1174,27 @@ def _resolve_published_comfort_adjustments(result, now: datetime, controller: Py
                 "rounded_adjustment": rounded_adjustment,
                 "filtered_adjustment": filtered_adjustment,
                 "unrounded_rate_limited_adjustment": rate_limited_adjustment,
-                "calculation_status": "calculated",
+                "calculation_status": "reseeded" if force_reseed else "calculated",
                 "last_valid_age_seconds": 0.0,
+            }
+            continue
+
+        if force_reseed:
+            # Never preserve a legacy-polarity helper value when source data
+            # is unavailable during the one-time score migration.
+            last_valid.pop(zone_key, None)
+            last_published[zone_key] = {
+                "at": now,
+                "unrounded_value": 0.0,
+                "value": 0.0,
+            }
+            publications[zone_key] = {
+                "raw_adjustment": 0.0,
+                "rounded_adjustment": 0.0,
+                "filtered_adjustment": 0.0,
+                "unrounded_rate_limited_adjustment": 0.0,
+                "calculation_status": "reseeded_unavailable",
+                "last_valid_age_seconds": None,
             }
             continue
 
@@ -1037,7 +1296,7 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         )
 
 
-def run_comfort_adjustment_pass(*, reason: str) -> None:
+def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> None:
     """Calculate and publish independent per-zone comfort adjustments."""
     task.unique(COMFORT_ADJUSTMENT_PASS_TASK_NAME)
 
@@ -1077,7 +1336,12 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
     )
     if result.operating_mode is not None and result.operating_mode_source != "last_valid_mode":
         RUNTIME_STATE["comfort_adjustment_last_valid_mode"] = {"mode": result.operating_mode, "at": now}
-    publications = _resolve_published_comfort_adjustments(result, now, controller)
+    publications = _resolve_published_comfort_adjustments(
+        result,
+        now,
+        controller,
+        force_reseed=force_reseed,
+    )
     published_adjustments: list[str] = []
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         adjustment = publications[zone.key]["filtered_adjustment"]
@@ -1123,12 +1387,28 @@ def run_comfort_adjustment_pass(*, reason: str) -> None:
     )
 
 
-def _run_comfort_adjustment_pass(*, reason: str) -> None:
+def _run_comfort_adjustment_pass(*, reason: str) -> bool:
+    force_reseed = _comfort_score_semantics_requires_migration()
+    if force_reseed and RUNTIME_STATE.get("comfort_score_semantics_migration_in_progress"):
+        return False
     try:
-        run_comfort_adjustment_pass(reason=reason)
+        if force_reseed:
+            RUNTIME_STATE["comfort_score_semantics_migration_in_progress"] = True
+        run_comfort_adjustment_pass(reason=reason, force_reseed=force_reseed)
+        if force_reseed:
+            _persist_comfort_score_semantics_version()
+            LOGGER.info(
+                "COMFORT ADJUSTMENT: reseeded helpers for comfort-score semantics version %s",
+                COMFORT_SCORE_SEMANTICS_VERSION,
+            )
+        return True
     except Exception as exc:  # pragma: no cover - exercised in Home Assistant runtime
         RUNTIME_STATE["comfort_adjustment_last_error"] = str(exc)
         LOGGER.exception("COMFORT ADJUSTMENT: pass failed")
+        return False
+    finally:
+        if force_reseed:
+            RUNTIME_STATE["comfort_score_semantics_migration_in_progress"] = False
 
 
 def _describe_open_zones(open_zones: tuple[str, ...]) -> str:
@@ -1482,6 +1762,59 @@ def _persist_heat_demand_fan_boost_state(fan_boost_level: int) -> None:
     )
     if write_error is not None:
         LOGGER.warning("FAN BOOST: failed to persist state: %s", write_error)
+
+
+@pyscript_executor
+def _read_comfort_score_semantics_version(file_path):
+    """Read the helper-value convention used by the previous app version."""
+    try:
+        with open(file_path, encoding="utf-8") as state_file:
+            raw_version = state_file.read().strip()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, str(exc)
+    try:
+        return int(raw_version), None
+    except ValueError:
+        return None, f"invalid semantics version {raw_version!r}"
+
+
+@pyscript_executor
+def _write_comfort_score_semantics_version(file_path, version):
+    """Persist the convention only after all helpers have been reseeded."""
+    try:
+        with open(file_path, "w", encoding="utf-8") as state_file:
+            state_file.write(f"{int(version)}\n")
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _comfort_score_semantics_requires_migration() -> bool:
+    """Return whether existing helper values may use an old score polarity."""
+    if not RUNTIME_STATE.get("comfort_score_semantics_restore_checked"):
+        RUNTIME_STATE["comfort_score_semantics_restore_checked"] = True
+        persisted_version, read_error = _read_comfort_score_semantics_version(
+            COMFORT_SCORE_SEMANTICS_STATE_FILE
+        )
+        if read_error is not None:
+            LOGGER.warning("COMFORT ADJUSTMENT: unable to read score semantics state: %s", read_error)
+        RUNTIME_STATE["comfort_score_semantics_version"] = persisted_version
+    return RUNTIME_STATE.get("comfort_score_semantics_version") != COMFORT_SCORE_SEMANTICS_VERSION
+
+
+def _persist_comfort_score_semantics_version() -> None:
+    """Mark the helpers safe only after a forced score reseed completed."""
+    write_error = _write_comfort_score_semantics_version(
+        COMFORT_SCORE_SEMANTICS_STATE_FILE,
+        COMFORT_SCORE_SEMANTICS_VERSION,
+    )
+    if write_error is not None:
+        LOGGER.warning("COMFORT ADJUSTMENT: unable to persist score semantics state: %s", write_error)
+    # Keep this app lifetime safe even if the disk state cannot be updated; on
+    # the next reload it will conservatively reseed again.
+    RUNTIME_STATE["comfort_score_semantics_version"] = COMFORT_SCORE_SEMANTICS_VERSION
 
 
 def _is_free_power_price_state(value: object | None) -> bool:
@@ -2449,10 +2782,29 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _publish_runtime_state("running")
 
 
+def _ensure_comfort_score_semantics_migrated() -> bool:
+    """Reseed old-polarity helpers before a control snapshot can read them."""
+    # Helpers created by a previous target-offset polarity must never reach a
+    # control snapshot.  The independent publisher is run synchronously once
+    # to replace all five values before this pass reads them.
+    if RUNTIME_STATE.get("comfort_score_semantics_migration_in_progress"):
+        return False
+    if _comfort_score_semantics_requires_migration():
+        return _run_comfort_adjustment_pass(reason="score-semantics migration before control")
+    return True
+
+
 def _run_enabled_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None:
     if not _control_is_enabled():
         LOGGER.info("TempTamer control is disabled; skipping trigger '%s'", reason)
         _publish_runtime_state("stopped")
+        return
+
+    if RUNTIME_STATE.get("comfort_score_semantics_migration_in_progress"):
+        LOGGER.info("COMFORT ADJUSTMENT: deferring control while score helpers are being reseeded")
+        return
+    if not _ensure_comfort_score_semantics_migrated():
+        LOGGER.warning("COMFORT ADJUSTMENT: control deferred until score-semantics reseed succeeds")
         return
 
     try:
@@ -2510,6 +2862,9 @@ fields:
     selector:
       text:
 """
+    if not _ensure_comfort_score_semantics_migrated():
+        LOGGER.warning("COMFORT ADJUSTMENT: manual control deferred until score-semantics reseed succeeds")
+        return
     run_control_pass(reason=reason)
 
 
