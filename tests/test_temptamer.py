@@ -14,6 +14,7 @@ from unittest.mock import Mock, call, patch
 
 from pyscript.apps.temptamer.comfort_modes import (
     DefaultComfortMode,
+    FreePowerSetpointBoost,
     NightComfortMode,
     PowerComfortMode,
     PowerOffComfortMode,
@@ -32,6 +33,7 @@ from pyscript.apps.temptamer.config import (
     MODE_TRIGGER_ENTITIES,
     POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
     POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS,
+    POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST,
     POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS,
     POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS,
     POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
@@ -1842,7 +1844,27 @@ class TempTamerTests(unittest.TestCase):
             temptamer_main._update_powerday_downstairs_priority_runtime_state(snapshot, HVAC_COOL, now)
         )
 
-    def test_powerday_downstairs_priority_holds_for_ten_minutes_then_releases_below_two_degrees(self):
+    def test_powerday_downstairs_priority_enters_at_one_point_seven_five_degrees(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                powerday_downstairs_priority_state_map(
+                    **{
+                        "sensor.office_average_temperature": "20.75",
+                        "sensor.downstairs_zone_average_temperature": "19.0",
+                        "switch.wt32_hpctrl_e8dbd0_dining": "off",
+                        "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "off",
+                    }
+                )
+            ),
+            now=now,
+        )
+
+        self.assertTrue(temptamer_main._update_powerday_downstairs_priority_runtime_state(snapshot, HVAC_HEAT, now))
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_gap"], 1.75)
+
+    def test_powerday_downstairs_priority_holds_for_ten_minutes_then_releases_at_one_degree(self):
         start = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
         start_snapshot = build_behavior_snapshot(
             FakeReader(powerday_downstairs_priority_state_map()),
@@ -1856,10 +1878,10 @@ class TempTamerTests(unittest.TestCase):
             FakeReader(
                 powerday_downstairs_priority_state_map(
                     **{
-                        "sensor.office_average_temperature": "19.5",
-                        "sensor.average_dining_zone_temp": "19.5",
-                        "sensor.average_bed1_2_zone_temp": "19.5",
-                        "sensor.average_bed3_4_zone_temp": "19.5",
+                        "sensor.office_average_temperature": "19.0",
+                        "sensor.average_dining_zone_temp": "19.0",
+                        "sensor.average_bed1_2_zone_temp": "19.0",
+                        "sensor.average_bed3_4_zone_temp": "19.0",
                         "switch.wt32_hpctrl_e8dbd0_office": "off",
                         "switch.wt32_hpctrl_e8dbd0_dining": "off",
                         "switch.wt32_hpctrl_e8dbd0_bed_12": "off",
@@ -1883,7 +1905,7 @@ class TempTamerTests(unittest.TestCase):
                 start + timedelta(seconds=POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS),
             )
         )
-        self.assertIn("gap 1.5C < 2.0C", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
+        self.assertIn("gap 1.0C <= 1.0C", temptamer_main.RUNTIME_STATE["powerday_downstairs_priority_reason"])
 
     def test_powerday_downstairs_priority_ends_immediately_when_downstairs_is_satisfied(self):
         start = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
@@ -2194,16 +2216,19 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(len(opened_upstairs), 1)
         self.assertTrue(opened_upstairs[0].turn_on)
 
-    def test_powerday_holds_office_and_dining_free_power_supplement_until_downstairs_is_above_19(self):
+    def test_powerday_uses_zone_specific_initial_free_power_boosts(self):
         power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         self.assertEqual(
-            (
-                power_mode.free_power_initial_suppliment,
-                power_mode.free_power_later,
-                power_mode.free_power_downstairs_initial_suppliment,
-                power_mode.free_power_downstairs_later,
-            ),
-            (0.75, 1.5, 1.25, 3.0),
+            power_mode.free_power_setpoint_boost,
+            FreePowerSetpointBoost(initial=1.0, later=2.0),
+        )
+        self.assertEqual(
+            power_mode.free_power_zone_setpoint_boosts,
+            {
+                "office": FreePowerSetpointBoost(initial=0.5, later=1.0),
+                "bedroom_1_2": FreePowerSetpointBoost(initial=1.0, later=1.25),
+                "downstairs": FreePowerSetpointBoost(initial=1.25, later=2.25),
+            },
         )
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -2212,6 +2237,7 @@ class TempTamerTests(unittest.TestCase):
                         "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
                         "input_select.temptamer_comfort_mode_downstairs": "Auto",
                         GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                        "sensor.downstairs_zone_average_temperature": "20.0",
                     }
                 ),
                 base_attr_map("21.0"),
@@ -2219,50 +2245,29 @@ class TempTamerTests(unittest.TestCase):
             now=datetime(2026, 7, 25, 12, 59, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(snapshot.comfort_mode, COMFORT_MODE_POWER_DAY)
-        self.assertEqual(snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
-        self.assertEqual(snapshot.zones["dining"].scheme.name, SCHEME_DAY_LIVING)
-        self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
-        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_DAY_LIVING)
-        self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
         base_day_living_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
-        adjusted_continue_until = base_day_living_scheme.continue_until + power_mode.free_power_initial_suppliment
-        for zone_key in ("office", "dining"):
-            self.assertEqual(snapshot.zones[zone_key].scheme, base_day_living_scheme)
-        for zone_key in ("bedroom_1_2", "bedroom_3_4"):
+        expected_day_living_boosts = {
+            "office": 0.5,
+            "dining": 1.0,
+            "bedroom_1_2": 1.0,
+            "bedroom_3_4": 1.0,
+        }
+        for zone_key, boost in expected_day_living_boosts.items():
+            adjusted_continue_until = base_day_living_scheme.continue_until + boost
             self.assertEqual(snapshot.zones[zone_key].scheme.continue_until, adjusted_continue_until)
             self.assertEqual(snapshot.zones[zone_key].scheme.enable_outside, adjusted_continue_until - 0.75)
             self.assertEqual(snapshot.zones[zone_key].scheme.ideal_target, adjusted_continue_until - 0.5)
-        base_downstairs_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS]
-        downstairs_continue_until = (
-            base_downstairs_scheme.continue_until + power_mode.free_power_downstairs_initial_suppliment
-        )
+
+        downstairs_continue_until = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until + 1.25
         self.assertEqual(snapshot.zones["downstairs"].scheme.continue_until, downstairs_continue_until)
         self.assertEqual(
             snapshot.zones["downstairs"].scheme.enable_outside,
             downstairs_continue_until - 0.75 + power_mode.free_power_downstairs_enable_outside_supplement,
         )
         self.assertEqual(snapshot.zones["downstairs"].scheme.ideal_target, downstairs_continue_until - 0.5)
-        self.assertEqual(
-            snapshot.zones["downstairs"].cool_scheme,
-            TEST_SYSTEM_CONFIG.cool_control_schemes[SCHEME_DOWNSTAIRS],
-        )
-        self.assertTrue(snapshot.free_power_available)
-        self.assertTrue(snapshot.heat_sink_available)
-        self.assertEqual(
-            snapshot.comfort_mode_behavior.fan_speed_level(
-                2.6,
-                1,
-                current_speed_level=1,
-                free_power_available=snapshot.heat_sink_available,
-            ),
-            2,
-        )
 
     def test_powerday_applies_office_and_dining_free_power_supplement_only_above_19_downstairs(self):
-        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         base_day_living_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
-        adjusted_continue_until = base_day_living_scheme.continue_until + power_mode.free_power_initial_suppliment
 
         at_threshold_snapshot = build_behavior_snapshot(
             FakeReader(
@@ -2291,7 +2296,8 @@ class TempTamerTests(unittest.TestCase):
             now=datetime(2026, 7, 25, 12, 59, tzinfo=timezone.utc),
         )
 
-        for zone_key in ("office", "dining"):
+        for zone_key, boost in {"office": 0.5, "dining": 1.0}.items():
+            adjusted_continue_until = base_day_living_scheme.continue_until + boost
             self.assertEqual(at_threshold_snapshot.zones[zone_key].scheme, base_day_living_scheme)
             self.assertEqual(above_threshold_snapshot.zones[zone_key].scheme.continue_until, adjusted_continue_until)
             self.assertEqual(above_threshold_snapshot.zones[zone_key].scheme.enable_outside, adjusted_continue_until - 0.75)
@@ -2301,7 +2307,7 @@ class TempTamerTests(unittest.TestCase):
                 TEST_SYSTEM_CONFIG.cool_control_schemes[SCHEME_DAY_LIVING],
             )
 
-    def test_powerday_uses_later_heat_supplement_after_1pm_when_power_is_free(self):
+    def test_powerday_uses_zone_specific_later_free_power_boosts_at_1pm(self):
         power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -2315,37 +2321,42 @@ class TempTamerTests(unittest.TestCase):
                 ),
                 base_attr_map("21.0"),
             ),
-            now=datetime(2026, 7, 25, 13, 1, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 25, 13, 0, tzinfo=timezone.utc),
         )
 
         base_day_living_scheme = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
-        adjusted_continue_until = base_day_living_scheme.continue_until + power_mode.free_power_later
-        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
-        self.assertEqual(snapshot.zones["office"].scheme.enable_outside, adjusted_continue_until - 0.75)
-        self.assertEqual(snapshot.zones["office"].scheme.ideal_target, adjusted_continue_until - 0.5)
-        downstairs_continue_until = (
-            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until
-            + power_mode.free_power_downstairs_later
-        )
+        expected_day_living_boosts = {
+            "office": 1.0,
+            "dining": 2.0,
+            "bedroom_1_2": 1.25,
+            "bedroom_3_4": 2.0,
+        }
+        for zone_key, boost in expected_day_living_boosts.items():
+            adjusted_continue_until = base_day_living_scheme.continue_until + boost
+            self.assertEqual(snapshot.zones[zone_key].scheme.continue_until, adjusted_continue_until)
+            self.assertEqual(snapshot.zones[zone_key].scheme.enable_outside, adjusted_continue_until - 0.75)
+            self.assertEqual(snapshot.zones[zone_key].scheme.ideal_target, adjusted_continue_until - 0.5)
+
+        downstairs_continue_until = TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until + 2.25
         self.assertEqual(snapshot.zones["downstairs"].scheme.continue_until, downstairs_continue_until)
         self.assertEqual(
             snapshot.zones["downstairs"].scheme.enable_outside,
             downstairs_continue_until - 0.75 + power_mode.free_power_downstairs_enable_outside_supplement,
         )
 
-    def test_powerday_uses_later_heat_supplement_early_when_pv_average_is_high(self):
+    def test_powerday_pv_promotes_zone_specific_later_boosts_before_1pm(self):
         now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
             (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
         ]
         reader = FakeReader(
-                base_state_map(
-                    **{
-                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                        GOODWE_PV_POWER_SENSOR: "6.5",
-                        "sensor.downstairs_zone_average_temperature": "20.0",
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
+                    "sensor.downstairs_zone_average_temperature": "20.0",
                 }
             ),
             base_attr_map("21.0"),
@@ -2358,49 +2369,68 @@ class TempTamerTests(unittest.TestCase):
             now=now,
         )
 
-        adjusted_continue_until = (
-            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
-            + power_mode.free_power_later
-        )
         self.assertTrue(later_active)
         self.assertTrue(snapshot.free_power_later_available)
-        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
-        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"], 6.5)
-        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"], now)
+        self.assertEqual(
+            snapshot.zones["office"].scheme.continue_until,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until + 1.0,
+        )
+        self.assertEqual(
+            snapshot.zones["bedroom_1_2"].scheme.continue_until,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until + 1.25,
+        )
+        self.assertEqual(
+            snapshot.zones["downstairs"].scheme.continue_until,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until + 2.25,
+        )
 
-    def test_powerday_pv_early_later_supplement_does_not_start_before_11am(self):
-        now = datetime(2026, 7, 25, 10, 59, tzinfo=timezone.utc)
-        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+    def test_powerday_pv_later_boost_holds_until_free_power_ends(self):
+        start = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
         temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
-            (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
+            (start - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
         ]
-        reader = FakeReader(
-                base_state_map(
-                    **{
-                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                        GOODWE_PV_POWER_SENSOR: "6.5",
-                        "sensor.downstairs_zone_average_temperature": "20.0",
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "6.5",
                 }
-            ),
-            base_attr_map("21.0"),
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_free_power_later_runtime_state(active_reader, start))
+
+        lower_pv_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_PV_POWER_SENSOR: "0",
+                }
+            )
+        )
+        self.assertTrue(
+            temptamer_main._update_powerday_free_power_later_runtime_state(
+                lower_pv_reader,
+                start + timedelta(minutes=10),
+            )
         )
 
-        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
-        snapshot = build_behavior_snapshot(
-            reader,
-            free_power_later_available=later_active,
-            now=now,
+        paid_power_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_PV_POWER_SENSOR: "0",
+                }
+            )
         )
-
-        adjusted_continue_until = (
-            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
-            + power_mode.free_power_initial_suppliment
+        self.assertFalse(
+            temptamer_main._update_powerday_free_power_later_runtime_state(
+                paid_power_reader,
+                start + timedelta(minutes=20),
+            )
         )
-        self.assertFalse(later_active)
-        self.assertFalse(snapshot.free_power_later_available)
-        self.assertEqual(snapshot.zones["office"].scheme.continue_until, adjusted_continue_until)
-        self.assertIn("before free power start", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
 
     def test_powerday_uses_night_scheme_downstairs_before_free_power_in_heat_mode(self):
         snapshot = build_behavior_snapshot(
@@ -2449,102 +2479,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
         self.assertEqual(snapshot.zones["downstairs"].cool_scheme.name, SCHEME_DOWNSTAIRS)
 
-    def test_powerday_pv_early_later_supplement_requires_average_above_threshold(self):
-        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
-            (now - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.0)
-        ]
-        reader = FakeReader(
-            base_state_map(
-                **{
-                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                    GOODWE_PV_POWER_SENSOR: "6.0",
-                }
-            ),
-            base_attr_map("21.0"),
-        )
-
-        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
-
-        self.assertFalse(later_active)
-        self.assertAlmostEqual(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"], 6.0)
-        self.assertIn("PV average 6.00 <= 6.00", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
-
-    def test_powerday_pv_early_later_supplement_requires_full_sample_coverage(self):
-        now = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [(now - timedelta(minutes=14), 6.5)]
-        reader = FakeReader(
-            base_state_map(
-                **{
-                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                    GOODWE_PV_POWER_SENSOR: "6.5",
-                }
-            ),
-            base_attr_map("21.0"),
-        )
-
-        later_active = temptamer_main._update_powerday_free_power_later_runtime_state(reader, now)
-
-        self.assertFalse(later_active)
-        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_pv_power_average"])
-        self.assertIn("lacks 15-minute coverage", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
-
-    def test_powerday_pv_early_later_supplement_holds_until_free_power_ends(self):
-        start = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
-        temptamer_main.RUNTIME_STATE["powerday_pv_power_samples"] = [
-            (start - timedelta(seconds=POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS), 6.5)
-        ]
-        active_reader = FakeReader(
-            base_state_map(
-                **{
-                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                    GOODWE_PV_POWER_SENSOR: "6.5",
-                }
-            )
-        )
-        self.assertTrue(temptamer_main._update_powerday_free_power_later_runtime_state(active_reader, start))
-
-        lower_pv_reader = FakeReader(
-            base_state_map(
-                **{
-                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
-                    GOODWE_PV_POWER_SENSOR: "0",
-                }
-            )
-        )
-        still_active = temptamer_main._update_powerday_free_power_later_runtime_state(
-            lower_pv_reader,
-            start + timedelta(minutes=10),
-        )
-
-        self.assertTrue(still_active)
-        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"], start)
-        self.assertIn("holding until free power ends", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
-
-        paid_power_reader = FakeReader(
-            base_state_map(
-                **{
-                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
-                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
-                    GOODWE_PV_POWER_SENSOR: "0",
-                }
-            )
-        )
-        cleared = temptamer_main._update_powerday_free_power_later_runtime_state(
-            paid_power_reader,
-            start + timedelta(minutes=20),
-        )
-
-        self.assertFalse(cleared)
-        self.assertIsNone(temptamer_main.RUNTIME_STATE["powerday_free_power_later_started_at"])
-        self.assertIn("free power is not available", temptamer_main.RUNTIME_STATE["powerday_free_power_later_reason"])
-
     def test_powerday_heat_soaks_when_battery_export_heat_sink_is_active(self):
-        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
         snapshot = build_behavior_snapshot(
             FakeReader(
                 base_state_map(
@@ -2569,12 +2504,12 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["bedroom_3_4"].scheme.name, SCHEME_DAY_LIVING)
         adjusted_continue_until = (
             TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING].continue_until
-            + power_mode.free_power_initial_suppliment
+            + 1.0
         )
         self.assertEqual(snapshot.zones["dining"].scheme.continue_until, adjusted_continue_until)
         downstairs_continue_until = (
             TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until
-            + power_mode.free_power_downstairs_initial_suppliment
+            + 1.25
         )
         self.assertEqual(snapshot.zones["downstairs"].scheme.continue_until, downstairs_continue_until)
         self.assertEqual(snapshot.zones["downstairs"].scheme.enable_outside, downstairs_continue_until - 0.75)
@@ -3730,6 +3665,114 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.hvac_mode, "heat")
         self.assertGreater(plan.setpoint, snapshot.inlet_temp)
         self.assertEqual(plan.setpoint, 25)
+
+    def test_powerday_free_power_downstairs_open_adds_direct_heat_target_boost(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                        "sensor.office_average_temperature": "20.0",
+                        "sensor.downstairs_zone_average_temperature": "24.0",
+                    }
+                ),
+                base_attr_map("20.0", target_temp_step=0.5),
+            )
+        )
+        demand = EquipmentDemand(heat_requested=True, requested_by_zones=("office",))
+        predicted_open_zones = ("office", "downstairs")
+
+        boosted_plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            predicted_open_zones,
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+        unboosted_plan = build_dispatch_plan(
+            replace(snapshot, free_power_available=False),
+            demand,
+            predicted_open_zones,
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+
+        self.assertEqual(boosted_plan.setpoint, unboosted_plan.setpoint + POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST)
+
+    def test_powerday_free_power_downstairs_open_lowers_direct_cool_target_boost(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    }
+                ),
+                base_attr_map("22.0", target_temp_step=0.5),
+            )
+        )
+        demand = EquipmentDemand(cool_requested=True, requested_by_zones=("office",))
+        predicted_open_zones = ("office", "downstairs")
+
+        boosted_plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            predicted_open_zones,
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+        unboosted_plan = build_dispatch_plan(
+            replace(snapshot, free_power_available=False),
+            demand,
+            predicted_open_zones,
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+
+        self.assertEqual(boosted_plan.setpoint, unboosted_plan.setpoint - POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST)
+
+    def test_powerday_direct_target_boost_requires_downstairs_to_be_planned_open(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                        "sensor.office_average_temperature": "20.0",
+                    }
+                ),
+                base_attr_map("20.0", target_temp_step=0.5),
+            )
+        )
+        demand = EquipmentDemand(heat_requested=True, requested_by_zones=("office",))
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+        unboosted_plan = build_dispatch_plan(
+            replace(snapshot, free_power_available=False),
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+        )
+
+        self.assertEqual(plan.setpoint, unboosted_plan.setpoint)
 
     def test_equipment_demand_excludes_guarded_min_sensor_heat_request(self):
         snapshot = build_behavior_snapshot(

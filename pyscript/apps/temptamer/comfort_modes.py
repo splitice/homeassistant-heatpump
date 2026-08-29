@@ -35,6 +35,14 @@ class ComfortModeSnapshotData:
 
 
 @dataclass(frozen=True)
+class FreePowerSetpointBoost:
+    """The initial and 13:00 setpoint increases for one PowerDay zone."""
+
+    initial: float = 1.0
+    later: float = 2.0
+
+
+@dataclass(frozen=True)
 class ComfortMode:
     name: str
 
@@ -157,11 +165,6 @@ class PowerComfortMode(DefaultComfortMode):
     free_power_heat_start_medium_fan_differential: ClassVar[float] = 1.5
     free_power_low_to_medium_fan_differential: ClassVar[float] = 2.5
     free_power_medium_to_low_fan_differential: ClassVar[float] = 1.25
-    free_power_initial_suppliment: ClassVar[float] = 0.75
-    free_power_later: ClassVar[float] = 1.5
-    free_power_downstairs_initial_suppliment: ClassVar[float] = 1.25
-    free_power_downstairs_later: ClassVar[float] = 3.0
-    free_power_later_start: ClassVar[time] = time(13, 0)
     free_power_downstairs_zone_key: ClassVar[str] = "downstairs"
     free_power_downstairs_enable_outside_supplement: ClassVar[float] = 1.0
     free_power_downstairs_temperature_threshold: ClassVar[float] = 19.0
@@ -169,6 +172,12 @@ class PowerComfortMode(DefaultComfortMode):
 
     power_price_entity_id: str = ""
     downstairs_heat_start_time: time = time(11, 0)
+    free_power_later_start_time: time = time(13, 0)
+    # This is immutable, so a direct default is safe.  Avoiding a class-valued
+    # default_factory also keeps PyScript's generated dataclass initializer
+    # from trying to call its EvalLocalVar wrapper at runtime.
+    free_power_setpoint_boost: FreePowerSetpointBoost = FreePowerSetpointBoost()
+    free_power_zone_setpoint_boosts: Mapping[str, FreePowerSetpointBoost] = field(default_factory=dict)
     free_power_state: str = "0"
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
     heat_soak_scheme: str = SCHEME_DAY_LIVING
@@ -206,8 +215,8 @@ class PowerComfortMode(DefaultComfortMode):
             )
         ):
             return zone
-        adjusted_continue_until = zone.scheme.continue_until + self._free_power_heating_supplement(
-            zone.scheme.name,
+        adjusted_continue_until = zone.scheme.continue_until + self._free_power_setpoint_boost(
+            zone.key,
             snapshot_data,
         )
         adjusted_enable_outside = adjusted_continue_until - 0.75
@@ -225,17 +234,20 @@ class PowerComfortMode(DefaultComfortMode):
         )
         return replace(zone, scheme=adjusted_scheme)
 
-    def _free_power_heating_supplement(
+    def _free_power_setpoint_boost(
         self,
-        scheme_name: str,
+        zone_key: str,
         snapshot_data: ComfortModeSnapshotData,
     ) -> float:
-        is_downstairs_scheme = scheme_name == SCHEME_DOWNSTAIRS
-        if snapshot_data.free_power_later_available:
-            return self.free_power_downstairs_later if is_downstairs_scheme else self.free_power_later
-        if snapshot_data.now is not None and snapshot_data.now.time() > self.free_power_later_start:
-            return self.free_power_downstairs_later if is_downstairs_scheme else self.free_power_later
-        return self.free_power_downstairs_initial_suppliment if is_downstairs_scheme else self.free_power_initial_suppliment
+        boost = self.free_power_zone_setpoint_boosts.get(
+            zone_key,
+            self.free_power_setpoint_boost,
+        )
+        if snapshot_data.free_power_later_available or (
+            snapshot_data.now is not None and snapshot_data.now.time() >= self.free_power_later_start_time
+        ):
+            return boost.later
+        return boost.initial
 
     def fan_speed_level(
         self,

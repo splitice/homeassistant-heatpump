@@ -17,7 +17,14 @@ from .constants import (
     SCHEME_NIGHT,
     SCHEME_OFF,
 )
-from .comfort_modes import DefaultComfortMode, NightComfortMode, PowerComfortMode, PowerOffComfortMode, ScheduledComfortMode
+from .comfort_modes import (
+    DefaultComfortMode,
+    FreePowerSetpointBoost,
+    NightComfortMode,
+    PowerComfortMode,
+    PowerOffComfortMode,
+    ScheduledComfortMode,
+)
 from .comfort_adjustments import (
     ComfortAdjustmentConfig,
     ComfortAdjustmentRoomConfig,
@@ -66,11 +73,15 @@ POWERDAY_FREE_POWER_PV_POWER_THRESHOLD = 6.0
 POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS = 15 * 60
 POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY = "downstairs"
 POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS = ("office", "dining", "bedroom_1_2", "bedroom_3_4")
-POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP = 3.0
-POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP = 2.0
+POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP = 1.75
+POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP = 1.0
 POWERDAY_DOWNSTAIRS_PRIORITY_MIN_SECONDS = 10 * 60
 POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS = 2
 POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS = 1
+# Applied directly to the heat-pump target while downstairs is planned open
+# during an active free-power PowerDay call.  The dispatcher uses the inverse
+# adjustment for cooling.
+POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST = 1.0
 POWEROFF_ACTIVATION_BATTERY_THRESHOLD = 95.0
 POWEROFF_DEACTIVATION_BATTERY_THRESHOLD = 90.0
 POWEROFF_PV_POWER_THRESHOLD = 1.0
@@ -238,6 +249,11 @@ DEFAULT_COMFORT_MODE_POWER_DAY = PowerComfortMode(
     ),
     power_price_entity_id=GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     downstairs_heat_start_time=POWERDAY_FREE_POWER_START_TIME,
+    free_power_zone_setpoint_boosts={
+        "office": FreePowerSetpointBoost(initial=0.5, later=1.0),
+        "bedroom_1_2": FreePowerSetpointBoost(initial=0.25, later=0.25),
+        "downstairs": FreePowerSetpointBoost(initial=1.5, later=2.25),
+    },
 )
 
 DEFAULT_COMFORT_MODES = {

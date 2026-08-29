@@ -2087,6 +2087,7 @@ def _set_powerday_free_power_later_runtime_state(
 
 
 def _update_powerday_free_power_later_runtime_state(controller: PyscriptController, now: datetime) -> bool:
+    """Promote PowerDay to its later boost early when free-power PV is sustained."""
     normalized_now = _normalize_runtime_datetime(now) or _system_now()
     pv_power = parse_float(controller.get_state(GOODWE_PV_POWER_SENSOR))
     samples = _record_powerday_pv_power_sample(normalized_now, pv_power)
@@ -2308,13 +2309,13 @@ def _update_powerday_downstairs_priority_runtime_state(snapshot, operating_mode:
             reason=f"minimum priority hold until {hold_until.isoformat()}; gap {temperature_gap:.1f}C",
         )
 
-    if temperature_gap < POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:
+    if temperature_gap <= POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:
         return _set_powerday_downstairs_priority_runtime_state(
             active=False,
             started_at=None,
             temperature_gap=temperature_gap,
             upstairs_zone_keys=(),
-            reason=f"upstairs/downstairs gap {temperature_gap:.1f}C < {POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:.1f}C",
+            reason=f"upstairs/downstairs gap {temperature_gap:.1f}C <= {POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP:.1f}C",
         )
 
     return _set_powerday_downstairs_priority_runtime_state(

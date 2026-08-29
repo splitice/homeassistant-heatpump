@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .comfort_modes import DefaultComfortMode
-from .config import DEFAULT_SYSTEM_CONFIG
+from .config import DEFAULT_SYSTEM_CONFIG, POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST
 from .constants import (
     COMFORT_MODE_OFF,
     COMFORT_MODE_POWER_DAY,
@@ -226,6 +226,23 @@ def _requested_active_heat_raw(
     return max(room_target, snapshot.inlet_temp + boost_delta)
 
 
+def _powerday_downstairs_free_power_direct_target_adjustment(
+    snapshot: DemandSnapshot,
+    demand: EquipmentDemand,
+    predicted_open_zones: tuple[str, ...],
+) -> float:
+    """Return the signed direct target adjustment for an active downstairs call."""
+    if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY or not snapshot.free_power_available:
+        return 0.0
+    if "downstairs" not in predicted_open_zones:
+        return 0.0
+    if demand.heat_requested:
+        return POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST
+    if demand.cool_requested:
+        return -POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST
+    return 0.0
+
+
 def _requested_setpoint_raw(
     snapshot: DemandSnapshot,
     demand: EquipmentDemand,
@@ -239,7 +256,11 @@ def _requested_setpoint_raw(
     if demand.cool_requested:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
-            return zone.cool_scheme.enable_outside
+            return zone.cool_scheme.enable_outside + _powerday_downstairs_free_power_direct_target_adjustment(
+                snapshot,
+                demand,
+                predicted_open_zones,
+            )
         return snapshot.inlet_temp
 
     if demand.maintain_cool_mode:
@@ -248,7 +269,11 @@ def _requested_setpoint_raw(
 
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
-        return _requested_active_heat_raw(snapshot, zone, target_temp_step)
+        return _requested_active_heat_raw(snapshot, zone, target_temp_step) + _powerday_downstairs_free_power_direct_target_adjustment(
+            snapshot,
+            demand,
+            predicted_open_zones,
+        )
 
     if demand.maintain_heat_mode:
         primary_zone = snapshot.zones[demand.requested_by_zones[0]] if demand.requested_by_zones else None
@@ -275,6 +300,11 @@ def _requested_setpoint(
     idle_heat_step: int | None = None,
     target_temp_step: object | None = 1.0,
 ) -> int | float:
+    direct_target_adjustment = _powerday_downstairs_free_power_direct_target_adjustment(
+        snapshot,
+        demand,
+        predicted_open_zones,
+    )
     raw_requested_setpoint = _requested_setpoint_raw(
         snapshot,
         demand,
@@ -292,10 +322,11 @@ def _requested_setpoint(
     if demand.cool_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             zone.cool_scheme.enable_outside,
+            direct_target_adjustment,
             raw_requested_setpoint,
             normalized_setpoint,
         )
@@ -315,12 +346,13 @@ def _requested_setpoint(
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f room_temp=%.1f deficit=%.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f room_temp=%.1f deficit=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             zone.scheme.enable_outside,
             zone.current_temp,
             max(0.0, zone.scheme.enable_outside - zone.current_temp),
+            direct_target_adjustment,
             raw_requested_setpoint,
             normalized_setpoint,
         )
