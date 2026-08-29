@@ -65,6 +65,7 @@ class DemandSnapshot:
     inlet_temp: float
     free_power_available: bool
     heat_sink_available: bool
+    battery_free_power_boost_available: bool
     free_power_later_available: bool
     zones: dict[str, ZoneRuntimeState]
     heat_calling_zones: tuple[str, ...]

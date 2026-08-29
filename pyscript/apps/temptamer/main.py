@@ -11,8 +11,13 @@ from .config import (
     COMFORT_SCORE_SEMANTICS_VERSION,
     DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
     DEFAULT_SYSTEM_CONFIG,
+    DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS,
+    DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS,
+    DOWNSTAIRS_STARTUP_PRIORITY_UPSTAIRS_ZONE_KEYS,
+    DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
     EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
+    POWERDAY_BATTERY_FREE_POWER_BOOST_RELEASE_THRESHOLD,
     GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     GOODWE_PV_POWER_SENSOR,
@@ -207,6 +212,10 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_error": None,
     "last_heatcool_transition": None,
     "last_active_hvac_mode": None,
+    "last_heatcool_request_at": None,
+    "downstairs_startup_priority_started_at": None,
+    "downstairs_startup_priority_active": False,
+    "downstairs_startup_priority_reason": None,
     "idle_started_at": None,
     "idle_heat_step": None,
     "idle_heat_step_changed_at": None,
@@ -226,6 +235,8 @@ RUNTIME_STATE: dict[str, Any] = {
     "powerday_export_power_samples": [],
     "powerday_export_average": None,
     "powerday_battery_remaining": None,
+    "powerday_battery_free_power_boost_active": False,
+    "powerday_battery_free_power_boost_reason": None,
     "powerday_heat_sink_started_at": None,
     "powerday_heat_sink_hold_until": None,
     "powerday_heat_sink_active": False,
@@ -1496,6 +1507,12 @@ def _publish_runtime_state(status: str) -> None:
             "last_successful_control_pass": _isoformat(RUNTIME_STATE["last_successful_control_pass"]),
             "last_heatcool_transition": _isoformat(RUNTIME_STATE["last_heatcool_transition"]),
             "last_active_hvac_mode": RUNTIME_STATE["last_active_hvac_mode"],
+            "last_heatcool_request_at": _isoformat(RUNTIME_STATE.get("last_heatcool_request_at")),
+            "downstairs_startup_priority_started_at": _isoformat(
+                RUNTIME_STATE.get("downstairs_startup_priority_started_at")
+            ),
+            "downstairs_startup_priority_active": RUNTIME_STATE.get("downstairs_startup_priority_active"),
+            "downstairs_startup_priority_reason": RUNTIME_STATE.get("downstairs_startup_priority_reason"),
             "idle_started_at": _isoformat(RUNTIME_STATE["idle_started_at"]),
             "idle_heat_step": RUNTIME_STATE.get("idle_heat_step"),
             "idle_heat_step_changed_at": _isoformat(RUNTIME_STATE.get("idle_heat_step_changed_at")),
@@ -1537,6 +1554,12 @@ def _publish_runtime_state(status: str) -> None:
             "heat_demand_fan_boost_reason": RUNTIME_STATE.get("heat_demand_fan_boost_reason"),
             "powerday_export_average": RUNTIME_STATE.get("powerday_export_average"),
             "powerday_battery_remaining": RUNTIME_STATE.get("powerday_battery_remaining"),
+            "powerday_battery_free_power_boost_active": RUNTIME_STATE.get(
+                "powerday_battery_free_power_boost_active"
+            ),
+            "powerday_battery_free_power_boost_reason": RUNTIME_STATE.get(
+                "powerday_battery_free_power_boost_reason"
+            ),
             "powerday_heat_sink_started_at": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_started_at")),
             "powerday_heat_sink_hold_until": _isoformat(RUNTIME_STATE.get("powerday_heat_sink_hold_until")),
             "powerday_heat_sink_active": RUNTIME_STATE.get("powerday_heat_sink_active"),
@@ -1934,6 +1957,65 @@ def _time_weighted_powerday_export_average(samples: list[tuple[datetime, float]]
     return _time_weighted_runtime_average(samples, now, POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS)
 
 
+def _set_powerday_battery_free_power_boost_runtime_state(*, active: bool, reason: str) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("powerday_battery_free_power_boost_active"))
+    RUNTIME_STATE["powerday_battery_free_power_boost_active"] = active
+    RUNTIME_STATE["powerday_battery_free_power_boost_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "POWERDAY: battery_free_power_boost_active=%s battery=%s reason=%s",
+            active,
+            RUNTIME_STATE.get("powerday_battery_remaining"),
+            reason,
+        )
+    return active
+
+
+def _update_powerday_battery_free_power_boost_runtime_state(controller: PyscriptController) -> bool:
+    battery_remaining = parse_float(controller.get_state(GOODWE_BATTERY_REMAINING_SENSOR))
+    RUNTIME_STATE["powerday_battery_remaining"] = battery_remaining
+
+    selected_comfort_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity) or "")
+    if selected_comfort_mode != COMFORT_MODE_POWER_DAY:
+        return _set_powerday_battery_free_power_boost_runtime_state(
+            active=False,
+            reason="comfort mode is not PowerDay",
+        )
+    if battery_remaining is None:
+        return _set_powerday_battery_free_power_boost_runtime_state(
+            active=False,
+            reason="missing battery remaining",
+        )
+
+    if bool(RUNTIME_STATE.get("powerday_battery_free_power_boost_active")):
+        if battery_remaining >= POWERDAY_BATTERY_FREE_POWER_BOOST_RELEASE_THRESHOLD:
+            return _set_powerday_battery_free_power_boost_runtime_state(
+                active=True,
+                reason=(
+                    f"battery {battery_remaining:.1f} >= "
+                    f"{POWERDAY_BATTERY_FREE_POWER_BOOST_RELEASE_THRESHOLD:.1f}; holding initial boost"
+                ),
+            )
+        return _set_powerday_battery_free_power_boost_runtime_state(
+            active=False,
+            reason=(
+                f"battery {battery_remaining:.1f} < "
+                f"{POWERDAY_BATTERY_FREE_POWER_BOOST_RELEASE_THRESHOLD:.1f}"
+            ),
+        )
+
+    if battery_remaining >= POWERDAY_BATTERY_THRESHOLD:
+        return _set_powerday_battery_free_power_boost_runtime_state(
+            active=True,
+            reason=f"battery {battery_remaining:.1f} >= {POWERDAY_BATTERY_THRESHOLD:.1f}; starting initial boost",
+        )
+    return _set_powerday_battery_free_power_boost_runtime_state(
+        active=False,
+        reason=f"battery {battery_remaining:.1f} < {POWERDAY_BATTERY_THRESHOLD:.1f}",
+    )
+
+
 def _powerday_eligibility_reason(
     *,
     battery_remaining: float | None,
@@ -2150,6 +2232,123 @@ def _update_powerday_free_power_later_runtime_state(controller: PyscriptControll
         started_at=normalized_now,
         reason=f"PV average {pv_average:.2f} > {POWERDAY_FREE_POWER_PV_POWER_THRESHOLD:.2f}",
     )
+
+
+def _has_active_heatcool_request(snapshot, operating_mode: str | None) -> bool:
+    if operating_mode == HVAC_HEAT:
+        return bool(snapshot.heat_calling_zones)
+    if operating_mode == HVAC_COOL:
+        return bool(snapshot.cool_calling_zones)
+    return False
+
+
+def _downstairs_startup_priority_entry_eligibility(
+    snapshot,
+    operating_mode: str | None,
+    last_heatcool_request_at: datetime | None,
+    now: datetime,
+) -> tuple[bool, str]:
+    if snapshot.poweroff_forced_off:
+        return False, "PowerOff is waiting for its activation conditions"
+    if not _has_active_heatcool_request(snapshot, operating_mode):
+        return False, "there is no active heat or cool request"
+    if last_heatcool_request_at is None:
+        return False, "the heat/cool request gap has not been observed yet"
+    if now - last_heatcool_request_at <= timedelta(seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS):
+        return False, (
+            f"heat/cool request gap is not longer than {DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS // 60} minutes"
+        )
+
+    for zone_key in DOWNSTAIRS_STARTUP_PRIORITY_UPSTAIRS_ZONE_KEYS:
+        upstairs_zone = snapshot.zones.get(zone_key)
+        if upstairs_zone is not None and upstairs_zone.switch_is_on:
+            return False, f"{zone_key} is already open"
+
+    downstairs_zone = snapshot.zones.get(DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY)
+    if downstairs_zone is None:
+        return False, "downstairs zone is unavailable"
+    if not downstairs_zone.is_enabled_by_mode:
+        return False, "downstairs zone is disabled"
+    if operating_mode == HVAC_HEAT and downstairs_zone.current_temp >= downstairs_zone.scheme.continue_until:
+        return False, "downstairs is at or above its continue-until target"
+    if operating_mode == HVAC_COOL and downstairs_zone.current_temp <= downstairs_zone.cool_scheme.continue_until:
+        return False, "downstairs is at or below its continue-until target"
+    return True, "an extended heat/cool request gap can start downstairs first"
+
+
+def _set_downstairs_startup_priority_runtime_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    reason: str,
+) -> bool:
+    previous_active = bool(RUNTIME_STATE.get("downstairs_startup_priority_active"))
+    RUNTIME_STATE["downstairs_startup_priority_started_at"] = started_at
+    RUNTIME_STATE["downstairs_startup_priority_active"] = active
+    RUNTIME_STATE["downstairs_startup_priority_reason"] = reason
+
+    if active != previous_active:
+        LOGGER.info(
+            "DISPATCH: downstairs_startup_priority_active=%s started_at=%s reason=%s",
+            active,
+            _isoformat(started_at),
+            reason,
+        )
+    return active
+
+
+def _update_downstairs_startup_priority_runtime_state(snapshot, operating_mode: str | None, now: datetime) -> bool:
+    normalized_now = _normalize_runtime_datetime(now) or _system_now()
+    active_request = _has_active_heatcool_request(snapshot, operating_mode)
+    last_heatcool_request_at = _normalize_runtime_datetime(RUNTIME_STATE.get("last_heatcool_request_at"))
+    previously_active = bool(RUNTIME_STATE.get("downstairs_startup_priority_active"))
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("downstairs_startup_priority_started_at"))
+
+    if previously_active and started_at is not None:
+        downstairs_zone = snapshot.zones.get(DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY)
+        if snapshot.poweroff_forced_off or downstairs_zone is None or not downstairs_zone.is_enabled_by_mode:
+            result = _set_downstairs_startup_priority_runtime_state(
+                active=False,
+                started_at=None,
+                reason="downstairs startup priority is no longer safe to apply",
+            )
+        elif not active_request:
+            result = _set_downstairs_startup_priority_runtime_state(
+                active=False,
+                started_at=None,
+                reason="the active heat or cool request ended",
+            )
+        elif normalized_now < started_at + timedelta(seconds=DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS):
+            result = _set_downstairs_startup_priority_runtime_state(
+                active=True,
+                started_at=started_at,
+                reason=(
+                    "holding downstairs before opening other zones until "
+                    f"{(started_at + timedelta(seconds=DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS)).isoformat()}"
+                ),
+            )
+        else:
+            result = _set_downstairs_startup_priority_runtime_state(
+                active=False,
+                started_at=None,
+                reason="minimum downstairs-only startup period elapsed",
+            )
+    else:
+        eligible, reason = _downstairs_startup_priority_entry_eligibility(
+            snapshot,
+            operating_mode,
+            last_heatcool_request_at,
+            normalized_now,
+        )
+        result = _set_downstairs_startup_priority_runtime_state(
+            active=eligible,
+            started_at=normalized_now if eligible else None,
+            reason="started: " + reason if eligible else reason,
+        )
+
+    if active_request or last_heatcool_request_at is None:
+        RUNTIME_STATE["last_heatcool_request_at"] = normalized_now
+    return result
 
 
 def _powerday_downstairs_priority_base_eligibility(snapshot, operating_mode: str | None) -> tuple[bool, str]:
@@ -2484,6 +2683,10 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_at", None)
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
+    RUNTIME_STATE.setdefault("last_heatcool_request_at", None)
+    RUNTIME_STATE.setdefault("downstairs_startup_priority_started_at", None)
+    RUNTIME_STATE.setdefault("downstairs_startup_priority_active", False)
+    RUNTIME_STATE.setdefault("downstairs_startup_priority_reason", None)
     RUNTIME_STATE.setdefault("last_fan_speed_decrease_at", None)
     RUNTIME_STATE.setdefault("hvac_off_started_at", None)
     RUNTIME_STATE.setdefault("hvac_start_fan_ramp_started_at", None)
@@ -2497,6 +2700,8 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("powerday_downstairs_priority_gap", None)
     RUNTIME_STATE.setdefault("powerday_downstairs_priority_upstairs_zones", ())
     RUNTIME_STATE.setdefault("powerday_downstairs_priority_reason", None)
+    RUNTIME_STATE.setdefault("powerday_battery_free_power_boost_active", False)
+    RUNTIME_STATE.setdefault("powerday_battery_free_power_boost_reason", None)
     RUNTIME_STATE.setdefault("poweroff_battery_remaining", None)
     RUNTIME_STATE.setdefault("poweroff_pv_power", None)
     RUNTIME_STATE.setdefault("poweroff_activation_started_at", None)
@@ -2512,6 +2717,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _restore_heat_demand_fan_boost_state(now)
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
+    powerday_battery_free_power_boost_active = _update_powerday_battery_free_power_boost_runtime_state(controller)
     powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(controller, now)
     poweroff_active = _update_poweroff_runtime_state(controller, now)
 
@@ -2521,6 +2727,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         last_switch_changes=RUNTIME_STATE["last_zone_change"],
         pending_switch_states=RUNTIME_STATE["pending_zone_state"],
         heat_sink_available=powerday_heat_sink_active,
+        battery_free_power_boost_available=powerday_battery_free_power_boost_active,
         free_power_later_available=powerday_free_power_later_active,
         poweroff_active=poweroff_active,
         now=now,
@@ -2549,6 +2756,11 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         operating_mode,
         now,
     )
+    downstairs_startup_priority_active = _update_downstairs_startup_priority_runtime_state(
+        snapshot,
+        operating_mode,
+        now,
+    )
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
         LOGGER.info("DISPATCH: manual mode selected; leaving zones and heatpump unchanged")
@@ -2566,6 +2778,8 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_priority_active=powerday_downstairs_priority_active,
         downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
         upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        downstairs_startup_priority_active=downstairs_startup_priority_active,
+        downstairs_startup_priority_zone_key=DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
     )
     demand = resolve_equipment_demand(
         snapshot,
@@ -2627,6 +2841,8 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_priority_active=powerday_downstairs_priority_active,
         downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
         upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
+        downstairs_startup_priority_active=downstairs_startup_priority_active,
+        downstairs_startup_priority_zone_key=DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
         requested_fan_speed_level=fan_speed_level(provisional_plan.fan_mode),
     )
     demand = resolve_equipment_demand(

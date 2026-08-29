@@ -24,6 +24,9 @@ from pyscript.apps.temptamer.config import (
     COMFORT_ADJUSTMENT_TRIGGER_ENTITIES,
     DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
     DEFAULT_SYSTEM_CONFIG,
+    DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS,
+    DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS,
+    DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
     EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR,
     EAGLE_200_POWER_DEMAND_SENSOR,
     GLOBAL_SETPOINT_ADJUSTMENT_ENTITY,
@@ -263,6 +266,7 @@ def build_behavior_snapshot(
     last_switch_changes=None,
     pending_switch_states=None,
     heat_sink_available=False,
+    battery_free_power_boost_available=False,
     free_power_later_available=False,
     poweroff_active=False,
     now=None,
@@ -273,6 +277,7 @@ def build_behavior_snapshot(
         last_switch_changes=last_switch_changes,
         pending_switch_states=pending_switch_states,
         heat_sink_available=heat_sink_available,
+        battery_free_power_boost_available=battery_free_power_boost_available,
         free_power_later_available=free_power_later_available,
         poweroff_active=poweroff_active,
         now=now,
@@ -1955,6 +1960,194 @@ class TempTamerTests(unittest.TestCase):
         )
         self.assertTrue(all(not action.discretionary for action in actions))
 
+    def test_downstairs_startup_priority_runs_downstairs_only_after_an_extended_request_gap(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        "sensor.office_average_temperature": "17.0",
+                        "sensor.downstairs_zone_average_temperature": "20.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+
+        self.assertTrue(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(snapshot, HVAC_HEAT, now)
+        )
+        self.assertEqual(temptamer_main.RUNTIME_STATE["downstairs_startup_priority_started_at"], now)
+
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            now,
+            operation_mode=HVAC_HEAT,
+            downstairs_startup_priority_active=True,
+            downstairs_startup_priority_zone_key=DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
+        )
+
+        self.assertEqual(predicted_open, (DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,))
+        self.assertEqual(
+            [(action.zone_key, action.turn_on, action.discretionary) for action in actions],
+            [(DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY, True, False)],
+        )
+
+    def test_downstairs_startup_priority_holds_for_three_minutes_then_releases(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        "sensor.office_average_temperature": "17.0",
+                        "sensor.downstairs_zone_average_temperature": "20.0",
+                    }
+                ),
+                base_attr_map("20.0"),
+            ),
+            now=now,
+        )
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+
+        self.assertTrue(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(snapshot, HVAC_HEAT, now)
+        )
+        self.assertTrue(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(
+                snapshot,
+                HVAC_HEAT,
+                now + timedelta(seconds=DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS - 1),
+            )
+        )
+        self.assertFalse(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(
+                snapshot,
+                HVAC_HEAT,
+                now + timedelta(seconds=DOWNSTAIRS_STARTUP_PRIORITY_MIN_SECONDS),
+            )
+        )
+        self.assertIn(
+            "minimum downstairs-only startup period elapsed",
+            temptamer_main.RUNTIME_STATE["downstairs_startup_priority_reason"],
+        )
+
+    def test_downstairs_startup_priority_also_applies_to_a_new_cool_request(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        "sensor.office_average_temperature": "24.0",
+                        "sensor.downstairs_zone_average_temperature": "22.0",
+                    }
+                ),
+                base_attr_map("22.0"),
+            ),
+            now=now,
+        )
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+
+        self.assertTrue(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(snapshot, HVAC_COOL, now)
+        )
+
+    def test_downstairs_startup_priority_control_pass_opens_only_downstairs_first(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    "sensor.office_average_temperature": "17.0",
+                    "sensor.downstairs_zone_average_temperature": "20.0",
+                    TEST_CLIMATE_ENTITY: "off",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "low",
+            "temperature": 20,
+            "current_temperature": 20,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+        temptamer_main._system_now = lambda: now
+
+        try:
+            temptamer_main.run_control_pass(reason="downstairs startup priority test")
+        finally:
+            temptamer_main._system_now = real_system_now
+
+        self.assertTrue(temptamer_main.RUNTIME_STATE["downstairs_startup_priority_active"])
+        self.assertIn(
+            call(
+                "switch",
+                "turn_on",
+                blocking=True,
+                entity_id=DEFAULT_SYSTEM_CONFIG.zones[DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY].switch_entity_id,
+            ),
+            service_call.call_args_list,
+        )
+        for zone_key, zone_config in DEFAULT_SYSTEM_CONFIG.zones.items():
+            if zone_key == DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY:
+                continue
+            self.assertNotIn(
+                call("switch", "turn_on", blocking=True, entity_id=zone_config.switch_entity_id),
+                service_call.call_args_list,
+            )
+
+    def test_downstairs_startup_priority_requires_an_eligible_downstairs_zone(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        state_map = base_state_map(
+            **{
+                "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                "sensor.office_average_temperature": "17.0",
+                "sensor.downstairs_zone_average_temperature": "22.5",
+            }
+        )
+        snapshot = build_behavior_snapshot(FakeReader(state_map, base_attr_map("20.0")), now=now)
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+
+        self.assertFalse(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(snapshot, HVAC_HEAT, now)
+        )
+        self.assertIn(
+            "downstairs is at or above",
+            temptamer_main.RUNTIME_STATE["downstairs_startup_priority_reason"],
+        )
+
+        state_map["input_select.temptamer_comfort_mode_downstairs"] = SCHEME_OFF
+        disabled_snapshot = build_behavior_snapshot(FakeReader(state_map, base_attr_map("20.0")), now=now)
+        temptamer_main.RUNTIME_STATE["last_heatcool_request_at"] = now - timedelta(
+            seconds=DOWNSTAIRS_STARTUP_PRIORITY_INACTIVE_SECONDS + 1
+        )
+        self.assertFalse(
+            temptamer_main._update_downstairs_startup_priority_runtime_state(disabled_snapshot, HVAC_HEAT, now)
+        )
+        self.assertIn("downstairs zone is disabled", temptamer_main.RUNTIME_STATE["downstairs_startup_priority_reason"])
+
     def test_powerday_downstairs_priority_control_pass_publishes_state_and_dispatches_downstairs_only(self):
         now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
         real_system_now = temptamer_main._system_now
@@ -2553,6 +2746,86 @@ class TempTamerTests(unittest.TestCase):
             temptamer_main.RUNTIME_STATE["powerday_heat_sink_hold_until"],
             now + timedelta(seconds=POWERDAY_HEAT_SINK_MIN_SECONDS),
         )
+
+    def test_powerday_full_battery_applies_the_initial_free_power_setpoint_boost(self):
+        now = datetime(2026, 7, 25, 13, 30, tzinfo=timezone.utc)
+        reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "95",
+                    "sensor.downstairs_zone_average_temperature": "20.0",
+                }
+            ),
+            base_attr_map("21.0"),
+        )
+
+        active = temptamer_main._update_powerday_battery_free_power_boost_runtime_state(reader)
+        snapshot = build_behavior_snapshot(
+            reader,
+            battery_free_power_boost_available=active,
+            now=now,
+        )
+        power_mode = TEST_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+
+        self.assertTrue(active)
+        self.assertFalse(snapshot.free_power_available)
+        self.assertFalse(snapshot.heat_sink_available)
+        self.assertTrue(snapshot.battery_free_power_boost_available)
+        self.assertEqual(
+            snapshot.zones["downstairs"].scheme.continue_until,
+            TEST_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS].continue_until
+            + power_mode.free_power_zone_setpoint_boosts["downstairs"].initial,
+        )
+
+    def test_powerday_full_battery_initial_boost_holds_at_ninety_and_releases_below(self):
+        active_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "95",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_battery_free_power_boost_runtime_state(active_reader))
+
+        hold_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "90",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_battery_free_power_boost_runtime_state(hold_reader))
+        self.assertIn("holding initial boost", temptamer_main.RUNTIME_STATE["powerday_battery_free_power_boost_reason"])
+
+        free_price_hold_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "90",
+                }
+            )
+        )
+        self.assertTrue(temptamer_main._update_powerday_battery_free_power_boost_runtime_state(free_price_hold_reader))
+
+        release_reader = FakeReader(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                    GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                    GOODWE_BATTERY_REMAINING_SENSOR: "89.9",
+                }
+            )
+        )
+        self.assertFalse(temptamer_main._update_powerday_battery_free_power_boost_runtime_state(release_reader))
+        self.assertIn("battery 89.9 < 90.0", temptamer_main.RUNTIME_STATE["powerday_battery_free_power_boost_reason"])
 
     def test_powerday_battery_export_heat_sink_requires_battery_above_threshold(self):
         now = datetime(2026, 7, 25, 12, 10, tzinfo=timezone.utc)

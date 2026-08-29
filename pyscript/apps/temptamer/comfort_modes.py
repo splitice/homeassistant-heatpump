@@ -28,6 +28,7 @@ class ComfortModeSnapshotData:
     inlet_temp: float
     free_power_available: bool
     heat_sink_available: bool
+    battery_free_power_boost_available: bool = False
     free_power_later_available: bool = False
     downstairs_temp: float | None = None
     poweroff_active: bool = False
@@ -205,7 +206,10 @@ class PowerComfortMode(DefaultComfortMode):
         return scheme_name
 
     def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
-        if not snapshot_data.heat_sink_available or zone.scheme.name == SCHEME_OFF:
+        if (
+            not snapshot_data.heat_sink_available
+            and not snapshot_data.battery_free_power_boost_available
+        ) or zone.scheme.name == SCHEME_OFF:
             return zone
         if (
             zone.key in self.free_power_downstairs_gated_zone_keys
@@ -243,6 +247,8 @@ class PowerComfortMode(DefaultComfortMode):
             zone_key,
             self.free_power_setpoint_boost,
         )
+        if snapshot_data.battery_free_power_boost_available and not snapshot_data.free_power_available:
+            return boost.initial
         if snapshot_data.free_power_later_available or (
             snapshot_data.now is not None and snapshot_data.now.time() >= self.free_power_later_start_time
         ):
