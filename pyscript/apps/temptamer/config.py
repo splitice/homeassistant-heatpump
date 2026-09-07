@@ -581,24 +581,43 @@ for zone in DEFAULT_SYSTEM_CONFIG.zones.values():
 
 TEMPERATURE_TRIGGER_ENTITIES = tuple(_temperature_trigger_entities)
 
-_mode_trigger_entities: list[str] = []
+# Keep vents open briefly after an immediate heatpump shutdown so its fan can
+# finish running down with an unobstructed airflow path.
+IMMEDIATE_SHUTDOWN_ZONE_CLOSE_DELAY_SECONDS = 2 * 60
+
+_immediate_reconciliation_trigger_entities: list[str] = []
 
 
-def _add_mode_trigger_entity(entity_id: str | None) -> None:
-    if entity_id and entity_id not in _mode_trigger_entities:
-        _mode_trigger_entities.append(entity_id)
+def _add_immediate_reconciliation_trigger_entity(entity_id: str | None) -> None:
+    if entity_id and entity_id not in _immediate_reconciliation_trigger_entities:
+        _immediate_reconciliation_trigger_entities.append(entity_id)
 
 
-_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
-_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity)
-_add_mode_trigger_entity(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR)
+# Only explicit user selections may bypass zone anti-flap and idle handling.
+_add_immediate_reconciliation_trigger_entity(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity)
+_add_immediate_reconciliation_trigger_entity(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity)
 for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values():
-    _add_mode_trigger_entity(entity_id)
+    _add_immediate_reconciliation_trigger_entity(entity_id)
+
+IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES = tuple(_immediate_reconciliation_trigger_entities)
+
+_normal_recalculation_trigger_entities: list[str] = []
+
+
+def _add_normal_recalculation_trigger_entity(entity_id: str | None) -> None:
+    if entity_id and entity_id not in _normal_recalculation_trigger_entities:
+        _normal_recalculation_trigger_entities.append(entity_id)
+
+
+# Telemetry and calculated targets should retain normal zone, idle, and forecast safeguards.
+for entity_id in TEMPERATURE_TRIGGER_ENTITIES:
+    _add_normal_recalculation_trigger_entity(entity_id)
+_add_normal_recalculation_trigger_entity(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR)
 for entity_id in DEFAULT_SYSTEM_CONFIG.zone_comfort_adjustment_entities.values():
-    _add_mode_trigger_entity(entity_id)
-_add_mode_trigger_entity(DEFAULT_SYSTEM_CONFIG.global_setpoint_adjustment_entity)
+    _add_normal_recalculation_trigger_entity(entity_id)
+_add_normal_recalculation_trigger_entity(DEFAULT_SYSTEM_CONFIG.global_setpoint_adjustment_entity)
 for comfort_mode in DEFAULT_SYSTEM_CONFIG.comfort_modes.values():
     for entity_id in comfort_mode.trigger_entity_ids:
-        _add_mode_trigger_entity(entity_id)
+        _add_normal_recalculation_trigger_entity(entity_id)
 
-MODE_TRIGGER_ENTITIES = tuple(_mode_trigger_entities)
+NORMAL_RECALCULATION_TRIGGER_ENTITIES = tuple(_normal_recalculation_trigger_entities)

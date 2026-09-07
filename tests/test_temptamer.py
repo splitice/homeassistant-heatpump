@@ -33,7 +33,8 @@ from pyscript.apps.temptamer.config import (
     GOODWE_BATTERY_REMAINING_SENSOR,
     GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR,
     GOODWE_PV_POWER_SENSOR,
-    MODE_TRIGGER_ENTITIES,
+    IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES,
+    NORMAL_RECALCULATION_TRIGGER_ENTITIES,
     POWERDAY_EXPORT_AVERAGE_WINDOW_SECONDS,
     POWERDAY_DOWNSTAIRS_FREE_POWER_FAN_BOOST_LEVELS,
     POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST,
@@ -66,6 +67,7 @@ from pyscript.apps.temptamer.constants import (
     HVAC_START_FAN_RAMP_DURATION_SECONDS,
     HVAC_START_FAN_RAMP_MIN_OFF_SECONDS,
     IDLE_HEAT_UNWIND_SECONDS,
+    MIN_IDLE_SECONDS,
     SCHEME_BATHROOM,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
@@ -819,7 +821,8 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertIn("cover.officeshutters.current_position", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
             self.assertNotIn(zone.output_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
-            self.assertIn(zone.output_entity_id, MODE_TRIGGER_ENTITIES)
+            self.assertIn(zone.output_entity_id, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+            self.assertNotIn(zone.output_entity_id, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
 
     def test_bedroom_1_fallback_facade_matches_its_south_awning_label(self):
         bedroom_1_2 = next(
@@ -1022,33 +1025,6 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(restored["office"], saved["office"])
-
-    def test_forecast_comfort_provider_carries_filtered_fabric_solar_score(self):
-        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
-        snapshot = SimpleNamespace(
-            base_zone_targets={zone.key: (20.0, 20.0) for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones}
-        )
-        provider = temptamer_main._ForecastComfortAdjustmentProvider(
-            FakeReader(
-                comfort_adjustment_state_map(),
-                comfort_adjustment_attr_map(),
-            ),
-            snapshot,
-            COMFORT_ADJUSTMENT_COVER_FACADES,
-            {},
-            {"office": 90.0},
-        )
-
-        with patch.object(
-            temptamer_main,
-            "calculate_comfort_adjustments",
-            wraps=calculate_comfort_adjustments,
-        ) as calculate:
-            adjustments = provider(now, 11.0, "sunny")
-
-        self.assertIsNotNone(adjustments)
-        self.assertEqual(calculate.call_args.kwargs["filtered_solar_irradiances"]["office"], 90.0)
-        self.assertGreater(adjustments["office"], -1.5)
 
     def test_cover_position_holds_last_valid_before_configured_fallback(self):
         first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -1636,11 +1612,11 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(night_mode.fan_speed_level(6.1, 1, current_speed_level=1), 2)
         self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1), 1)
         self.assertEqual(power_mode.fan_speed_level(2.6, 1, current_speed_level=1, free_power_available=True), 2)
-        self.assertIn(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR, MODE_TRIGGER_ENTITIES)
-        self.assertIn(GOODWE_BATTERY_REMAINING_SENSOR, MODE_TRIGGER_ENTITIES)
-        self.assertIn(GOODWE_PV_POWER_SENSOR, MODE_TRIGGER_ENTITIES)
-        self.assertIn(EAGLE_200_POWER_DEMAND_SENSOR, MODE_TRIGGER_ENTITIES)
-        self.assertIn(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR, MODE_TRIGGER_ENTITIES)
+        self.assertIn(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+        self.assertIn(GOODWE_BATTERY_REMAINING_SENSOR, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+        self.assertIn(GOODWE_PV_POWER_SENSOR, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+        self.assertIn(EAGLE_200_POWER_DEMAND_SENSOR, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+        self.assertIn(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
 
     def test_poweroff_uses_powerday_during_the_day_and_night_outside_it(self):
         day_snapshot = build_behavior_snapshot(
@@ -3112,9 +3088,63 @@ class TempTamerTests(unittest.TestCase):
             DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities["downstairs"],
             "input_select.temptamer_comfort_mode_downstairs",
         )
-        self.assertIn("input_select.temptamer_comfort_mode_downstairs", MODE_TRIGGER_ENTITIES)
+        self.assertIn(
+            "input_select.temptamer_comfort_mode_downstairs",
+            IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES,
+        )
         self.assertEqual(DEFAULT_SYSTEM_CONFIG.global_setpoint_adjustment_entity, GLOBAL_SETPOINT_ADJUSTMENT_ENTITY)
-        self.assertIn(GLOBAL_SETPOINT_ADJUSTMENT_ENTITY, MODE_TRIGGER_ENTITIES)
+        self.assertIn(GLOBAL_SETPOINT_ADJUSTMENT_ENTITY, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+
+    def test_control_trigger_sets_separate_user_reconciliation_from_normal_recalculation(self):
+        self.assertIn(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
+        self.assertIn(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
+        self.assertTrue(
+            set(DEFAULT_SYSTEM_CONFIG.zone_comfort_mode_entities.values())
+            <= set(IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
+        )
+        self.assertTrue(
+            set(IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES).isdisjoint(NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+        )
+        self.assertIn(DEFAULT_SYSTEM_CONFIG.zones["office"].sensor_entity_id, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+
+    def test_control_trigger_handlers_use_their_respective_reconciliation_behavior(self):
+        with patch.object(temptamer_main, "_run_enabled_control_pass") as run_control_pass:
+            temptamer_main.temptamer_immediate_reconciliation_requested()
+
+        run_control_pass.assert_called_once_with(
+            reason="immediate comfort/HVAC selection reconciliation",
+            comfort_mode_changed=True,
+        )
+
+        with patch.object(temptamer_main, "_run_enabled_control_pass") as run_control_pass:
+            temptamer_main.temptamer_normal_recalculation_requested()
+
+        run_control_pass.assert_called_once_with(reason="normal state recalculation")
+
+    def test_fan_rundown_hold_keeps_zones_open_when_hvac_is_explicitly_off(self):
+        now = datetime(2026, 8, 30, 7, 46, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Off",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("22.0"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(
+            snapshot,
+            now,
+            operation_mode=HVAC_HEAT,
+            hold_closing_zones=True,
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(predicted_open, ("office",))
 
     def test_build_snapshot_propagates_zone_setpoint_deltas(self):
         snapshot = build_behavior_snapshot(
@@ -5107,7 +5137,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertIsNone(plan.setpoint)
         self.assertIsNone(plan.idle_heat_step)
 
-    def test_heating_idle_stage_3_respects_minimum_heat_setpoint(self):
+    def test_heating_idle_stage_3_holds_at_minimum_heat_setpoint(self):
         now = datetime(2026, 1, 1, 12, 12, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -5137,10 +5167,9 @@ class TempTamerTests(unittest.TestCase):
             now=now,
         )
 
-        self.assertTrue(plan.turn_off)
-        self.assertFalse(plan.idle)
-        self.assertTrue(plan.idle_shutdown)
-        self.assertIsNone(plan.setpoint)
+        self.assertFalse(plan.turn_off)
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 17)
         self.assertEqual(plan.idle_heat_step, -3)
 
     def test_heating_idle_stage_4_applies_after_twenty_four_minutes_above_continue_until(self):
@@ -5245,7 +5274,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(plan.setpoint, 18)
         self.assertEqual(plan.idle_heat_step, -11)
 
-    def test_heating_idle_stage_6_turns_off_when_backoff_reaches_minimum_heat_setpoint(self):
+    def test_heating_idle_stage_6_holds_minimum_heat_setpoint_until_idle_minimum_elapses(self):
         now = datetime(2026, 1, 1, 12, 25, 0, tzinfo=timezone.utc)
         snapshot = build_behavior_snapshot(
             FakeReader(
@@ -5275,10 +5304,24 @@ class TempTamerTests(unittest.TestCase):
             now=now,
         )
 
-        self.assertTrue(plan.turn_off)
-        self.assertFalse(plan.idle)
-        self.assertTrue(plan.idle_shutdown)
+        self.assertFalse(plan.turn_off)
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.setpoint, 17)
         self.assertEqual(plan.idle_heat_step, -11)
+
+        plan_after_minimum_idle = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+            idle_started_at=now - timedelta(seconds=MIN_IDLE_SECONDS),
+            now=now,
+        )
+
+        self.assertTrue(plan_after_minimum_idle.turn_off)
+        self.assertTrue(plan_after_minimum_idle.idle_shutdown)
 
     def test_heating_idle_unwinds_from_minus_4_to_minus_3_after_unwind_interval(self):
         now = datetime(2026, 1, 1, 12, 10, 0, tzinfo=timezone.utc)
@@ -6463,7 +6506,9 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-    def test_run_control_pass_comfort_mode_change_closes_satisfied_zone_and_turns_heatpump_off(self):
+    def test_run_control_pass_comfort_mode_change_turns_off_before_closing_zones_for_fan_rundown(self):
+        now = datetime(2026, 8, 30, 7, 46, tzinfo=timezone.utc)
+        real_system_now = temptamer_main._system_now
         temptamer_main.state._values.clear()
         temptamer_main.state._attrs.clear()
         temptamer_main.RUNTIME_STATE.clear()
@@ -6497,6 +6542,7 @@ class TempTamerTests(unittest.TestCase):
                     "sensor.average_bed1_2_zone_temp": "18.5",
                     "sensor.average_bed3_4_zone_temp": "18.5",
                     "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    "switch.wt32_hpctrl_e8dbd0_dining": "on",
                 }
             )
         )
@@ -6508,22 +6554,47 @@ class TempTamerTests(unittest.TestCase):
         service_call = Mock()
         temptamer_main.service.call = service_call
 
-        temptamer_main.run_control_pass(reason="mode selection changed", comfort_mode_changed=True)
+        try:
+            temptamer_main._system_now = lambda: now
+            temptamer_main.run_control_pass(reason="mode selection changed", comfort_mode_changed=True)
 
-        self.assertEqual(
-            service_call.call_args_list,
-            [
-                call(
-                    "switch",
-                    "turn_off",
-                    blocking=True,
-                    entity_id="switch.wt32_hpctrl_e8dbd0_office",
-                ),
-                call("climate", "turn_off", blocking=True, entity_id=TEST_CLIMATE_ENTITY),
-            ],
-        )
-        self.assertIsNone(temptamer_main.RUNTIME_STATE["idle_started_at"])
-        self.assertIsNone(temptamer_main.RUNTIME_STATE["idle_heat_step"])
+            self.assertCountEqual(
+                service_call.call_args_list,
+                [call("climate", "turn_off", blocking=True, entity_id=TEST_CLIMATE_ENTITY)],
+            )
+            self.assertEqual(
+                temptamer_main.RUNTIME_STATE["immediate_shutdown_zone_close_not_before"],
+                now + timedelta(minutes=2),
+            )
+
+            temptamer_main.state._values[TEST_CLIMATE_ENTITY] = "off"
+            service_call.reset_mock()
+            temptamer_main._system_now = lambda: now + timedelta(seconds=119)
+            temptamer_main.run_control_pass(reason="fan rundown hold")
+            self.assertEqual(service_call.call_args_list, [])
+
+            temptamer_main._system_now = lambda: now + timedelta(minutes=2)
+            temptamer_main.run_control_pass(reason="fan rundown complete")
+            self.assertCountEqual(
+                service_call.call_args_list,
+                [
+                    call(
+                        "switch",
+                        "turn_off",
+                        blocking=True,
+                        entity_id="switch.wt32_hpctrl_e8dbd0_office",
+                    ),
+                    call(
+                        "switch",
+                        "turn_off",
+                        blocking=True,
+                        entity_id="switch.wt32_hpctrl_e8dbd0_dining",
+                    ),
+                ],
+            )
+            self.assertIsNone(temptamer_main.RUNTIME_STATE["immediate_shutdown_zone_close_not_before"])
+        finally:
+            temptamer_main._system_now = real_system_now
 
     def test_run_control_pass_uses_climate_target_temp_step_for_set_temperature(self):
         temptamer_main.state._values.clear()
@@ -7579,6 +7650,39 @@ class IdleDemandForecastTests(unittest.TestCase):
             ),
         )
 
+    def test_runtime_idle_forecast_does_not_pass_a_pyscript_callback_to_the_forecast_module(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=22.5)
+        weather_points = (WeatherForecastPoint(now + timedelta(hours=1), 10.0, "sunny"),)
+        expected = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=now + timedelta(minutes=30),
+            earliest_zone_key="office",
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=True,
+            source="forecast",
+            reason="office heat demand predicted in 30 minutes",
+        )
+
+        with (
+            patch.object(temptamer_main, "_refresh_idle_demand_weather_forecast", return_value=weather_points),
+            patch.object(temptamer_main, "resolve_outdoor_temperature", return_value=10.0),
+            patch.object(temptamer_main, "forecast_idle_demand", return_value=expected) as forecast,
+        ):
+            result = temptamer_main._resolve_idle_demand_forecast(
+                Mock(),
+                snapshot,
+                EquipmentDemand(reason="all zones satisfied"),
+                current_hvac_mode=HVAC_HEAT,
+                operation_mode=HVAC_HEAT,
+                now=now,
+            )
+
+        self.assertIs(result, expected)
+        self.assertNotIn("adjustment_provider", forecast.call_args.kwargs)
+        self.assertEqual(forecast.call_args.kwargs["current_outdoor_temperature"], 10.0)
+
     def test_heating_forecast_is_safe_when_demand_is_first_predicted_at_thirty_minutes(self):
         now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=20.195)
@@ -7652,7 +7756,7 @@ class IdleDemandForecastTests(unittest.TestCase):
         self.assertEqual(result.earliest_demand_at, now + timedelta(minutes=1))
         self.assertEqual(conditions, ["sunny"])
 
-    def test_safe_forecast_turns_off_without_creating_idle_shutdown_memory(self):
+    def test_safe_forecast_keeps_the_unit_idle_until_the_minimum_duration(self):
         now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=22.5)
         forecast = IdleDemandForecast(
@@ -7672,6 +7776,36 @@ class IdleDemandForecastTests(unittest.TestCase):
             ("office",),
             current_hvac_mode="heat",
             current_fan_mode="low",
+            current_setpoint=22.0,
+            idle_started_at=now,
+            idle_demand_forecast=forecast,
+            now=now,
+        )
+
+        self.assertFalse(plan.turn_off)
+        self.assertTrue(plan.idle)
+
+    def test_safe_forecast_turns_off_after_minimum_idle_without_creating_restart_memory(self):
+        now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(operation_mode=HVAC_HEAT, office_temperature=22.5)
+        forecast = IdleDemandForecast(
+            generated_at=now,
+            horizon_seconds=30 * 60,
+            earliest_demand_at=now + timedelta(minutes=30),
+            earliest_zone_key="office",
+            operation_mode=HVAC_HEAT,
+            safe_to_turn_off=True,
+            source="forecast",
+            reason="office heat demand predicted in 30 minutes",
+        )
+
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(reason="all zones satisfied"),
+            ("office",),
+            current_hvac_mode="heat",
+            current_fan_mode="low",
+            idle_started_at=now - timedelta(seconds=MIN_IDLE_SECONDS),
             idle_demand_forecast=forecast,
             now=now,
         )

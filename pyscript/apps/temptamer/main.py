@@ -26,7 +26,9 @@ from .config import (
     IDLE_DEMAND_FORECAST_REFRESH_SECONDS,
     IDLE_DEMAND_FORECAST_STEP_SECONDS,
     IDLE_DEMAND_FORECAST_WEATHER_ENTITY,
-    MODE_TRIGGER_ENTITIES,
+    IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES,
+    IMMEDIATE_SHUTDOWN_ZONE_CLOSE_DELAY_SECONDS,
+    NORMAL_RECALCULATION_TRIGGER_ENTITIES,
     POWERDAY_BATTERY_THRESHOLD,
     POWERDAY_DOWNSTAIRS_PRIORITY_ENTER_GAP,
     POWERDAY_DOWNSTAIRS_PRIORITY_EXIT_GAP,
@@ -65,6 +67,7 @@ from .constants import (
     HVAC_START_FAN_RAMP_MIN_OFF_SECONDS,
     HVAC_COOL,
     HVAC_HEAT,
+    HVAC_OFF,
     SWITCH_STATE_SETTLE_SECONDS,
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
@@ -212,6 +215,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_error": None,
     "last_heatcool_transition": None,
     "last_active_hvac_mode": None,
+    "immediate_shutdown_zone_close_not_before": None,
     "last_heatcool_request_at": None,
     "downstairs_startup_priority_started_at": None,
     "downstairs_startup_priority_active": False,
@@ -328,82 +332,6 @@ class PyscriptController:
         return service.call(domain, service_name, blocking=True, **kwargs)  # type: ignore[name-defined]
 
 
-class _ForecastStateReader:
-    """Overlay a future weather condition on top of the live Home Assistant reader."""
-
-    def __init__(self, controller: PyscriptController, *, outdoor_temperature: float, condition: str | None):
-        self._controller = controller
-        self._outdoor_temperature = outdoor_temperature
-        self._condition = condition
-
-    def get_state(self, entity_id: str) -> object | None:
-        config = DEFAULT_COMFORT_ADJUSTMENT_CONFIG
-        if entity_id == config.outdoor_temperature_entity_id:
-            return self._outdoor_temperature
-        if entity_id == config.weather_entity_id and self._condition is not None:
-            return self._condition
-        if entity_id == config.solar_radiation_entity_id:
-            # Hourly forecasts provide a condition rather than future irradiance.
-            # This deliberately selects the comfort model's weather/sun fallback.
-            return None
-        return self._controller.get_state(entity_id)
-
-    def get_attr(self, entity_id: str, attr_name: str) -> object | None:
-        return self._controller.get_attr(entity_id, attr_name)
-
-
-class _ForecastComfortAdjustmentProvider:
-    """Re-use the comfort model without modifying its published state or filters."""
-
-    def __init__(
-        self,
-        controller: PyscriptController,
-        snapshot,
-        cover_facades: dict[str, str | None],
-        cover_position_overrides: dict[str, tuple[float, str]],
-        filtered_solar_irradiances: dict[str, float | None],
-    ):
-        self._controller = controller
-        self._snapshot = snapshot
-        self._cover_facades = cover_facades
-        self._cover_position_overrides = cover_position_overrides
-        # Weather forecasts have condition but no future irradiance.  Retain
-        # the currently filtered fabric state so a forecast does not make the
-        # delayed solar term disappear between adjacent control passes.
-        self._filtered_solar_irradiances = dict(filtered_solar_irradiances)
-
-    def __call__(self, at: datetime, outdoor_temperature: float | None, condition: str | None) -> dict[str, float] | None:
-        if outdoor_temperature is None:
-            return None
-        reader = _ForecastStateReader(
-            self._controller,
-            outdoor_temperature=outdoor_temperature,
-            condition=condition,
-        )
-        effective_temperatures: dict[str, float] = {}
-        for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
-            effective_temperatures[zone.key] = outdoor_temperature
-        result = calculate_comfort_adjustments(
-            reader,
-            config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
-            cover_facades=self._cover_facades,
-            effective_outdoor_temperatures=effective_temperatures,
-            effective_window_outdoor_temperatures=effective_temperatures,
-            effective_wall_outdoor_temperatures=effective_temperatures,
-            filter_warming_up={},
-            cover_position_overrides=self._cover_position_overrides,
-            filtered_solar_irradiances=self._filtered_solar_irradiances,
-            reference_zone_targets=self._snapshot.base_zone_targets,
-            last_valid_operating_mode=RUNTIME_STATE.get("comfort_adjustment_last_valid_mode"),
-            now=at,
-        )
-        adjustments: dict[str, float] = {}
-        for zone_key, adjustment in result.adjustments.items():
-            if result.calculation_validity.get(zone_key, False):
-                adjustments[zone_key] = adjustment
-        return adjustments
-
-
 def _cached_idle_demand_weather_points() -> tuple[WeatherForecastPoint, ...]:
     raw_points = RUNTIME_STATE.get("idle_demand_forecast_weather_points")
     if not isinstance(raw_points, (list, tuple)):
@@ -488,35 +416,24 @@ def _resolve_idle_demand_forecast(
 
     weather_points = _refresh_idle_demand_weather_forecast(controller, now)
     outdoor_temperature = resolve_outdoor_temperature(controller, DEFAULT_COMFORT_ADJUSTMENT_CONFIG, now=now)
-    current_condition = controller.get_state(IDLE_DEMAND_FORECAST_WEATHER_ENTITY)
-    condition = str(current_condition) if current_condition is not None else None
     has_forecast_temperature = False
-    has_forecast_condition = condition is not None
     for point in weather_points:
         if point.temperature is not None:
             has_forecast_temperature = True
-        if point.condition is not None:
-            has_forecast_condition = True
     forecast_anchor_temperature = outdoor_temperature if has_forecast_temperature else None
-    adjustment_provider = None
-    if has_forecast_temperature and has_forecast_condition:
-        adjustment_provider = _ForecastComfortAdjustmentProvider(
-            controller,
-            snapshot,
-            _resolve_cover_facades(),
-            _resolve_cover_position_overrides(controller, now),
-            _current_filtered_solar_irradiances(controller, now),
-        )
+    # ``forecast_idle_demand`` lives in a separate PyScript module.  Passing
+    # it a PyScript method as a callback yields a coroutine when that module
+    # invokes the callback, which a normal mapping lookup cannot consume.
+    # Forecast from the current snapshot's already comfort-adjusted thresholds
+    # instead; the temperature projection remains weather-aware.
     return forecast_idle_demand(
         snapshot,
         operation_mode=operation_mode,
         now=now,
         weather_points=weather_points,
         current_outdoor_temperature=forecast_anchor_temperature,
-        current_condition=condition,
         horizon_seconds=IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
         step_seconds=IDLE_DEMAND_FORECAST_STEP_SECONDS,
-        adjustment_provider=adjustment_provider,
     )
 
 
@@ -1507,6 +1424,9 @@ def _publish_runtime_state(status: str) -> None:
             "last_successful_control_pass": _isoformat(RUNTIME_STATE["last_successful_control_pass"]),
             "last_heatcool_transition": _isoformat(RUNTIME_STATE["last_heatcool_transition"]),
             "last_active_hvac_mode": RUNTIME_STATE["last_active_hvac_mode"],
+            "immediate_shutdown_zone_close_not_before": _isoformat(
+                RUNTIME_STATE.get("immediate_shutdown_zone_close_not_before")
+            ),
             "last_heatcool_request_at": _isoformat(RUNTIME_STATE.get("last_heatcool_request_at")),
             "downstairs_startup_priority_started_at": _isoformat(
                 RUNTIME_STATE.get("downstairs_startup_priority_started_at")
@@ -2683,6 +2603,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_at", None)
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
+    RUNTIME_STATE.setdefault("immediate_shutdown_zone_close_not_before", None)
     RUNTIME_STATE.setdefault("last_heatcool_request_at", None)
     RUNTIME_STATE.setdefault("downstairs_startup_priority_started_at", None)
     RUNTIME_STATE.setdefault("downstairs_startup_priority_active", False)
@@ -2714,6 +2635,22 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_demand_forecast", None)
     RUNTIME_STATE["idle_demand_forecast"] = None
     RUNTIME_STATE["last_trigger"] = reason
+    if comfort_mode_changed:
+        # A new user selection supersedes any earlier fan-rundown delay.
+        RUNTIME_STATE["immediate_shutdown_zone_close_not_before"] = None
+    normalized_now = _normalize_runtime_datetime(now) or now
+    immediate_shutdown_zone_close_not_before = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("immediate_shutdown_zone_close_not_before")
+    )
+    immediate_shutdown_zone_close_hold_active = (
+        immediate_shutdown_zone_close_not_before is not None
+        and normalized_now < immediate_shutdown_zone_close_not_before
+    )
+    immediate_shutdown_zone_close_due = (
+        immediate_shutdown_zone_close_not_before is not None
+        and normalized_now >= immediate_shutdown_zone_close_not_before
+    )
+    zone_reconciliation_changed = comfort_mode_changed or immediate_shutdown_zone_close_due
     _restore_heat_demand_fan_boost_state(now)
     _reconcile_pending_zone_state(controller, now)
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
@@ -2773,13 +2710,14 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         snapshot,
         now,
         operation_mode=operating_mode,
-        comfort_mode_changed=comfort_mode_changed,
+        comfort_mode_changed=zone_reconciliation_changed,
         startup_reconcile=startup_reconcile,
         downstairs_priority_active=powerday_downstairs_priority_active,
         downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
         upstairs_zone_keys=POWERDAY_DOWNSTAIRS_PRIORITY_UPSTAIRS_ZONE_KEYS,
         downstairs_startup_priority_active=downstairs_startup_priority_active,
         downstairs_startup_priority_zone_key=DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
+        hold_closing_zones=immediate_shutdown_zone_close_hold_active,
     )
     demand = resolve_equipment_demand(
         snapshot,
@@ -2836,7 +2774,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         snapshot,
         now,
         operation_mode=operating_mode,
-        comfort_mode_changed=comfort_mode_changed,
+        comfort_mode_changed=zone_reconciliation_changed,
         startup_reconcile=startup_reconcile,
         downstairs_priority_active=powerday_downstairs_priority_active,
         downstairs_zone_key=POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
@@ -2844,6 +2782,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_startup_priority_active=downstairs_startup_priority_active,
         downstairs_startup_priority_zone_key=DOWNSTAIRS_STARTUP_PRIORITY_ZONE_KEY,
         requested_fan_speed_level=fan_speed_level(provisional_plan.fan_mode),
+        hold_closing_zones=immediate_shutdown_zone_close_hold_active,
     )
     demand = resolve_equipment_demand(
         snapshot,
@@ -2889,6 +2828,22 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     dispatch_plan_kwargs["idle_demand_forecast"] = idle_demand_forecast
     plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
 
+    if comfort_mode_changed and plan.turn_off and (current_hvac_mode_str or "").lower() != HVAC_OFF:
+        deferred_zone_closures = [action for action in zone_actions if not action.turn_on]
+        if deferred_zone_closures:
+            close_not_before = normalized_now + timedelta(seconds=IMMEDIATE_SHUTDOWN_ZONE_CLOSE_DELAY_SECONDS)
+            RUNTIME_STATE["immediate_shutdown_zone_close_not_before"] = close_not_before
+            zone_actions = [action for action in zone_actions if action.turn_on]
+            immediate_shutdown_zone_close_hold_active = True
+            predicted_open_zones = tuple(
+                sorted(set(predicted_open_zones) | {action.zone_key for action in deferred_zone_closures})
+            )
+            LOGGER.info(
+                "ZONES: deferring %s immediate-shutdown closure(s) until %s for heatpump fan rundown",
+                len(deferred_zone_closures),
+                close_not_before.isoformat(),
+            )
+
     RUNTIME_STATE["heat_demand_fan_boost_level"] = heat_demand_fan_boost_level
     RUNTIME_STATE["last_heat_demand_fan_boost_at"] = last_heat_demand_fan_boost_at
     RUNTIME_STATE["max_power_demand_5m_kw"] = max_power_demand_5m_kw
@@ -2900,8 +2855,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         now,
         predicted_open_zones,
         operation_mode=operating_mode,
-        comfort_mode_changed=comfort_mode_changed,
+        comfort_mode_changed=zone_reconciliation_changed,
         startup_reconcile=startup_reconcile,
+        hold_closing_zones=immediate_shutdown_zone_close_hold_active,
     )
     if startup_reconcile:
         LOGGER.info(
@@ -2921,6 +2877,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
                 DEFAULT_SYSTEM_CONFIG.zones[action.zone_key].label,
                 action.reason,
             )
+
+    if immediate_shutdown_zone_close_due:
+        RUNTIME_STATE["immediate_shutdown_zone_close_not_before"] = None
 
     if not predicted_open_zones:
         LOGGER.warning("ZONES: predicted_open=none details=%s", " | ".join(zone_diagnostics))
@@ -3111,9 +3070,16 @@ def temptamer_periodic_comfort_adjustments() -> None:
     _run_comfort_adjustment_pass(reason="periodic trigger")
 
 
-@state_trigger(*MODE_TRIGGER_ENTITIES)
-def temptamer_mode_changed(*_args, **_kwargs) -> None:
-    _run_enabled_control_pass(reason="mode selection changed", comfort_mode_changed=True)
+@state_trigger(*IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
+def temptamer_immediate_reconciliation_requested(*_args, **_kwargs) -> None:
+    """Reconcile user-selected comfort/HVAC changes without anti-flap delays."""
+    _run_enabled_control_pass(reason="immediate comfort/HVAC selection reconciliation", comfort_mode_changed=True)
+
+
+@state_trigger(*NORMAL_RECALCULATION_TRIGGER_ENTITIES)
+def temptamer_normal_recalculation_requested(*_args, **_kwargs) -> None:
+    """Recalculate for telemetry and adjustment changes while retaining idle safeguards."""
+    _run_enabled_control_pass(reason="normal state recalculation")
 
 
 @state_trigger(*COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)

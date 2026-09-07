@@ -280,6 +280,7 @@ def describe_zone_predictions(
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
     startup_reconcile: bool = False,
+    hold_closing_zones: bool = False,
 ) -> tuple[str, ...]:
     predicted_open = set(predicted_open_zones)
     reconcile_all = comfort_mode_changed or startup_reconcile
@@ -302,7 +303,15 @@ def describe_zone_predictions(
 
         if zone.key in predicted_open:
             if zone.switch_is_on:
-                status_parts.append("kept open")
+                if (
+                    hold_closing_zones
+                    and zone.is_enabled_by_mode
+                    and operation_mode in {HVAC_HEAT, HVAC_COOL}
+                    and _zone_should_close(zone, operation_mode)
+                ):
+                    status_parts.append("held open for heatpump fan rundown")
+                else:
+                    status_parts.append("kept open")
             else:
                 status_parts.append("predicted to open")
         else:
@@ -344,6 +353,7 @@ def resolve_zone_actions(
     downstairs_startup_priority_active: bool = False,
     downstairs_startup_priority_zone_key: str | None = None,
     requested_fan_speed_level: int | None = None,
+    hold_closing_zones: bool = False,
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
     predicted_open: set[str] = set()
@@ -356,6 +366,8 @@ def resolve_zone_actions(
         return actions, tuple(sorted(predicted_open))
 
     if snapshot.poweroff_forced_off:
+        if hold_closing_zones:
+            return actions, tuple(sorted(predicted_open))
         for key in tuple(sorted(predicted_open)):
             actions.append(
                 ZoneAction(
@@ -368,6 +380,8 @@ def resolve_zone_actions(
         return actions, tuple()
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
+        if hold_closing_zones:
+            return actions, tuple(sorted(predicted_open))
         for key in tuple(sorted(predicted_open)):
             actions.append(
                 ZoneAction(
@@ -431,6 +445,8 @@ def resolve_zone_actions(
 
     for zone in snapshot.zones.values():
         if zone.switch_is_on and not zone.is_enabled_by_mode:
+            if hold_closing_zones:
+                continue
             predicted_open.discard(zone.key)
             actions.append(
                 ZoneAction(
@@ -455,9 +471,10 @@ def resolve_zone_actions(
     opening_candidates = _sorted_by_rank(ranked_opening_candidates)
 
     closing_candidates: list[ZoneRuntimeState] = []
-    for zone in snapshot.zones.values():
-        if zone.switch_is_on and zone.is_enabled_by_mode and _zone_should_close(zone, operation_mode):
-            closing_candidates.append(zone)
+    if not hold_closing_zones:
+        for zone in snapshot.zones.values():
+            if zone.switch_is_on and zone.is_enabled_by_mode and _zone_should_close(zone, operation_mode):
+                closing_candidates.append(zone)
     ranked_closing_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
     for zone in closing_candidates:
         ranked_closing_candidates.append((_closing_rank(zone, operation_mode), zone))
@@ -516,11 +533,15 @@ def resolve_zone_actions(
             )
             discretionary_used += 1
 
-    high_fan_office_closure = resolve_high_fan_office_closure(
-        snapshot,
-        tuple(sorted(predicted_open)),
-        operation_mode=operation_mode,
-        requested_fan_speed_level=requested_fan_speed_level,
+    high_fan_office_closure = (
+        None
+        if hold_closing_zones
+        else resolve_high_fan_office_closure(
+            snapshot,
+            tuple(sorted(predicted_open)),
+            operation_mode=operation_mode,
+            requested_fan_speed_level=requested_fan_speed_level,
+        )
     )
     if high_fan_office_closure is not None:
         predicted_open.remove(high_fan_office_closure.zone_key)

@@ -1225,25 +1225,27 @@ def build_dispatch_plan(
             and snapshot.heat_sink_available
             and idle_hvac_mode == HVAC_HEAT
         )
+        normalized_now = _normalize_timestamp(now)
+        normalized_idle_started_at = _normalize_timestamp(idle_started_at)
+        idle_minimum_elapsed = (
+            current_mode == idle_hvac_mode
+            and normalized_now is not None
+            and normalized_idle_started_at is not None
+            and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
+        )
         if (
             idle_demand_forecast is not None
             and idle_demand_forecast.operation_mode == idle_hvac_mode
             and idle_demand_forecast.safe_to_turn_off
             and not powerday_heat_soak_active
+            and idle_minimum_elapsed
         ):
             return DispatchPlan(
                 turn_off=True,
                 open_zones=predicted_open_zones,
                 reason="forecast idle shutdown: " + idle_demand_forecast.reason,
             )
-        normalized_now = _normalize_timestamp(now)
-        normalized_idle_started_at = _normalize_timestamp(idle_started_at)
-        if (
-            current_mode == idle_hvac_mode
-            and normalized_now is not None
-            and normalized_idle_started_at is not None
-            and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)
-        ):
+        if idle_minimum_elapsed:
             return DispatchPlan(
                 turn_off=True,
                 idle_shutdown=idle_hvac_mode == HVAC_HEAT,
@@ -1251,7 +1253,7 @@ def build_dispatch_plan(
                 reason=demand.reason,
             )
         if idle_hvac_mode == HVAC_HEAT:
-            idle_setpoint, resolved_idle_heat_step, idle_heat_step_changed, minimum_setpoint_reached = _requested_idle_heat_setpoint(
+            idle_setpoint, resolved_idle_heat_step, idle_heat_step_changed, _minimum_setpoint_reached = _requested_idle_heat_setpoint(
                 snapshot,
                 predicted_open_zones,
                 current_setpoint,
@@ -1262,14 +1264,6 @@ def build_dispatch_plan(
                 now,
                 target_temp_step,
             )
-            if minimum_setpoint_reached:
-                return DispatchPlan(
-                    turn_off=True,
-                    idle_shutdown=True,
-                    idle_heat_step=resolved_idle_heat_step,
-                    open_zones=predicted_open_zones,
-                    reason="idle minimum heat setpoint reached: " + demand.reason,
-                )
         else:
             normalized_current_setpoint = parse_float(current_setpoint)
             idle_setpoint = (
