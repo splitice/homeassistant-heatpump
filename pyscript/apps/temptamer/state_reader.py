@@ -118,13 +118,19 @@ def _resolve_optional_sensor(reader: StateReader, entity_id: str | None) -> floa
     return parse_float(reader.get_state(entity_id))
 
 
-def _resolve_comfort_adjustment(reader: StateReader, entity_id: str | None) -> float:
-    """Read a usable helper value, with the documented safe range."""
+def _resolve_manual_adjustment(reader: StateReader, entity_id: str | None) -> float:
+    """Read a finite manual offset without limiting the user's adjustment."""
     if entity_id is None:
         return 0.0
     adjustment = parse_float(reader.get_state(entity_id))
     if adjustment is None or not isfinite(adjustment):
         return 0.0
+    return adjustment
+
+
+def _resolve_comfort_adjustment(reader: StateReader, entity_id: str | None) -> float:
+    """Keep automatic comfort scores within the documented safe range."""
+    adjustment = _resolve_manual_adjustment(reader, entity_id)
     return max(-1.5, min(1.5, adjustment))
 
 
@@ -349,7 +355,7 @@ def build_snapshot(
     # These base targets are consumed by the independent publisher so an
     # adjustment never becomes its own future reference.
     base_zone_targets: dict[str, tuple[float, float]] = {}
-    global_setpoint_adjustment = _resolve_comfort_adjustment(
+    global_setpoint_adjustment = _resolve_manual_adjustment(
         reader,
         config.global_setpoint_adjustment_entity,
     )

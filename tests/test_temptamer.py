@@ -1529,6 +1529,36 @@ class TempTamerTests(unittest.TestCase):
             self.assertEqual(adjusted.base_zone_targets[zone_key], baseline.base_zone_targets[zone_key])
         self.assertEqual(adjusted.zones["office"].comfort_adjustment, 0.2)
 
+    def test_manual_adjustment_is_unclamped_while_automatic_score_is_clamped(self):
+        baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
+        for manual in (-2.5, 2.5):
+            for automatic in (-9.0, 9.0):
+                with self.subTest(manual=manual, automatic=automatic):
+                    adjusted = build_snapshot(FakeReader(base_state_map(**{
+                        "input_number.temptamer_setpoint_adjustment": str(manual),
+                        "input_number.comfort_adjustment_office": str(automatic),
+                    }), base_attr_map()))
+                    clamped_auto = -1.5 if automatic < 0 else 1.5
+                    self.assertEqual(adjusted.global_setpoint_adjustment, manual)
+                    self.assertEqual(adjusted.zones["office"].comfort_adjustment, clamped_auto)
+                    for key, zone in adjusted.zones.items():
+                        correction = (clamped_auto if key == "office" else 0.0) - manual
+                        for scheme_attr in ("scheme", "cool_scheme"):
+                            before = getattr(baseline.zones[key], scheme_attr)
+                            after = getattr(zone, scheme_attr)
+                            for threshold in ("enable_outside", "continue_until", "ideal_target"):
+                                self.assertAlmostEqual(
+                                    getattr(after, threshold), getattr(before, threshold) - correction,
+                                )
+
+    def test_manual_adjustment_defaults_to_zero_for_invalid_values(self):
+        for value in (None, "unavailable", "invalid", "nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                snapshot = build_snapshot(FakeReader(base_state_map(**{
+                    "input_number.temptamer_setpoint_adjustment": value,
+                }), base_attr_map()))
+                self.assertEqual(snapshot.global_setpoint_adjustment, 0.0)
+
     def test_build_snapshot_auto_zone_override_falls_back_to_global_mode(self):
         snapshot = build_snapshot(
             FakeReader(

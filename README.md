@@ -62,7 +62,7 @@ This repository now includes a PyScript app in `pyscript/apps/temptamer` that im
      - `input_number.comfort_adjustment_bed_3_4`
      - `input_number.comfort_adjustment_office`
      - `input_number.comfort_adjustment_dining`
-   - `input_number.temptamer_setpoint_adjustment`, with minimum `-1.5`, maximum `1.5`, and step `0.1`, to offset every zone together
+   - `input_number.temptamer_setpoint_adjustment`, with your preferred minimum and maximum and step `0.1`, to offset every zone together. The controller does not clamp this manual offset; automatic comfort scores remain clamped to `-1.5` through `1.5`. Effective targets are `base - (clamp(auto) - global)`.
    - `sensor.gw3000c_outdoor_temperature` and `sensor.gw3000c_solar_radiation`, or the `weather.epping` temperature/condition fallbacks
    - `weather.epping_hourly`, which supports Home Assistant's hourly `weather.get_forecasts` action for predictive idle shutdown
    - `sun.sun` with `elevation` and `azimuth` attributes
