@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from math import ceil, cos, exp, floor, isfinite, radians, sin
 from typing import Mapping, Protocol
 
+from .constants import COMFORT_SCORE_MAXIMUM, COMFORT_SCORE_MINIMUM
+
 
 _UNSET = object()
 
@@ -66,6 +68,7 @@ class ComfortAdjustmentZoneConfig:
     output_entity_id: str
     fallback_temperature_entity_id: str | None
     rooms: tuple[ComfortAdjustmentRoomConfig, ...]
+    humidity_entity_id: str | None = None
     upstairs: bool = False
     # Keep this as ``object`` for the PyScript evaluator; see the equivalent
     # envelope field above.
@@ -76,7 +79,9 @@ class ComfortAdjustmentZoneConfig:
 class ComfortAdjustmentConfig:
     zones: tuple[ComfortAdjustmentZoneConfig, ...]
     house_temperature_entity_id: str
+    house_humidity_entity_id: str
     heatpump_mode_user_entity_id: str
+    controller_hvac_mode_entity_id: str
     climate_entity_id: str
     outdoor_temperature_entity_id: str
     weather_entity_id: str
@@ -99,6 +104,8 @@ class ComfortAdjustmentConfig:
     # the room-level operative model.
     calculation_model: str = "operative"
     indoor_surface_resistance: float = 0.12
+    warm_indoor_surface_resistance: float = 0.415
+    warm_surface_resistance_full_effect_delta_celsius: float = 3.0
     operative_air_weight: float = 0.5
     maximum_total_k: float = 0.8
     minimum_operative_denominator: float = 0.55
@@ -113,8 +120,8 @@ class ComfortAdjustmentConfig:
     solar_direct_fraction_maximum: float = 0.80
     solar_maximum_direct_normal_irradiance: float = 1100.0
     solar_ground_reflection_fraction: float = 0.10
-    solar_mrt_coefficient: float = 0.012
-    solar_adjustment_limit: float = 0.4
+    solar_mrt_coefficient: float = 0.015
+    solar_adjustment_limit: float = 0.5
     output_rate_limit_celsius: float = 0.2
     output_rate_limit_seconds: int = 15 * 60
     outdoor_filter_warmup_fraction: float = 0.5
@@ -123,6 +130,10 @@ class ComfortAdjustmentConfig:
 @dataclass(frozen=True)
 class ComfortAdjustmentResult:
     zone_temperatures: Mapping[str, float | None]
+    zone_humidities: Mapping[str, float | None]
+    zone_humidity_sources: Mapping[str, str]
+    zone_humidity_entity_ids: Mapping[str, str | None]
+    humidity_adjustments: Mapping[str, float]
     outdoor_temperature: float | None
     effective_outdoor_temperatures: Mapping[str, float | None]
     effective_window_outdoor_temperatures: Mapping[str, float | None]
@@ -234,6 +245,21 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def calculate_humidex_adjustment(temperature: float, relative_humidity: float) -> float:
+    """Return the Humidex apparent-temperature delta in Celsius."""
+    if not isfinite(temperature) or not isfinite(relative_humidity):
+        return 0.0
+    if relative_humidity < 0.0 or relative_humidity > 100.0:
+        return 0.0
+    vapour_pressure = (
+        relative_humidity
+        / 100.0
+        * 6.112
+        * exp(17.67 * temperature / (temperature + 243.5))
+    )
+    return 5.0 / 9.0 * (vapour_pressure - 10.0)
+
+
 def _read_first_temperature(reader: StateReaderLike, primary_entity_id: str, fallback_entity_id: str | None) -> float | None:
     primary = _parse_float(reader.get_state(primary_entity_id))
     if primary is not None:
@@ -321,6 +347,34 @@ def _resolve_zone_temperature_details(
     return None, "unavailable", room_diagnostics, issues
 
 
+def _resolve_zone_humidity_details(
+    reader: StateReaderLike,
+    zone: ComfortAdjustmentZoneConfig,
+    house_humidity: TemperatureReading,
+    config: ComfortAdjustmentConfig,
+    now: datetime | None,
+) -> tuple[float | None, str, str | None, list[str]]:
+    """Resolve local humidity first, then the configured house fallback."""
+    issues: list[str] = []
+    if zone.humidity_entity_id is not None:
+        local_humidity = _read_temperature(
+            reader,
+            zone.humidity_entity_id,
+            now=now,
+            minimum=0.0,
+            maximum=100.0,
+            stale_after_seconds=config.input_stale_after_seconds,
+        )
+        if local_humidity.value is not None:
+            return local_humidity.value, "zone_sensor", zone.humidity_entity_id, issues
+        _append_issue(issues, local_humidity)
+
+    if house_humidity.value is not None:
+        return house_humidity.value, "house_fallback", config.house_humidity_entity_id, issues
+    _append_issue(issues, house_humidity)
+    return None, "unavailable", None, issues
+
+
 def resolve_zone_temperature(
     reader: StateReaderLike,
     zone: ComfortAdjustmentZoneConfig,
@@ -354,6 +408,7 @@ def _normalized_mode(value: object | None) -> str | None:
 def resolve_operating_mode_with_source(
     *,
     user_mode: object | None,
+    controller_mode: object | None = None,
     hvac_action: object | None,
     configured_hvac_mode: object | None,
     last_valid_mode: object | None = None,
@@ -367,12 +422,17 @@ def resolve_operating_mode_with_source(
     if selected_mode is not None:
         return selected_mode, "user_mode"
 
+    selected_controller_mode = _normalized_mode(controller_mode)
+    if selected_controller_mode is not None:
+        return selected_controller_mode, "controller_hvac_mode"
+
     active_mode = _normalized_mode(hvac_action)
     if active_mode is not None:
         return active_mode, "hvac_action"
 
-    if zone_temperature is None or outdoor_temperature is None:
-        return None, "unavailable"
+    configured_mode = _normalized_mode(configured_hvac_mode)
+    if configured_mode is not None:
+        return configured_mode, "configured_hvac_mode"
 
     previous_mode = _normalized_mode(last_valid_mode)
     last_valid_at = _normalize_datetime(last_valid_mode_at)
@@ -389,20 +449,21 @@ def resolve_operating_mode_with_source(
     ):
         return previous_mode, "last_valid_mode"
 
+    if zone_temperature is None or outdoor_temperature is None:
+        return None, "unavailable"
+
     if outdoor_temperature <= zone_temperature - 0.5:
         return "heat", "temperature_inference"
     if outdoor_temperature >= zone_temperature + 0.5:
         return "cool", "temperature_inference"
 
-    configured_mode = _normalized_mode(configured_hvac_mode)
-    if configured_mode is not None:
-        return configured_mode, "configured_hvac_mode"
     return ("heat" if outdoor_temperature <= zone_temperature else "cool"), "temperature_fallback"
 
 
 def resolve_operating_mode(
     *,
     user_mode: object | None,
+    controller_mode: object | None = None,
     hvac_action: object | None,
     configured_hvac_mode: object | None,
     last_valid_mode: object | None = None,
@@ -415,6 +476,7 @@ def resolve_operating_mode(
     """Return only the mode for existing callers; diagnostics use the source-aware form."""
     mode, _source = resolve_operating_mode_with_source(
         user_mode=user_mode,
+        controller_mode=controller_mode,
         hvac_action=hvac_action,
         configured_hvac_mode=configured_hvac_mode,
         last_valid_mode=last_valid_mode,
@@ -576,6 +638,10 @@ def _has_valid_room_envelope(
         or profile.wall_u_value < 0.0
         or not isfinite(config.indoor_surface_resistance)
         or config.indoor_surface_resistance <= 0.0
+        or not isfinite(config.warm_indoor_surface_resistance)
+        or config.warm_indoor_surface_resistance <= 0.0
+        or not isfinite(config.warm_surface_resistance_full_effect_delta_celsius)
+        or config.warm_surface_resistance_full_effect_delta_celsius <= 0.0
         or not 0.0 <= config.operative_air_weight <= 1.0
         or not isfinite(config.shutter_resistance)
         or config.shutter_resistance < 0.0
@@ -615,6 +681,23 @@ def _window_facade(
     if window.facade is not None:
         return window.facade, "configured_fallback"
     return None, "unconfigured"
+
+
+def _surface_resistance_for_temperature(
+    config: ComfortAdjustmentConfig,
+    effective_outdoor_temperature: float,
+    target_temperature: float,
+) -> float:
+    """Interpolate from the cold coefficient to the calibrated warm coefficient."""
+    warm_fraction = _clamp(
+        (effective_outdoor_temperature - target_temperature)
+        / config.warm_surface_resistance_full_effect_delta_celsius,
+        0.0,
+        1.0,
+    )
+    return config.indoor_surface_resistance + warm_fraction * (
+        config.warm_indoor_surface_resistance - config.indoor_surface_resistance
+    )
 
 
 def _window_shutter_details(
@@ -749,7 +832,16 @@ def _calculate_room_operative_adjustment(
             config,
             facade,
         )
-        current_window_k = window.view_factor * float(shutter_details["effective_u_value"]) * config.indoor_surface_resistance
+        window_surface_resistance = _surface_resistance_for_temperature(
+            config,
+            effective_window_outdoor_temperature,
+            target_temperature,
+        )
+        current_window_k = (
+            window.view_factor
+            * float(shutter_details["effective_u_value"])
+            * window_surface_resistance
+        )
         window_k += current_window_k
         conductive_drive += current_window_k * (target_temperature - effective_window_outdoor_temperature)
         direct_irradiance = direct_normal * direct_factor * window.direct_shade_factor
@@ -765,6 +857,7 @@ def _calculate_room_operative_adjustment(
                 "facade": facade,
                 "facade_source": facade_source,
                 "window_view_factor": window.view_factor,
+                "surface_resistance": window_surface_resistance,
                 "window_k": current_window_k,
                 "direct_incidence_factor": direct_incidence_factor,
                 "awning_shading_factor": awning_shading_factor,
@@ -776,7 +869,12 @@ def _calculate_room_operative_adjustment(
         )
         window_details.append(shutter_details)
 
-    wall_k = envelope.opaque_wall_view_factor * profile.wall_u_value * config.indoor_surface_resistance
+    wall_surface_resistance = _surface_resistance_for_temperature(
+        config,
+        effective_wall_outdoor_temperature,
+        target_temperature,
+    )
+    wall_k = envelope.opaque_wall_view_factor * profile.wall_u_value * wall_surface_resistance
     conductive_drive += wall_k * (target_temperature - effective_wall_outdoor_temperature)
     unclamped_total_k = window_k + wall_k
     total_k = min(unclamped_total_k, config.maximum_total_k)
@@ -803,11 +901,16 @@ def _calculate_room_operative_adjustment(
     # (delay heating).  The consumer therefore applies target - score.
     envelope_score = -envelope_target_compensation
     window_solar_score = -current_solar_adjustment
-    room_comfort_score = _clamp(envelope_score + window_solar_score, -1.5, 1.5)
+    room_comfort_score = _clamp(
+        envelope_score + window_solar_score,
+        COMFORT_SCORE_MINIMUM,
+        COMFORT_SCORE_MAXIMUM,
+    )
     return envelope_score, window_solar_score, room_comfort_score, {
         "comfort_weight": envelope.comfort_weight,
         "construction_profile": profile.key,
         "wall_u_value": profile.wall_u_value,
+        "wall_surface_resistance": wall_surface_resistance,
         "window_k": window_k,
         "wall_k": wall_k,
         "total_k": total_k,
@@ -896,7 +999,11 @@ def _calculate_room_legacy_adjustment(
     current_solar_adjustment = -solar_coefficient * solar_access * solar_index
     envelope_score = -envelope_target_compensation
     window_solar_score = -current_solar_adjustment
-    room_comfort_score = _clamp(envelope_score + window_solar_score, -1.5, 1.5)
+    room_comfort_score = _clamp(
+        envelope_score + window_solar_score,
+        COMFORT_SCORE_MINIMUM,
+        COMFORT_SCORE_MAXIMUM,
+    )
     return envelope_score, window_solar_score, room_comfort_score, {
         "comfort_weight": envelope.comfort_weight,
         "legacy_envelope_transmission": envelope_transmission,
@@ -913,7 +1020,7 @@ def _calculate_room_legacy_adjustment(
 
 
 def round_comfort_adjustment(value: float) -> float:
-    clamped = _clamp(value, -1.5, 1.5)
+    clamped = _clamp(value, COMFORT_SCORE_MINIMUM, COMFORT_SCORE_MAXIMUM)
     rounded = floor(clamped * 10.0 + 0.5) / 10.0 if clamped >= 0.0 else ceil(clamped * 10.0 - 0.5) / 10.0
     return 0.0 if rounded == 0.0 else rounded
 
@@ -1011,6 +1118,14 @@ def calculate_comfort_adjustments(
         maximum=config.indoor_temperature_max_celsius,
         stale_after_seconds=config.input_stale_after_seconds,
     )
+    house_humidity_reading = _read_temperature(
+        reader,
+        config.house_humidity_entity_id,
+        now=now,
+        minimum=0.0,
+        maximum=100.0,
+        stale_after_seconds=config.input_stale_after_seconds,
+    )
     outdoor_sensor_reading, weather_temperature_reading, outdoor_temperature_source = _resolve_outdoor_temperature_details(
         reader,
         config,
@@ -1035,6 +1150,7 @@ def calculate_comfort_adjustments(
             else None
         )
     user_mode = reader.get_state(config.heatpump_mode_user_entity_id)
+    controller_mode = reader.get_state(config.controller_hvac_mode_entity_id)
     configured_hvac_mode = reader.get_state(config.climate_entity_id)
     hvac_action = reader.get_attr(config.climate_entity_id, "hvac_action")
 
@@ -1042,6 +1158,10 @@ def calculate_comfort_adjustments(
     zone_temperature_sources: dict[str, str] = {}
     room_diagnostics_by_zone: dict[str, list[dict[str, object]]] = {}
     input_issues_by_zone: dict[str, list[str]] = {}
+    zone_humidities: dict[str, float | None] = {}
+    zone_humidity_sources: dict[str, str] = {}
+    zone_humidity_entity_ids: dict[str, str | None] = {}
+    humidity_adjustments: dict[str, float] = {}
     for zone in config.zones:
         zone_temperature, temperature_source, room_diagnostics, input_issues = _resolve_zone_temperature_details(
             reader,
@@ -1053,7 +1173,22 @@ def calculate_comfort_adjustments(
         zone_temperatures[zone.key] = zone_temperature
         zone_temperature_sources[zone.key] = temperature_source
         room_diagnostics_by_zone[zone.key] = room_diagnostics
-        input_issues_by_zone[zone.key] = input_issues
+        zone_humidity, humidity_source, humidity_entity_id, humidity_issues = _resolve_zone_humidity_details(
+            reader,
+            zone,
+            house_humidity_reading,
+            config,
+            now,
+        )
+        zone_humidities[zone.key] = zone_humidity
+        zone_humidity_sources[zone.key] = humidity_source
+        zone_humidity_entity_ids[zone.key] = humidity_entity_id
+        humidity_adjustments[zone.key] = (
+            calculate_humidex_adjustment(zone_temperature, zone_humidity)
+            if zone_temperature is not None and zone_humidity is not None
+            else 0.0
+        )
+        input_issues_by_zone[zone.key] = input_issues + humidity_issues
 
     operating_indoor_temperature = house_temperature_reading.value
     operating_indoor_temperature_source = "house_temperature"
@@ -1069,6 +1204,7 @@ def calculate_comfort_adjustments(
             operating_indoor_temperature_source = "unavailable"
     operating_mode, operating_mode_source = resolve_operating_mode_with_source(
         user_mode=user_mode,
+        controller_mode=controller_mode,
         hvac_action=hvac_action,
         configured_hvac_mode=configured_hvac_mode,
         last_valid_mode=last_valid_operating_mode,
@@ -1138,6 +1274,11 @@ def calculate_comfort_adjustments(
                 "effective_outdoor_model": "separate_window_and_wall_filters",
                 "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
                 "fabric_solar_score": 0.0,
+                "humidity": zone_humidities[zone.key],
+                "humidity_source": zone_humidity_sources[zone.key],
+                "humidity_entity_id": zone_humidity_entity_ids[zone.key],
+                "humidity_temperature": zone_temperature,
+                "humidity_adjustment": humidity_adjustments[zone.key],
             }
             continue
 
@@ -1220,6 +1361,11 @@ def calculate_comfort_adjustments(
                 "effective_outdoor_model": "separate_window_and_wall_filters",
                 "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
                 "fabric_solar_score": 0.0,
+                "humidity": zone_humidities[zone.key],
+                "humidity_source": zone_humidity_sources[zone.key],
+                "humidity_entity_id": zone_humidity_entity_ids[zone.key],
+                "humidity_temperature": zone_temperature,
+                "humidity_adjustment": humidity_adjustments[zone.key],
             }
             continue
         envelope_adjustment = weighted_envelope_adjustment / comfort_weight_total
@@ -1228,7 +1374,14 @@ def calculate_comfort_adjustments(
             zone.fabric_solar,
             resolved_filtered_solar_irradiances[zone.key],
         )
-        raw_adjustment = _clamp(envelope_adjustment + solar_adjustment + fabric_solar_score, -1.5, 1.5)
+        raw_adjustment = _clamp(
+            envelope_adjustment
+            + solar_adjustment
+            + fabric_solar_score
+            + humidity_adjustments[zone.key],
+            COMFORT_SCORE_MINIMUM,
+            COMFORT_SCORE_MAXIMUM,
+        )
         envelope_adjustments[zone.key] = envelope_adjustment
         solar_adjustments[zone.key] = solar_adjustment
         fabric_solar_scores[zone.key] = fabric_solar_score
@@ -1248,6 +1401,11 @@ def calculate_comfort_adjustments(
             "effective_outdoor_model": "separate_window_and_wall_filters",
             "filtered_solar_irradiance": resolved_filtered_solar_irradiances[zone.key],
             "fabric_solar_score": fabric_solar_score,
+            "humidity": zone_humidities[zone.key],
+            "humidity_source": zone_humidity_sources[zone.key],
+            "humidity_entity_id": zone_humidity_entity_ids[zone.key],
+            "humidity_temperature": zone_temperature,
+            "humidity_adjustment": humidity_adjustments[zone.key],
             "window_k": weighted_window_k / comfort_weight_total,
             "wall_k": weighted_wall_k / comfort_weight_total,
             "total_k": weighted_total_k / comfort_weight_total,
@@ -1276,11 +1434,16 @@ def calculate_comfort_adjustments(
 
     global_input_issues: list[str] = []
     _append_issue(global_input_issues, house_temperature_reading)
+    _append_issue(global_input_issues, house_humidity_reading)
     _append_issue(global_input_issues, outdoor_sensor_reading)
     _append_issue(global_input_issues, weather_temperature_reading)
 
     return ComfortAdjustmentResult(
         zone_temperatures=zone_temperatures,
+        zone_humidities=zone_humidities,
+        zone_humidity_sources=zone_humidity_sources,
+        zone_humidity_entity_ids=zone_humidity_entity_ids,
+        humidity_adjustments=humidity_adjustments,
         outdoor_temperature=outdoor_temperature,
         effective_outdoor_temperatures=resolved_effective_outdoor_temperatures,
         effective_window_outdoor_temperatures=resolved_window_outdoor_temperatures,

@@ -54,6 +54,7 @@ from pyscript.apps.temptamer.config import (
 from pyscript.apps.temptamer.comfort_adjustments import (
     apply_adjustment_hysteresis,
     calculate_comfort_adjustments,
+    calculate_humidex_adjustment,
     filter_outdoor_temperature,
     resolve_operating_mode as resolve_comfort_adjustment_operating_mode,
     resolve_solar_index,
@@ -363,6 +364,169 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertEqual(result.adjustments["dining"], -0.9)
         self.assertEqual(result.zone_diagnostics["bedroom_1_2"]["room_aggregation"], "comfort_weighted_mean")
 
+    def test_humidex_adjustment_matches_known_warm_weather_value(self):
+        self.assertAlmostEqual(calculate_humidex_adjustment(23.0, 50.0), 2.2459, places=4)
+
+    def test_zone_humidity_uses_local_sensor_then_house_fallback(self):
+        result = self.calculate(
+            state_overrides={
+                "sensor.rumpus_white_clock_humidity": "50.0",
+                "sensor.air_monitor_lite_c705_humidity": "55.0",
+                "sensor.climate_indoor_humidity": "65.0",
+            }
+        )
+
+        self.assertEqual(result.zone_humidities["downstairs"], 50.0)
+        self.assertEqual(result.zone_humidity_sources["downstairs"], "zone_sensor")
+        self.assertEqual(
+            result.zone_humidity_entity_ids["downstairs"],
+            "sensor.rumpus_white_clock_humidity",
+        )
+        self.assertEqual(result.zone_humidities["office"], 55.0)
+        self.assertEqual(result.zone_humidity_sources["office"], "zone_sensor")
+        self.assertEqual(result.zone_humidities["dining"], 65.0)
+        self.assertEqual(result.zone_humidity_sources["dining"], "house_fallback")
+        self.assertEqual(
+            result.zone_humidity_entity_ids["dining"],
+            "sensor.climate_indoor_humidity",
+        )
+        self.assertAlmostEqual(
+            result.humidity_adjustments["office"],
+            calculate_humidex_adjustment(21.0, 55.0),
+        )
+        self.assertAlmostEqual(
+            result.raw_adjustments["office"],
+            result.envelope_adjustments["office"]
+            + result.solar_adjustments["office"]
+            + result.fabric_solar_scores["office"]
+            + result.humidity_adjustments["office"],
+        )
+
+    def test_humidity_composition_is_clamped_and_rounded_to_expanded_score_range(self):
+        humid = self.calculate(
+            state_overrides={
+                "sensor.office_average_temperature": "23.0",
+                "sensor.air_monitor_lite_c705_humidity": "100.0",
+            }
+        )
+        dry = self.calculate(
+            state_overrides={
+                "sensor.office_average_temperature": "20.0",
+                "sensor.air_monitor_lite_c705_humidity": "0.0",
+            }
+        )
+
+        self.assertEqual(humid.raw_adjustments["office"], 3.0)
+        self.assertEqual(humid.adjustments["office"], 3.0)
+        self.assertEqual(dry.raw_adjustments["office"], -3.0)
+        self.assertEqual(dry.adjustments["office"], -3.0)
+
+    def test_humidex_contribution_is_the_same_in_heat_and_cool_modes(self):
+        state_overrides = {
+            "sensor.office_average_temperature": "23.0",
+            "sensor.air_monitor_lite_c705_humidity": "50.0",
+        }
+        heating = self.calculate(state_overrides=state_overrides)
+        cooling = self.calculate(
+            state_overrides={
+                **state_overrides,
+                "input_select.heatpump_mode_user": "Cool",
+                TEST_CLIMATE_ENTITY: "cool",
+            }
+        )
+
+        self.assertAlmostEqual(heating.humidity_adjustments["office"], 2.2459, places=4)
+        self.assertEqual(
+            cooling.humidity_adjustments["office"],
+            heating.humidity_adjustments["office"],
+        )
+
+    def test_warm_day_coefficients_produce_three_quarters_envelope_and_one_quarter_solar_effect(self):
+        result = self.calculate(
+            state_overrides={
+                "sensor.gw3000c_outdoor_temperature": "23.0",
+                "sensor.gw3000c_solar_radiation": "600.0",
+            },
+            attr_overrides={"sun.sun": {"elevation": 30.0, "azimuth": 180.0}},
+            reference_zone_targets={"office": (20.0, 20.0)},
+        )
+
+        self.assertAlmostEqual(result.envelope_adjustments["office"], 1.5, places=2)
+        self.assertEqual(result.solar_adjustments["office"], 0.5)
+        office_room = result.zone_diagnostics["office"]["room_values"][0]
+        self.assertEqual(office_room["wall_surface_resistance"], 0.415)
+        self.assertEqual(
+            office_room["windows"][0]["surface_resistance"],
+            0.415,
+        )
+
+        cool_day = self.calculate(
+            state_overrides={"sensor.gw3000c_outdoor_temperature": "19.0"},
+            reference_zone_targets={"office": (20.0, 20.0)},
+        )
+        cool_room = cool_day.zone_diagnostics["office"]["room_values"][0]
+        self.assertEqual(cool_room["wall_surface_resistance"], 0.12)
+        self.assertEqual(cool_room["windows"][0]["surface_resistance"], 0.12)
+
+        midpoint = self.calculate(
+            state_overrides={"sensor.gw3000c_outdoor_temperature": "21.5"},
+            reference_zone_targets={"office": (20.0, 20.0)},
+        )
+        midpoint_room = midpoint.zone_diagnostics["office"]["room_values"][0]
+        self.assertAlmostEqual(midpoint_room["wall_surface_resistance"], 0.2675)
+
+    def test_invalid_or_stale_local_humidity_falls_back_to_house(self):
+        now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+        result = self.calculate(
+            state_overrides={
+                "sensor.rumpus_white_clock_humidity": "101.0",
+                "sensor.air_monitor_lite_c705_humidity": "50.0",
+                "sensor.climate_indoor_humidity": "60.0",
+            },
+            attr_overrides={
+                "sensor.air_monitor_lite_c705_humidity": {
+                    "last_updated": now - timedelta(seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.input_stale_after_seconds + 1)
+                }
+            },
+            now=now,
+        )
+
+        self.assertEqual(result.zone_humidities["downstairs"], 60.0)
+        self.assertEqual(result.zone_humidity_sources["downstairs"], "house_fallback")
+        self.assertIn(
+            "sensor.rumpus_white_clock_humidity:rejected_implausible",
+            result.zone_diagnostics["downstairs"]["input_issues"],
+        )
+        self.assertEqual(result.zone_humidities["office"], 60.0)
+        self.assertEqual(result.zone_humidity_sources["office"], "house_fallback")
+        self.assertIn(
+            "sensor.air_monitor_lite_c705_humidity:stale",
+            result.zone_diagnostics["office"]["input_issues"],
+        )
+
+        nonnumeric = self.calculate(
+            state_overrides={
+                "sensor.air_monitor_lite_c705_humidity": "not-a-number",
+                "sensor.climate_indoor_humidity": "58.0",
+            }
+        )
+        self.assertEqual(nonnumeric.zone_humidities["office"], 58.0)
+        self.assertEqual(nonnumeric.zone_humidity_sources["office"], "house_fallback")
+        self.assertIn(
+            "sensor.air_monitor_lite_c705_humidity:rejected_non_finite_or_not_numeric",
+            nonnumeric.zone_diagnostics["office"]["input_issues"],
+        )
+
+    def test_missing_humidity_contributes_zero_without_invalidating_score(self):
+        result = self.calculate()
+
+        self.assertIsNone(result.zone_humidities["office"])
+        self.assertEqual(result.zone_humidity_sources["office"], "unavailable")
+        self.assertIsNone(result.zone_humidity_entity_ids["office"])
+        self.assertEqual(result.humidity_adjustments["office"], 0.0)
+        self.assertTrue(result.calculation_validity["office"])
+        self.assertEqual(result.zone_diagnostics["office"]["humidity_adjustment"], 0.0)
+
     def test_temperature_gap_uses_unadjusted_zone_target_but_mode_uses_room_temperature(self):
         result = self.calculate(
             {
@@ -376,7 +540,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
         self.assertEqual(result.operating_modes["office"], "heat")
         self.assertEqual(result.reference_temperatures["office"], 19.7)
-        self.assertAlmostEqual(result.raw_adjustments["office"], -0.324, places=3)
+        self.assertAlmostEqual(result.raw_adjustments["office"], -0.314, places=3)
         self.assertEqual(result.adjustments["office"], -0.3)
 
     def test_office_comfort_score_combines_inverse_operative_terms_and_filtered_fabric_solar(self):
@@ -420,6 +584,23 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
         self.assertEqual(result.operating_mode, "heat")
         self.assertEqual(result.operating_mode_source, "configured_hvac_mode")
+        self.assertEqual(set(result.operating_modes.values()), {"heat"})
+
+    def test_controller_heat_selection_overrides_cached_cool_mode(self):
+        now = datetime(2026, 9, 24, 11, 23, tzinfo=timezone.utc)
+        result = self.calculate(
+            state_overrides={
+                "input_select.heatpump_mode_user": "HeatCool",
+                "input_select.temptamer_hvac_mode": "Heat",
+                TEST_CLIMATE_ENTITY: "off",
+            },
+            now=now,
+            last_valid_operating_mode="cool",
+            last_valid_operating_mode_at=now - timedelta(minutes=1),
+        )
+
+        self.assertEqual(result.operating_mode, "heat")
+        self.assertEqual(result.operating_mode_source, "controller_hvac_mode")
         self.assertEqual(set(result.operating_modes.values()), {"heat"})
 
     def test_operative_diagnostics_expose_components_room_weights_and_physical_shutter(self):
@@ -525,7 +706,7 @@ class ComfortAdjustmentTests(unittest.TestCase):
             window["direct_irradiance"],
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.solar_maximum_direct_normal_irradiance,
         )
-        self.assertLessEqual(result.solar_adjustments["office"], 0.4)
+        self.assertLessEqual(result.solar_adjustments["office"], 0.5)
 
         below_horizon = self.calculate(
             {
@@ -768,8 +949,8 @@ class ComfortAdjustmentTests(unittest.TestCase):
                 "sun.sun": {"elevation": 30.0, "azimuth": 135.0},
             },
         )
-        self.assertEqual(exposed.adjustments["office"], -0.4)
-        self.assertEqual(tapered.adjustments["office"], -0.6)
+        self.assertEqual(exposed.adjustments["office"], -0.3)
+        self.assertEqual(tapered.adjustments["office"], -0.5)
         self.assertEqual(band_edge.adjustments["office"], -0.8)
         self.assertGreater(exposed.solar_adjustments["office"], tapered.solar_adjustments["office"])
         self.assertGreater(tapered.solar_adjustments["office"], band_edge.solar_adjustments["office"])
@@ -832,8 +1013,12 @@ class ComfortAdjustmentTests(unittest.TestCase):
 
     def test_adjustment_trigger_inputs_exclude_output_input_numbers(self):
         self.assertIn("input_select.heatpump_mode_user", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn("input_select.temptamer_hvac_mode", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn(f"{TEST_CLIMATE_ENTITY}.hvac_action", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("cover.officeshutters.current_position", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn("sensor.climate_indoor_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn("sensor.rumpus_white_clock_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn("sensor.air_monitor_lite_c705_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
             self.assertNotIn(zone.output_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
             self.assertIn(zone.output_entity_id, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
@@ -1171,7 +1356,7 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             )
             calculated_office = calculations[0].adjustments["office"]
 
-            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "2\n")
+            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "5\n")
 
         self.assertEqual(published_office, calculated_office)
         self.assertNotEqual(published_office, 1.5)
@@ -1431,6 +1616,57 @@ class TempTamerLoggingTests(unittest.TestCase):
             logger.info("COMFORT DIAGNOSTICS: zone=office visible")
         self.assertIn("COMFORT DIAGNOSTICS: zone=office visible", captured.output[0])
 
+    def test_comfort_diagnostics_report_humidity_value_source_entity_and_score(self):
+        now = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
+        result = calculate_comfort_adjustments(
+            FakeReader(
+                comfort_adjustment_state_map(
+                    **{
+                        "sensor.air_monitor_lite_c705_humidity": "50.0",
+                        "sensor.climate_indoor_humidity": "60.0",
+                    }
+                ),
+                comfort_adjustment_attr_map(),
+            ),
+            config=DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+            cover_facades=COMFORT_ADJUSTMENT_COVER_FACADES,
+            now=now,
+        )
+        publications = {
+            zone.key: {
+                "raw_adjustment": result.raw_adjustments[zone.key],
+                "rounded_adjustment": result.adjustments[zone.key],
+                "unrounded_rate_limited_adjustment": result.adjustments[zone.key],
+                "filtered_adjustment": result.adjustments[zone.key],
+                "calculation_status": "calculated",
+                "last_valid_age_seconds": 0.0,
+            }
+            for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+        }
+        TEMPTAMER_LOGGING_CATEGORIES["comfort_adjustment_diagnostics"] = True
+
+        with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
+            temptamer_main._log_comfort_adjustment_diagnostics(result, publications, now)
+
+        office_log = next(message for message in captured.output if "zone=office" in message)
+        self.assertIn("humidity=50.0", office_log)
+        self.assertIn("humidity_source=zone_sensor", office_log)
+        self.assertIn("humidity_entity=sensor.air_monitor_lite_c705_humidity", office_log)
+        self.assertIn("humidity_score=", office_log)
+        calibration = temptamer_main._comfort_adjustment_calibration_parameters()
+        self.assertEqual(calibration["score_range"], (-3.0, 3.0))
+        self.assertEqual(calibration["warm_indoor_surface_resistance"], 0.415)
+        self.assertEqual(
+            calibration["warm_surface_resistance_full_effect_delta_celsius"],
+            3.0,
+        )
+        self.assertEqual(calibration["solar_mrt_coefficient"], 0.015)
+        self.assertEqual(calibration["solar_adjustment_limit"], 0.5)
+        self.assertEqual(
+            calibration["zone_humidity_entities"]["downstairs"],
+            "sensor.rumpus_white_clock_humidity",
+        )
+
     def test_reload_removes_legacy_pyscript_logging_filter_without_installing_a_callback(self):
         raw_logger = logging.getLogger("pyscript.temptamer")
         legacy_filter = type("_TempTamerCategoryFilter", (logging.Filter,), {})()
@@ -1547,10 +1783,10 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertEqual(unavailable.zones["office"].comfort_adjustment, 0.0)
-        self.assertEqual(positive.zones["office"].comfort_adjustment, 1.5)
-        self.assertEqual(negative.zones["office"].comfort_adjustment, -1.5)
-        self.assertEqual(positive.zones["office"].scheme.ideal_target, 18.2)
-        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 22.0)
+        self.assertEqual(positive.zones["office"].comfort_adjustment, 3.0)
+        self.assertEqual(negative.zones["office"].comfort_adjustment, -3.0)
+        self.assertEqual(positive.zones["office"].scheme.ideal_target, 16.7)
+        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 23.5)
 
     def test_global_setpoint_adjustment_shifts_all_zone_thresholds_and_composes(self):
         baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
@@ -1588,7 +1824,7 @@ class TempTamerTests(unittest.TestCase):
                         "input_number.temptamer_setpoint_adjustment": str(manual),
                         "input_number.comfort_adjustment_office": str(automatic),
                     }), base_attr_map()))
-                    clamped_auto = -1.5 if automatic < 0 else 1.5
+                    clamped_auto = -3.0 if automatic < 0 else 3.0
                     self.assertEqual(adjusted.global_setpoint_adjustment, manual)
                     self.assertEqual(adjusted.zones["office"].comfort_adjustment, clamped_auto)
                     for key, zone in adjusted.zones.items():

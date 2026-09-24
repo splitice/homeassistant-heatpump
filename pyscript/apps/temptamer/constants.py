@@ -13,6 +13,12 @@ COMFORT_MODE_POWER_DAY = "PowerDay"
 COMFORT_MODE_POWER_OFF = "PowerOff"
 COMFORT_MODE_AUTO = "Auto"
 
+# Automatic comfort scores are bounded separately from the user's global
+# setpoint adjustment.  Keep calculation, publication, and consumption on the
+# same range.
+COMFORT_SCORE_MINIMUM = -3.0
+COMFORT_SCORE_MAXIMUM = 3.0
+
 CONTROL_HVAC_MODE_HEAT = "Heat"
 CONTROL_HVAC_MODE_COOL = "Cool"
 CONTROL_HVAC_MODE_HEATCOOL = "HeatCool"

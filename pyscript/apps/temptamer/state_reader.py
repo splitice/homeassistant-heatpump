@@ -12,6 +12,8 @@ from .constants import (
     COMFORT_MODE_AUTO,
     COMFORT_MODE_OFF,
     COMFORT_MODE_POWER_OFF,
+    COMFORT_SCORE_MAXIMUM,
+    COMFORT_SCORE_MINIMUM,
     CONTROL_HVAC_MODE_COOL,
     CONTROL_HVAC_MODE_HEAT,
     CONTROL_HVAC_MODE_HEATCOOL,
@@ -133,7 +135,7 @@ def _resolve_manual_adjustment(reader: StateReader, entity_id: str | None) -> fl
 def _resolve_comfort_adjustment(reader: StateReader, entity_id: str | None) -> float:
     """Keep automatic comfort scores within the documented safe range."""
     adjustment = _resolve_manual_adjustment(reader, entity_id)
-    return max(-1.5, min(1.5, adjustment))
+    return max(COMFORT_SCORE_MINIMUM, min(COMFORT_SCORE_MAXIMUM, adjustment))
 
 
 def _shift_control_scheme(scheme: ControlScheme, setpoint_offset: float) -> ControlScheme:

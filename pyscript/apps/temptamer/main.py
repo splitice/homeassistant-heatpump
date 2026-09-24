@@ -64,6 +64,8 @@ from .constants import (
     APP_NAME,
     COMFORT_MODE_POWER_DAY,
     COMFORT_MODE_POWER_OFF,
+    COMFORT_SCORE_MAXIMUM,
+    COMFORT_SCORE_MINIMUM,
     CONTROL_HVAC_MODE_COOL,
     CONTROL_HVAC_MODE_HEAT,
     CONTROL_HVAC_MODE_HEATCOOL,
@@ -1036,8 +1038,18 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
         rooms[zone.key] = tuple(room_parameters)
     return {
         "model": config.calculation_model,
+        "score_range": (COMFORT_SCORE_MINIMUM, COMFORT_SCORE_MAXIMUM),
+        "house_humidity_entity": config.house_humidity_entity_id,
+        "zone_humidity_entities": {
+            zone.key: zone.humidity_entity_id
+            for zone in config.zones
+        },
         "operative_air_weight": config.operative_air_weight,
         "indoor_surface_resistance": config.indoor_surface_resistance,
+        "warm_indoor_surface_resistance": config.warm_indoor_surface_resistance,
+        "warm_surface_resistance_full_effect_delta_celsius": (
+            config.warm_surface_resistance_full_effect_delta_celsius
+        ),
         "maximum_total_k": config.maximum_total_k,
         "minimum_operative_denominator": config.minimum_operative_denominator,
         "last_valid_operating_mode_hold_seconds": config.last_valid_operating_mode_hold_seconds,
@@ -1266,7 +1278,7 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         calculation_status = str(publication["calculation_status"])
         source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
         LOGGER.info(
-            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s humidity_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s humidity=%s humidity_source=%s humidity_entity=%s humidity_temperature=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
             now.isoformat(),
             zone_key,
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
@@ -1275,12 +1287,17 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
             result.envelope_adjustments[zone_key],
             result.solar_adjustments[zone_key],
             result.fabric_solar_scores[zone_key],
+            result.humidity_adjustments[zone_key],
             publication["raw_adjustment"],
             publication["rounded_adjustment"],
             publication["unrounded_rate_limited_adjustment"],
             publication["filtered_adjustment"],
             result.reference_temperatures[zone_key],
             result.filtered_solar_irradiances[zone_key],
+            result.zone_humidities[zone_key],
+            result.zone_humidity_sources[zone_key],
+            result.zone_humidity_entity_ids[zone_key],
+            result.zone_temperatures[zone_key],
             result.effective_window_outdoor_temperatures[zone_key],
             result.effective_wall_outdoor_temperatures[zone_key],
             zone_diagnostics.get("filter_warming_up", result.filter_warming_up.get(zone_key, False)),
