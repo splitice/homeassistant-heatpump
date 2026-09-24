@@ -578,3 +578,34 @@ def resolve_zone_actions(
         ), tuple(sorted(predicted_open))
 
     return actions, tuple(sorted(predicted_open))
+
+
+def resolve_dry_zone_actions(snapshot: DemandSnapshot) -> tuple[list[ZoneAction], tuple[str, ...]]:
+    """Open every enabled zone for safe whole-house dry-mode airflow."""
+    opening_actions: list[ZoneAction] = []
+    closing_actions: list[ZoneAction] = []
+    predicted_open: list[str] = []
+    for zone_key, zone in snapshot.zones.items():
+        if zone.is_enabled_by_mode:
+            predicted_open.append(zone_key)
+            if not zone.switch_is_on:
+                opening_actions.append(
+                    ZoneAction(
+                        zone_key=zone_key,
+                        turn_on=True,
+                        reason="PowerDay dry mode requires whole-house airflow",
+                        safety_required=True,
+                        discretionary=False,
+                    )
+                )
+        elif zone.switch_is_on:
+            closing_actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=False,
+                    reason="zone comfort mode is Off during PowerDay dry mode",
+                    discretionary=False,
+                )
+            )
+    predicted_open.sort()
+    return opening_actions + closing_actions, tuple(predicted_open)

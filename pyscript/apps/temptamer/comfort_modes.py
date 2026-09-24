@@ -8,6 +8,9 @@ from typing import ClassVar, Protocol
 from .constants import (
     COMFORT_MODE_POWER_DAY,
     CONTROL_HVAC_MODE_HEAT,
+    POWERDAY_HEATSOAK_FULL,
+    POWERDAY_HEATSOAK_REDUCED,
+    POWERDAY_HEATSOAK_SUPPRESSED,
     SCHEME_BEDROOM,
     SCHEME_DAY_LIVING,
     SCHEME_DINING_BASIC,
@@ -33,6 +36,8 @@ class ComfortModeSnapshotData:
     downstairs_temp: float | None = None
     poweroff_active: bool = False
     now: datetime | None = None
+    free_power_heat_soak_level: str = POWERDAY_HEATSOAK_FULL
+    surplus_heat_sink_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,7 @@ class PowerComfortMode(DefaultComfortMode):
     # from trying to call its EvalLocalVar wrapper at runtime.
     free_power_setpoint_boost: FreePowerSetpointBoost = FreePowerSetpointBoost()
     free_power_zone_setpoint_boosts: Mapping[str, FreePowerSetpointBoost] = field(default_factory=dict)
+    reduced_heat_soak_multiplier: float = 0.5
     free_power_state: str = "0"
     heat_soak_source_schemes: frozenset[str] = frozenset({SCHEME_DINING_BASIC, SCHEME_BEDROOM})
     heat_soak_scheme: str = SCHEME_DAY_LIVING
@@ -198,18 +204,43 @@ class PowerComfortMode(DefaultComfortMode):
             and snapshot_data.now.time() < self.downstairs_heat_start_time
         ):
             return SCHEME_NIGHT
-        heat_sink_available = (
-            snapshot_data.heat_sink_available if snapshot_data is not None else self._free_power_is_available(reader)
-        )
-        if scheme_name in self.heat_soak_source_schemes and heat_sink_available:
+        full_heat_sink_available = self._full_heat_sink_available(snapshot_data, reader)
+        if scheme_name in self.heat_soak_source_schemes and full_heat_sink_available:
             return self.heat_soak_scheme
         return scheme_name
 
+    def _full_heat_sink_available(
+        self,
+        snapshot_data: ComfortModeSnapshotData | None,
+        reader: StateReaderLike,
+    ) -> bool:
+        if snapshot_data is None:
+            return self._free_power_is_available(reader)
+        if snapshot_data.surplus_heat_sink_available:
+            return True
+        return (
+            snapshot_data.free_power_available
+            and snapshot_data.free_power_heat_soak_level == POWERDAY_HEATSOAK_FULL
+        )
+
     def adjust_zone(self, zone, snapshot_data: ComfortModeSnapshotData):
+        if zone.scheme.name == SCHEME_OFF:
+            return zone
+        independent_heat_sink_available = (
+            snapshot_data.surplus_heat_sink_available
+            or snapshot_data.battery_free_power_boost_available
+        )
         if (
-            not snapshot_data.heat_sink_available
-            and not snapshot_data.battery_free_power_boost_available
-        ) or zone.scheme.name == SCHEME_OFF:
+            snapshot_data.free_power_available
+            and snapshot_data.free_power_heat_soak_level == POWERDAY_HEATSOAK_REDUCED
+            and not independent_heat_sink_available
+        ):
+            return self._adjust_zone_for_reduced_heat_soak(zone)
+        if (
+            snapshot_data.free_power_available
+            and snapshot_data.free_power_heat_soak_level == POWERDAY_HEATSOAK_SUPPRESSED
+            and not independent_heat_sink_available
+        ):
             return zone
         if (
             zone.key in self.free_power_downstairs_gated_zone_keys
@@ -219,6 +250,8 @@ class PowerComfortMode(DefaultComfortMode):
             )
         ):
             return zone
+        if not snapshot_data.heat_sink_available and not independent_heat_sink_available:
+            return zone
         adjusted_continue_until = zone.scheme.continue_until + self._free_power_setpoint_boost(
             zone.key,
             snapshot_data,
@@ -227,6 +260,7 @@ class PowerComfortMode(DefaultComfortMode):
         if (
             snapshot_data.comfort_mode == COMFORT_MODE_POWER_DAY
             and snapshot_data.free_power_available
+            and snapshot_data.free_power_heat_soak_level == POWERDAY_HEATSOAK_FULL
             and zone.key == self.free_power_downstairs_zone_key
         ):
             adjusted_enable_outside += self.free_power_downstairs_enable_outside_supplement
@@ -238,6 +272,22 @@ class PowerComfortMode(DefaultComfortMode):
         )
         return replace(zone, scheme=adjusted_scheme)
 
+    def _adjust_zone_for_reduced_heat_soak(self, zone):
+        boost = self.free_power_zone_setpoint_boosts.get(
+            zone.key,
+            self.free_power_setpoint_boost,
+        )
+        adjustment = boost.initial * self.reduced_heat_soak_multiplier
+        return replace(
+            zone,
+            scheme=replace(
+                zone.scheme,
+                enable_outside=zone.scheme.enable_outside + adjustment,
+                continue_until=zone.scheme.continue_until + adjustment,
+                ideal_target=zone.scheme.ideal_target + adjustment,
+            ),
+        )
+
     def _free_power_setpoint_boost(
         self,
         zone_key: str,
@@ -247,7 +297,10 @@ class PowerComfortMode(DefaultComfortMode):
             zone_key,
             self.free_power_setpoint_boost,
         )
-        if snapshot_data.battery_free_power_boost_available and not snapshot_data.free_power_available:
+        if snapshot_data.battery_free_power_boost_available and (
+            not snapshot_data.free_power_available
+            or snapshot_data.free_power_heat_soak_level != POWERDAY_HEATSOAK_FULL
+        ):
             return boost.initial
         if snapshot_data.free_power_later_available or (
             snapshot_data.now is not None and snapshot_data.now.time() >= self.free_power_later_start_time

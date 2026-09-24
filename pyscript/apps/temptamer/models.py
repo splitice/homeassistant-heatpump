@@ -82,6 +82,8 @@ class DemandSnapshot:
     # its reference temperature, avoiding a feedback loop through adjusted schemes.
     base_zone_targets: dict[str, tuple[float, float]] = field(default_factory=dict)
     global_setpoint_adjustment: float = 0.0
+    free_power_heat_soak_level: str = "full"
+    surplus_heat_sink_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,7 @@ class EquipmentDemand:
     heat_requested: bool = False
     cool_requested: bool = False
     fan_only_requested: bool = False
+    dry_requested: bool = False
     maintain_heat_mode: bool = False
     maintain_cool_mode: bool = False
     requested_by_zones: tuple[str, ...] = field(default_factory=tuple)

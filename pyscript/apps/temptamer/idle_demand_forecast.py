@@ -22,6 +22,7 @@ class WeatherForecastPoint:
     at: datetime
     temperature: float | None
     condition: str | None = None
+    humidity: float | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ def parse_hourly_weather_forecast(response: object, weather_entity_id: str) -> t
                 at=at,
                 temperature=_parse_float(raw_point.get("temperature")),
                 condition=condition,
+                humidity=_parse_float(raw_point.get("humidity")),
             )
         )
     points.sort(key=lambda point: point.at)
@@ -118,7 +120,14 @@ def forecast_temperature_at(
     for point in points:
         normalized_point_at = _normalize_datetime(point.at)
         if normalized_point_at is not None and point.temperature is not None:
-            anchors.append(WeatherForecastPoint(normalized_point_at, point.temperature, point.condition))
+            anchors.append(
+                WeatherForecastPoint(
+                    normalized_point_at,
+                    point.temperature,
+                    point.condition,
+                    point.humidity,
+                )
+            )
     if current_outdoor_temperature is not None:
         anchors.append(WeatherForecastPoint(normalized_now, current_outdoor_temperature))
     anchors.sort(key=lambda point: point.at)

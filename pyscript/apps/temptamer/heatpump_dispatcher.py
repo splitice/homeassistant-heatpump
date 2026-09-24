@@ -21,9 +21,11 @@ from .constants import (
     HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP,
     HVAC_START_FAN_RAMP_DURATION_SECONDS,
     HVAC_COOL,
+    HVAC_DRY,
     HVAC_FAN_ONLY,
     HVAC_HEAT,
     HVAC_OFF,
+    POWERDAY_HEATSOAK_FULL,
     IDLE_HEAT_STAGE_1_SECONDS,
     IDLE_HEAT_STAGE_2_SECONDS,
     IDLE_HEAT_STAGE_3_SECONDS,
@@ -232,7 +234,11 @@ def _powerday_downstairs_free_power_direct_target_adjustment(
     predicted_open_zones: tuple[str, ...],
 ) -> float:
     """Return the signed direct target adjustment for an active downstairs call."""
-    if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY or not snapshot.free_power_available:
+    if (
+        snapshot.comfort_mode != COMFORT_MODE_POWER_DAY
+        or not snapshot.free_power_available
+        or snapshot.free_power_heat_soak_level != POWERDAY_HEATSOAK_FULL
+    ):
         return 0.0
     if "downstairs" not in predicted_open_zones:
         return 0.0
@@ -1056,6 +1062,7 @@ def build_dispatch_plan(
         demand.heat_requested
         or demand.maintain_heat_mode
         or demand.fan_only_requested
+        or demand.dry_requested
         or demand.cool_requested
         or demand.maintain_cool_mode
     )
@@ -1069,16 +1076,29 @@ def build_dispatch_plan(
     if not predicted_open_zones and has_active_equipment_demand:
         return DispatchPlan(turn_off=True, open_zones=predicted_open_zones, reason="no zones open for safe dispatch")
 
+    if demand.dry_requested:
+        return DispatchPlan(
+            turn_off=False,
+            hvac_mode=HVAC_DRY,
+            requested_by_zones=demand.requested_by_zones,
+            open_zones=predicted_open_zones,
+            reason=demand.reason,
+        )
+
     reported_open_zone_count = _reported_open_zone_count(snapshot)
 
     def resolve_plan_fan_mode() -> str | None:
+        full_heat_sink_available = snapshot.surplus_heat_sink_available or (
+            snapshot.free_power_available
+            and snapshot.free_power_heat_soak_level == POWERDAY_HEATSOAK_FULL
+        )
         return resolve_fan_mode(
             current_fan_mode,
             current_hvac_mode,
             demand,
             comfort_mode_changed=comfort_mode_changed,
             comfort_mode=snapshot.comfort_mode_behavior,
-            free_power_available=snapshot.heat_sink_available,
+            free_power_available=full_heat_sink_available,
             open_zone_count=reported_open_zone_count,
             supported_fan_modes=supported_fan_modes,
             fan_speed_decrease_at=fan_speed_decrease_at,
@@ -1222,7 +1242,13 @@ def build_dispatch_plan(
     if idle_hvac_mode in {HVAC_HEAT, HVAC_COOL}:
         powerday_heat_soak_active = (
             snapshot.comfort_mode == COMFORT_MODE_POWER_DAY
-            and snapshot.heat_sink_available
+            and (
+                snapshot.surplus_heat_sink_available
+                or (
+                    snapshot.free_power_available
+                    and snapshot.free_power_heat_soak_level == POWERDAY_HEATSOAK_FULL
+                )
+            )
             and idle_hvac_mode == HVAC_HEAT
         )
         normalized_now = _normalize_timestamp(now)

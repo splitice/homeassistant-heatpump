@@ -43,10 +43,15 @@ from .config import (
     POWERDAY_FREE_POWER_PV_POWER_THRESHOLD,
     POWERDAY_FREE_POWER_START_TIME,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
+    POWERDAY_INDOOR_HUMIDITY_SENSOR,
+    POWERDAY_DRY_CYCLE_STATE_FILE,
+    POWERDAY_DRY_HEAT_TRANSITION_SECONDS,
+    POWERDAY_DRY_MAX_SECONDS,
     POWEROFF_ACTIVATION_BATTERY_THRESHOLD,
     POWEROFF_DEACTIVATION_BATTERY_THRESHOLD,
     POWEROFF_MIN_ACTIVATION_SECONDS,
     POWEROFF_PV_POWER_THRESHOLD,
+    WEATHER_FORECAST_MAX_AGE_SECONDS,
 )
 from .comfort_adjustments import (
     apply_adjustment_hysteresis,
@@ -59,6 +64,9 @@ from .constants import (
     APP_NAME,
     COMFORT_MODE_POWER_DAY,
     COMFORT_MODE_POWER_OFF,
+    CONTROL_HVAC_MODE_COOL,
+    CONTROL_HVAC_MODE_HEAT,
+    CONTROL_HVAC_MODE_HEATCOOL,
     CONTROL_HVAC_MODE_MANUAL,
     CONTROL_INTERVAL_SECONDS,
     HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS,
@@ -66,8 +74,11 @@ from .constants import (
     HVAC_START_FAN_RAMP_DURATION_SECONDS,
     HVAC_START_FAN_RAMP_MIN_OFF_SECONDS,
     HVAC_COOL,
+    HVAC_DRY,
     HVAC_HEAT,
     HVAC_OFF,
+    NORMAL_RECALCULATION_DEBOUNCE_SECONDS,
+    POWERDAY_HEATSOAK_FULL,
     SWITCH_STATE_SETTLE_SECONDS,
 )
 from .demand_resolver import resolve_equipment_demand, resolve_operating_mode
@@ -87,8 +98,15 @@ from .idle_demand_forecast import (
     forecast_idle_demand,
     parse_hourly_weather_forecast,
 )
+from .models import DispatchPlan, EquipmentDemand
+from .powerday_forecast import (
+    DehumidificationDecision,
+    PowerDayForecastAssessment,
+    assess_powerday_forecast,
+    resolve_powerday_dehumidification,
+)
 from .state_reader import build_snapshot, is_switch_on, parse_float
-from .zone_control import describe_zone_predictions, resolve_zone_actions
+from .zone_control import describe_zone_predictions, resolve_dry_zone_actions, resolve_zone_actions
 
 USING_PYTHON_IMPORTS = __name__.startswith("pyscript.") or __name__ == "__main__"
 
@@ -236,6 +254,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "max_power_demand_5m_kw": None,
     "heat_demand_fan_boost_reason": None,
     "last_trigger": None,
+    "normal_recalculation_generation": 0,
     "powerday_export_power_samples": [],
     "powerday_export_average": None,
     "powerday_battery_remaining": None,
@@ -280,8 +299,26 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_score_semantics_migration_in_progress": False,
     "idle_demand_forecast_weather_points": (),
     "idle_demand_forecast_weather_fetched_at": None,
+    "weather_forecast_last_success_at": None,
     "idle_demand_forecast_weather_error": None,
     "idle_demand_forecast": None,
+    "powerday_forecast_assessment": None,
+    "powerday_indoor_humidity": None,
+    "powerday_dry_eligible": False,
+    "powerday_dry_humidity_eligible": False,
+    "powerday_dry_coldest_enabled_zone_celsius": None,
+    "powerday_dry_heat_forecast_safe": None,
+    "powerday_dry_cool_forecast_safe": None,
+    "powerday_dry_active": False,
+    "powerday_dry_started_at": None,
+    "powerday_dry_completed": False,
+    "powerday_dry_completed_at": None,
+    "powerday_dry_elapsed_seconds": 0.0,
+    "powerday_dry_reason": None,
+    "powerday_dry_restore_checked": False,
+    "powerday_free_power_period_active": False,
+    "powerday_dry_heat_transition_started_at": None,
+    "powerday_dry_heat_transition_pending_off": False,
 }
 
 
@@ -343,6 +380,20 @@ def _cached_idle_demand_weather_points() -> tuple[WeatherForecastPoint, ...]:
     return tuple(points)
 
 
+def _fresh_cached_weather_points(now: datetime) -> tuple[WeatherForecastPoint, ...]:
+    last_success_at = _normalize_runtime_datetime(RUNTIME_STATE.get("weather_forecast_last_success_at"))
+    if last_success_at is None and RUNTIME_STATE.get("idle_demand_forecast_weather_error") is None:
+        last_success_at = _normalize_runtime_datetime(
+            RUNTIME_STATE.get("idle_demand_forecast_weather_fetched_at")
+        )
+    if last_success_at is None:
+        return ()
+    age_seconds = (now - last_success_at).total_seconds()
+    if age_seconds < 0.0 or age_seconds > WEATHER_FORECAST_MAX_AGE_SECONDS:
+        return ()
+    return _cached_idle_demand_weather_points()
+
+
 def _refresh_idle_demand_weather_forecast(
     controller: PyscriptController,
     now: datetime,
@@ -351,7 +402,7 @@ def _refresh_idle_demand_weather_forecast(
     if fetched_at is not None:
         age_seconds = (now - fetched_at).total_seconds()
         if 0.0 <= age_seconds < IDLE_DEMAND_FORECAST_REFRESH_SECONDS:
-            return _cached_idle_demand_weather_points()
+            return _fresh_cached_weather_points(now)
 
     RUNTIME_STATE["idle_demand_forecast_weather_fetched_at"] = now
     try:
@@ -364,18 +415,40 @@ def _refresh_idle_demand_weather_forecast(
         )
         points = parse_hourly_weather_forecast(response, IDLE_DEMAND_FORECAST_WEATHER_ENTITY)
     except Exception as exc:  # pragma: no cover - Home Assistant service failures are runtime-dependent
-        RUNTIME_STATE["idle_demand_forecast_weather_points"] = ()
         RUNTIME_STATE["idle_demand_forecast_weather_error"] = str(exc)
         LOGGER.warning("DISPATCH: idle demand forecast weather refresh failed: %s", exc)
-        return ()
+        return _fresh_cached_weather_points(now)
 
-    RUNTIME_STATE["idle_demand_forecast_weather_points"] = points
     if points:
+        RUNTIME_STATE["idle_demand_forecast_weather_points"] = points
+        RUNTIME_STATE["weather_forecast_last_success_at"] = now
         RUNTIME_STATE["idle_demand_forecast_weather_error"] = None
     else:
         RUNTIME_STATE["idle_demand_forecast_weather_error"] = "hourly forecast response contained no valid points"
         LOGGER.warning("DISPATCH: idle demand forecast weather refresh returned no valid hourly points")
-    return points
+    return _fresh_cached_weather_points(now)
+
+
+def _resolve_powerday_forecast_assessment(
+    controller: PyscriptController,
+    now: datetime,
+) -> PowerDayForecastAssessment:
+    points = _refresh_idle_demand_weather_forecast(controller, now)
+    outdoor_temperature = resolve_outdoor_temperature(
+        controller,
+        DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        now=now,
+    )
+    assessment = assess_powerday_forecast(
+        points,
+        now=now,
+        current_outdoor_temperature=outdoor_temperature,
+    )
+    previous = _current_powerday_forecast_assessment()
+    RUNTIME_STATE["powerday_forecast_assessment"] = assessment
+    if previous is None or previous.level != assessment.level or previous.source != assessment.source:
+        LOGGER.info("POWERDAY: forecast assessment changed: %s", assessment.reason)
+    return assessment
 
 
 def _has_active_equipment_demand(demand) -> bool:
@@ -383,6 +456,7 @@ def _has_active_equipment_demand(demand) -> bool:
         demand.heat_requested
         or demand.cool_requested
         or demand.fan_only_requested
+        or demand.dry_requested
         or demand.maintain_heat_mode
         or demand.maintain_cool_mode
     )
@@ -402,7 +476,11 @@ def _resolve_idle_demand_forecast(
         return None
     if _has_active_equipment_demand(demand):
         return None
-    if snapshot.comfort_mode == COMFORT_MODE_POWER_DAY and snapshot.heat_sink_available and operation_mode == HVAC_HEAT:
+    full_heat_soak_active = snapshot.surplus_heat_sink_available or (
+        snapshot.free_power_available
+        and snapshot.free_power_heat_soak_level == POWERDAY_HEATSOAK_FULL
+    )
+    if snapshot.comfort_mode == COMFORT_MODE_POWER_DAY and full_heat_soak_active and operation_mode == HVAC_HEAT:
         return IdleDemandForecast(
             generated_at=now,
             horizon_seconds=IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
@@ -1008,6 +1086,10 @@ def _reference_zone_targets_for_comfort_adjustments(
     if not _control_is_enabled():
         return None
 
+    assessment = _current_powerday_forecast_assessment()
+    free_power_heat_soak_level = (
+        assessment.level if assessment is not None else POWERDAY_HEATSOAK_FULL
+    )
     try:
         snapshot = build_snapshot(
             controller,
@@ -1016,6 +1098,7 @@ def _reference_zone_targets_for_comfort_adjustments(
             pending_switch_states=RUNTIME_STATE.get("pending_zone_state"),
             heat_sink_available=bool(RUNTIME_STATE.get("powerday_heat_sink_active")),
             free_power_later_available=bool(RUNTIME_STATE.get("powerday_free_power_later_active")),
+            free_power_heat_soak_level=free_power_heat_soak_level,
             poweroff_active=bool(RUNTIME_STATE.get("poweroff_active")),
             now=now,
         )
@@ -1224,6 +1307,18 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         )
 
 
+def _publish_input_number_if_changed(
+    controller: PyscriptController,
+    entity_id: str,
+    value: float,
+) -> bool:
+    current_value = parse_float(controller.get_state(entity_id))
+    if current_value is not None and abs(current_value - value) <= 1e-9:
+        return False
+    controller.call_service("input_number", "set_value", entity_id=entity_id, value=value)
+    return True
+
+
 def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> None:
     """Calculate and publish independent per-zone comfort adjustments."""
     task.unique(COMFORT_ADJUSTMENT_PASS_TASK_NAME)
@@ -1272,13 +1367,8 @@ def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> N
     )
     published_adjustments: list[str] = []
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
-        adjustment = publications[zone.key]["filtered_adjustment"]
-        controller.call_service(
-            "input_number",
-            "set_value",
-            entity_id=zone.output_entity_id,
-            value=adjustment,
-        )
+        adjustment = float(publications[zone.key]["filtered_adjustment"])
+        _publish_input_number_if_changed(controller, zone.output_entity_id, adjustment)
         published_adjustments.append(f"{zone.key}={float(adjustment):.1f}")
 
     _log_comfort_adjustment_diagnostics(result, publications, now)
@@ -1396,6 +1486,11 @@ def _current_idle_demand_forecast() -> IdleDemandForecast | None:
     return forecast if isinstance(forecast, IdleDemandForecast) else None
 
 
+def _current_powerday_forecast_assessment() -> PowerDayForecastAssessment | None:
+    assessment = RUNTIME_STATE.get("powerday_forecast_assessment")
+    return assessment if isinstance(assessment, PowerDayForecastAssessment) else None
+
+
 def _control_is_enabled() -> bool:
     enabled_state = state.get(ENABLED_ENTITY_ID)  # type: ignore[name-defined]
     if enabled_state is None:
@@ -1413,6 +1508,7 @@ def _set_control_enabled(enabled: bool, *, reason: str) -> None:
 
 def _publish_runtime_state(status: str) -> None:
     idle_demand_forecast = _current_idle_demand_forecast()
+    powerday_forecast = _current_powerday_forecast_assessment()
     state.set(  # type: ignore[name-defined]
         STATUS_ENTITY_ID,
         status,
@@ -1464,7 +1560,46 @@ def _publish_runtime_state(status: str) -> None:
             "idle_demand_forecast_weather_fetched_at": _isoformat(
                 _normalize_runtime_datetime(RUNTIME_STATE.get("idle_demand_forecast_weather_fetched_at"))
             ),
+            "weather_forecast_last_success_at": _isoformat(
+                _normalize_runtime_datetime(RUNTIME_STATE.get("weather_forecast_last_success_at"))
+            ),
             "idle_demand_forecast_weather_error": RUNTIME_STATE.get("idle_demand_forecast_weather_error"),
+            "powerday_forecast_level": powerday_forecast.level if powerday_forecast is not None else None,
+            "powerday_forecast_daytime_peak_celsius": (
+                powerday_forecast.daytime_peak_celsius if powerday_forecast is not None else None
+            ),
+            "powerday_forecast_evening_minimum_celsius": (
+                powerday_forecast.evening_minimum_celsius if powerday_forecast is not None else None
+            ),
+            "powerday_forecast_evening_maximum_humidity": (
+                powerday_forecast.evening_maximum_humidity if powerday_forecast is not None else None
+            ),
+            "powerday_forecast_source": powerday_forecast.source if powerday_forecast is not None else None,
+            "powerday_forecast_reason": powerday_forecast.reason if powerday_forecast is not None else None,
+            "powerday_indoor_humidity": RUNTIME_STATE.get("powerday_indoor_humidity"),
+            "powerday_dry_eligible": RUNTIME_STATE.get("powerday_dry_eligible", False),
+            "powerday_dry_humidity_eligible": RUNTIME_STATE.get(
+                "powerday_dry_humidity_eligible",
+                False,
+            ),
+            "powerday_dry_coldest_enabled_zone_celsius": RUNTIME_STATE.get(
+                "powerday_dry_coldest_enabled_zone_celsius"
+            ),
+            "powerday_dry_heat_forecast_safe": RUNTIME_STATE.get("powerday_dry_heat_forecast_safe"),
+            "powerday_dry_cool_forecast_safe": RUNTIME_STATE.get("powerday_dry_cool_forecast_safe"),
+            "powerday_dry_active": RUNTIME_STATE.get("powerday_dry_active", False),
+            "powerday_dry_started_at": _isoformat(RUNTIME_STATE.get("powerday_dry_started_at")),
+            "powerday_dry_completed": RUNTIME_STATE.get("powerday_dry_completed", False),
+            "powerday_dry_completed_at": _isoformat(RUNTIME_STATE.get("powerday_dry_completed_at")),
+            "powerday_dry_elapsed_seconds": RUNTIME_STATE.get("powerday_dry_elapsed_seconds", 0.0),
+            "powerday_dry_heat_transition_started_at": _isoformat(
+                RUNTIME_STATE.get("powerday_dry_heat_transition_started_at")
+            ),
+            "powerday_dry_heat_transition_pending_off": RUNTIME_STATE.get(
+                "powerday_dry_heat_transition_pending_off",
+                False,
+            ),
+            "powerday_dry_reason": RUNTIME_STATE.get("powerday_dry_reason"),
             "last_fan_speed_decrease_at": _isoformat(RUNTIME_STATE.get("last_fan_speed_decrease_at")),
             "hvac_off_started_at": _isoformat(RUNTIME_STATE.get("hvac_off_started_at")),
             "hvac_start_fan_ramp_started_at": _isoformat(RUNTIME_STATE.get("hvac_start_fan_ramp_started_at")),
@@ -1705,6 +1840,414 @@ def _persist_heat_demand_fan_boost_state(fan_boost_level: int) -> None:
     )
     if write_error is not None:
         LOGGER.warning("FAN BOOST: failed to persist state: %s", write_error)
+
+
+@pyscript_executor
+def _read_powerday_dry_cycle_state(file_path):
+    import json
+
+    try:
+        with open(file_path, encoding="utf-8") as state_file:
+            payload = json.load(state_file)
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, TypeError) as exc:
+        return None, str(exc)
+    if not isinstance(payload, dict):
+        return None, "persisted dry-cycle state is not an object"
+    return payload, None
+
+
+@pyscript_executor
+def _write_powerday_dry_cycle_state(file_path, payload):
+    import json
+    import os
+
+    temporary_file_path = f"{file_path}.tmp"
+    try:
+        with open(temporary_file_path, "w", encoding="utf-8") as state_file:
+            json.dump(payload, state_file, separators=(",", ":"), sort_keys=True)
+            state_file.write("\n")
+        os.replace(temporary_file_path, file_path)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _parse_persisted_datetime(value: object | None) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _normalize_runtime_datetime(parsed)
+
+
+def _persist_powerday_dry_cycle_state() -> None:
+    payload = {
+        "free_power_period_active": bool(RUNTIME_STATE.get("powerday_free_power_period_active")),
+        "dry_active": bool(RUNTIME_STATE.get("powerday_dry_active")),
+        "dry_started_at": _isoformat(
+            _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_started_at"))
+        ),
+        "dry_completed": bool(RUNTIME_STATE.get("powerday_dry_completed")),
+        "dry_completed_at": _isoformat(
+            _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_completed_at"))
+        ),
+        "heat_transition_started_at": _isoformat(
+            _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_heat_transition_started_at"))
+        ),
+        "heat_transition_pending_off": bool(
+            RUNTIME_STATE.get("powerday_dry_heat_transition_pending_off")
+        ),
+    }
+    write_error = _write_powerday_dry_cycle_state(POWERDAY_DRY_CYCLE_STATE_FILE, payload)
+    if write_error is not None:
+        LOGGER.warning("POWERDAY: unable to persist dry-cycle state: %s", write_error)
+
+
+def _restore_powerday_dry_cycle_state() -> None:
+    if RUNTIME_STATE.get("powerday_dry_restore_checked"):
+        return
+    RUNTIME_STATE["powerday_dry_restore_checked"] = True
+    payload, read_error = _read_powerday_dry_cycle_state(POWERDAY_DRY_CYCLE_STATE_FILE)
+    if read_error is not None:
+        LOGGER.warning("POWERDAY: unable to restore dry-cycle state: %s", read_error)
+        return
+    if payload is None:
+        return
+    RUNTIME_STATE["powerday_free_power_period_active"] = bool(payload.get("free_power_period_active"))
+    RUNTIME_STATE["powerday_dry_active"] = bool(payload.get("dry_active"))
+    RUNTIME_STATE["powerday_dry_started_at"] = _parse_persisted_datetime(payload.get("dry_started_at"))
+    RUNTIME_STATE["powerday_dry_completed"] = bool(payload.get("dry_completed"))
+    RUNTIME_STATE["powerday_dry_completed_at"] = _parse_persisted_datetime(
+        payload.get("dry_completed_at")
+    )
+    RUNTIME_STATE["powerday_dry_heat_transition_started_at"] = _parse_persisted_datetime(
+        payload.get("heat_transition_started_at")
+    )
+    RUNTIME_STATE["powerday_dry_heat_transition_pending_off"] = bool(
+        payload.get("heat_transition_pending_off")
+    )
+
+
+def _sync_powerday_free_power_period(free_power_available: bool) -> None:
+    _restore_powerday_dry_cycle_state()
+    previous_active = bool(RUNTIME_STATE.get("powerday_free_power_period_active"))
+    if free_power_available == previous_active:
+        return
+    RUNTIME_STATE["powerday_free_power_period_active"] = free_power_available
+    RUNTIME_STATE["powerday_dry_active"] = False
+    RUNTIME_STATE["powerday_dry_started_at"] = None
+    RUNTIME_STATE["powerday_dry_completed"] = False
+    RUNTIME_STATE["powerday_dry_completed_at"] = None
+    RUNTIME_STATE["powerday_dry_elapsed_seconds"] = 0.0
+    RUNTIME_STATE["powerday_dry_heat_transition_started_at"] = None
+    RUNTIME_STATE["powerday_dry_heat_transition_pending_off"] = False
+    RUNTIME_STATE["powerday_dry_reason"] = (
+        "new free-power period" if free_power_available else "free-power period ended"
+    )
+    _persist_powerday_dry_cycle_state()
+
+
+def _set_powerday_dry_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    completed: bool,
+    completed_at: datetime | None,
+    reason: str,
+) -> None:
+    previous_active = bool(RUNTIME_STATE.get("powerday_dry_active"))
+    previous_completed = bool(RUNTIME_STATE.get("powerday_dry_completed"))
+    previous_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_started_at"))
+    previous_completed_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_completed_at"))
+    normalized_started_at = _normalize_runtime_datetime(started_at)
+    normalized_completed_at = _normalize_runtime_datetime(completed_at) if completed else None
+    RUNTIME_STATE["powerday_dry_active"] = active
+    RUNTIME_STATE["powerday_dry_started_at"] = normalized_started_at
+    RUNTIME_STATE["powerday_dry_completed"] = completed
+    RUNTIME_STATE["powerday_dry_completed_at"] = normalized_completed_at
+    RUNTIME_STATE["powerday_dry_reason"] = reason
+    if active != previous_active or completed != previous_completed:
+        LOGGER.info(
+            "POWERDAY: dry_active=%s completed=%s started_at=%s reason=%s",
+            active,
+            completed,
+            _isoformat(normalized_started_at),
+            reason,
+        )
+    if (
+        active != previous_active
+        or completed != previous_completed
+        or normalized_started_at != previous_started_at
+        or normalized_completed_at != previous_completed_at
+    ):
+        _persist_powerday_dry_cycle_state()
+
+
+def _set_powerday_dry_heat_transition_started_at(
+    started_at: datetime | None,
+    *,
+    pending_off: bool = False,
+) -> None:
+    previous = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_heat_transition_started_at"))
+    previous_pending_off = bool(RUNTIME_STATE.get("powerday_dry_heat_transition_pending_off"))
+    normalized_started_at = _normalize_runtime_datetime(started_at)
+    RUNTIME_STATE["powerday_dry_heat_transition_started_at"] = normalized_started_at
+    RUNTIME_STATE["powerday_dry_heat_transition_pending_off"] = pending_off
+    if previous != normalized_started_at or previous_pending_off != pending_off:
+        _persist_powerday_dry_cycle_state()
+
+
+def _forecast_safe_for_operation(
+    snapshot,
+    operation_mode: str,
+    *,
+    now: datetime,
+    weather_points: tuple[WeatherForecastPoint, ...],
+    current_outdoor_temperature: float | None,
+) -> bool:
+    forecast = forecast_idle_demand(
+        snapshot,
+        operation_mode=operation_mode,
+        now=now,
+        weather_points=weather_points,
+        current_outdoor_temperature=current_outdoor_temperature,
+        horizon_seconds=IDLE_DEMAND_FORECAST_HORIZON_SECONDS,
+        step_seconds=IDLE_DEMAND_FORECAST_STEP_SECONDS,
+    )
+    return forecast.safe_to_turn_off
+
+
+def _resolve_powerday_dry_request(
+    controller: PyscriptController,
+    snapshot,
+    demand,
+    assessment: PowerDayForecastAssessment,
+    *,
+    weather_points: tuple[WeatherForecastPoint, ...],
+    supported_hvac_modes,
+    current_hvac_mode: str | None,
+    now: datetime,
+) -> tuple[bool, bool, DehumidificationDecision]:
+    indoor_humidity = parse_float(controller.get_state(POWERDAY_INDOOR_HUMIDITY_SENSOR))
+    RUNTIME_STATE["powerday_indoor_humidity"] = indoor_humidity
+    current_outdoor_temperature = resolve_outdoor_temperature(
+        controller,
+        DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+        now=now,
+    )
+    heat_forecast_safe = _forecast_safe_for_operation(
+        snapshot,
+        HVAC_HEAT,
+        now=now,
+        weather_points=weather_points,
+        current_outdoor_temperature=current_outdoor_temperature,
+    )
+    cool_forecast_safe = _forecast_safe_for_operation(
+        snapshot,
+        HVAC_COOL,
+        now=now,
+        weather_points=weather_points,
+        current_outdoor_temperature=current_outdoor_temperature,
+    )
+    RUNTIME_STATE["powerday_dry_heat_forecast_safe"] = heat_forecast_safe
+    RUNTIME_STATE["powerday_dry_cool_forecast_safe"] = cool_forecast_safe
+    has_thermal_demand = bool(
+        demand.heat_requested
+        or demand.maintain_heat_mode
+        or demand.cool_requested
+        or demand.maintain_cool_mode
+        or demand.fan_only_requested
+    )
+    if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_HEAT:
+        has_thermal_demand = has_thermal_demand or bool(
+            snapshot.heat_calling_zones or snapshot.continue_heating_zones
+        )
+    elif snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_COOL:
+        has_thermal_demand = has_thermal_demand or bool(
+            snapshot.cool_calling_zones or snapshot.continue_cooling_zones
+        )
+    elif snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_HEATCOOL:
+        has_thermal_demand = has_thermal_demand or bool(
+            snapshot.heat_calling_zones
+            or snapshot.continue_heating_zones
+            or snapshot.cool_calling_zones
+            or snapshot.continue_cooling_zones
+        )
+    active = bool(RUNTIME_STATE.get("powerday_dry_active"))
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_started_at"))
+    completed = bool(RUNTIME_STATE.get("powerday_dry_completed"))
+    completed_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_completed_at"))
+    normalized_now = _normalize_runtime_datetime(now) or now
+    current_mode = (current_hvac_mode or "").lower()
+    if active and started_at is not None:
+        elapsed_seconds = max(0.0, (normalized_now - started_at).total_seconds())
+    elif completed and started_at is not None and completed_at is not None:
+        elapsed_seconds = max(0.0, (completed_at - started_at).total_seconds())
+    else:
+        elapsed_seconds = 0.0
+    RUNTIME_STATE["powerday_dry_elapsed_seconds"] = elapsed_seconds
+
+    decision = resolve_powerday_dehumidification(
+        snapshot,
+        assessment,
+        indoor_humidity=indoor_humidity,
+        supported_hvac_modes=supported_hvac_modes,
+        has_thermal_demand=has_thermal_demand,
+        heat_forecast_safe=heat_forecast_safe,
+        cool_forecast_safe=cool_forecast_safe,
+        cycle_completed=completed,
+        currently_active=active,
+    )
+    RUNTIME_STATE["powerday_dry_eligible"] = decision.eligible
+    RUNTIME_STATE["powerday_dry_humidity_eligible"] = decision.humidity_eligible
+    RUNTIME_STATE["powerday_dry_coldest_enabled_zone_celsius"] = (
+        decision.coldest_enabled_zone_celsius
+    )
+
+    if active and started_at is None:
+        decision = DehumidificationDecision(
+            eligible=False,
+            humidity_eligible=decision.humidity_eligible,
+            coldest_enabled_zone_celsius=decision.coldest_enabled_zone_celsius,
+            reason="persisted dry cycle has no valid start time",
+        )
+        RUNTIME_STATE["powerday_dry_eligible"] = False
+    elif active and current_mode == HVAC_HEAT:
+        decision = DehumidificationDecision(
+            eligible=False,
+            humidity_eligible=decision.humidity_eligible,
+            coldest_enabled_zone_celsius=decision.coldest_enabled_zone_celsius,
+            reason="heatpump entered heat while automatic dry was active",
+        )
+        RUNTIME_STATE["powerday_dry_eligible"] = False
+    elif active and elapsed_seconds >= POWERDAY_DRY_MAX_SECONDS:
+        decision = DehumidificationDecision(
+            eligible=False,
+            humidity_eligible=decision.humidity_eligible,
+            coldest_enabled_zone_celsius=decision.coldest_enabled_zone_celsius,
+            reason=f"maximum dry runtime of {POWERDAY_DRY_MAX_SECONDS // 60} minutes elapsed",
+        )
+        RUNTIME_STATE["powerday_dry_eligible"] = False
+
+    if active:
+        if decision.eligible:
+            RUNTIME_STATE["powerday_dry_reason"] = decision.reason
+            return True, False, decision
+        _set_powerday_dry_state(
+            active=False,
+            started_at=started_at,
+            completed=True,
+            completed_at=normalized_now,
+            reason=decision.reason,
+        )
+        _set_powerday_dry_heat_transition_started_at(None, pending_off=True)
+        return False, False, decision
+
+    if not decision.eligible:
+        RUNTIME_STATE["powerday_dry_reason"] = decision.reason
+        if not completed and (current_hvac_mode or "").lower() != HVAC_DRY:
+            _set_powerday_dry_heat_transition_started_at(None)
+        return False, False, decision
+
+    transition_started_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("powerday_dry_heat_transition_started_at")
+    )
+    transition_pending_off = bool(RUNTIME_STATE.get("powerday_dry_heat_transition_pending_off"))
+    if current_mode == HVAC_HEAT:
+        if transition_started_at is not None or not transition_pending_off:
+            _set_powerday_dry_heat_transition_started_at(None, pending_off=True)
+        RUNTIME_STATE["powerday_dry_reason"] = "waiting for heat-to-dry reversing hold"
+        return False, True, decision
+    if (
+        current_mode == HVAC_OFF
+        and transition_started_at is None
+        and not transition_pending_off
+        and str(RUNTIME_STATE.get("last_active_hvac_mode") or "").lower() == HVAC_HEAT
+    ):
+        heat_off_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("hvac_off_started_at"))
+        transition_started_at = heat_off_started_at or normalized_now
+        transition_age = (normalized_now - transition_started_at).total_seconds()
+        if transition_age < POWERDAY_DRY_HEAT_TRANSITION_SECONDS:
+            _set_powerday_dry_heat_transition_started_at(transition_started_at)
+            RUNTIME_STATE["powerday_dry_reason"] = "waiting for heat-to-dry reversing hold"
+            return False, True, decision
+    if transition_pending_off:
+        if current_mode != HVAC_OFF:
+            RUNTIME_STATE["powerday_dry_reason"] = "waiting for heatpump to report off before reversing hold"
+            return False, True, decision
+        transition_started_at = normalized_now
+        _set_powerday_dry_heat_transition_started_at(transition_started_at)
+        RUNTIME_STATE["powerday_dry_reason"] = "waiting for heat-to-dry reversing hold"
+        return False, True, decision
+    if transition_started_at is not None:
+        if current_mode != HVAC_OFF:
+            RUNTIME_STATE["powerday_dry_reason"] = "waiting for heatpump to remain off during reversing hold"
+            return False, True, decision
+        transition_age = (normalized_now - transition_started_at).total_seconds()
+        if transition_age < POWERDAY_DRY_HEAT_TRANSITION_SECONDS:
+            RUNTIME_STATE["powerday_dry_reason"] = "waiting for heat-to-dry reversing hold"
+            return False, True, decision
+
+    _set_powerday_dry_heat_transition_started_at(None)
+    _set_powerday_dry_state(
+        active=True,
+        started_at=normalized_now,
+        completed=False,
+        completed_at=None,
+        reason=decision.reason,
+    )
+    RUNTIME_STATE["powerday_dry_elapsed_seconds"] = 0.0
+    return True, False, decision
+
+
+def _apply_dry_to_heat_transition_hold(
+    plan: DispatchPlan,
+    *,
+    current_hvac_mode: str | None,
+    now: datetime,
+) -> DispatchPlan:
+    if plan.hvac_mode == HVAC_COOL:
+        _set_powerday_dry_heat_transition_started_at(None)
+        return plan
+
+    normalized_now = _normalize_runtime_datetime(now) or now
+    current_mode = (current_hvac_mode or "").lower()
+    transition_started_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("powerday_dry_heat_transition_started_at")
+    )
+    transition_pending_off = bool(RUNTIME_STATE.get("powerday_dry_heat_transition_pending_off"))
+    if current_mode == HVAC_DRY and plan.hvac_mode != HVAC_DRY:
+        transition_started_at = None
+        transition_pending_off = True
+        _set_powerday_dry_heat_transition_started_at(None, pending_off=True)
+    elif transition_pending_off and current_mode == HVAC_OFF:
+        transition_started_at = normalized_now
+        transition_pending_off = False
+        _set_powerday_dry_heat_transition_started_at(transition_started_at)
+
+    if plan.hvac_mode != HVAC_HEAT:
+        return plan
+    if transition_pending_off:
+        return DispatchPlan(
+            turn_off=True,
+            open_zones=plan.open_zones,
+            reason="waiting for heatpump to report off before dry-to-heat reversing hold",
+        )
+    if transition_started_at is None:
+        return plan
+    elapsed_seconds = (normalized_now - transition_started_at).total_seconds()
+    if current_mode == HVAC_HEAT or elapsed_seconds >= POWERDAY_DRY_HEAT_TRANSITION_SECONDS:
+        _set_powerday_dry_heat_transition_started_at(None)
+        return plan
+    return DispatchPlan(
+        turn_off=True,
+        open_zones=plan.open_zones,
+        reason="waiting for dry-to-heat reversing hold",
+    )
 
 
 @pyscript_executor
@@ -2088,7 +2631,12 @@ def _set_powerday_free_power_later_runtime_state(
     return active
 
 
-def _update_powerday_free_power_later_runtime_state(controller: PyscriptController, now: datetime) -> bool:
+def _update_powerday_free_power_later_runtime_state(
+    controller: PyscriptController,
+    now: datetime,
+    *,
+    heat_soak_level: str = POWERDAY_HEATSOAK_FULL,
+) -> bool:
     """Promote PowerDay to its later boost early when free-power PV is sustained."""
     normalized_now = _normalize_runtime_datetime(now) or _system_now()
     pv_power = parse_float(controller.get_state(GOODWE_PV_POWER_SENSOR))
@@ -2109,6 +2657,12 @@ def _update_powerday_free_power_later_runtime_state(controller: PyscriptControll
             active=False,
             started_at=None,
             reason="free power is not available",
+        )
+    if heat_soak_level != POWERDAY_HEATSOAK_FULL:
+        return _set_powerday_free_power_later_runtime_state(
+            active=False,
+            started_at=None,
+            reason=f"free-power heatsoak level is {heat_soak_level}",
         )
 
     started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("powerday_free_power_later_started_at"))
@@ -2276,6 +2830,8 @@ def _powerday_downstairs_priority_base_eligibility(snapshot, operating_mode: str
         return False, "comfort mode is not PowerDay"
     if not snapshot.free_power_available:
         return False, "free power is not available"
+    if snapshot.free_power_heat_soak_level != POWERDAY_HEATSOAK_FULL:
+        return False, f"free-power heatsoak level is {snapshot.free_power_heat_soak_level}"
     if operating_mode != HVAC_HEAT:
         return False, "heating is not active"
 
@@ -2455,7 +3011,11 @@ def _powerday_downstairs_free_power_fan_boost(
     """Return the physical fan-level boost for active free-power downstairs heating."""
     if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY:
         return 0
-    if not snapshot.free_power_available or operating_mode != HVAC_HEAT:
+    if (
+        not snapshot.free_power_available
+        or snapshot.free_power_heat_soak_level != POWERDAY_HEATSOAK_FULL
+        or operating_mode != HVAC_HEAT
+    ):
         return 0
     if not demand.heat_requested:
         return 0
@@ -2631,8 +3191,26 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("poweroff_reason", None)
     RUNTIME_STATE.setdefault("idle_demand_forecast_weather_points", ())
     RUNTIME_STATE.setdefault("idle_demand_forecast_weather_fetched_at", None)
+    RUNTIME_STATE.setdefault("weather_forecast_last_success_at", None)
     RUNTIME_STATE.setdefault("idle_demand_forecast_weather_error", None)
     RUNTIME_STATE.setdefault("idle_demand_forecast", None)
+    RUNTIME_STATE.setdefault("powerday_forecast_assessment", None)
+    RUNTIME_STATE.setdefault("powerday_indoor_humidity", None)
+    RUNTIME_STATE.setdefault("powerday_dry_eligible", False)
+    RUNTIME_STATE.setdefault("powerday_dry_humidity_eligible", False)
+    RUNTIME_STATE.setdefault("powerday_dry_coldest_enabled_zone_celsius", None)
+    RUNTIME_STATE.setdefault("powerday_dry_heat_forecast_safe", None)
+    RUNTIME_STATE.setdefault("powerday_dry_cool_forecast_safe", None)
+    RUNTIME_STATE.setdefault("powerday_dry_active", False)
+    RUNTIME_STATE.setdefault("powerday_dry_started_at", None)
+    RUNTIME_STATE.setdefault("powerday_dry_completed", False)
+    RUNTIME_STATE.setdefault("powerday_dry_completed_at", None)
+    RUNTIME_STATE.setdefault("powerday_dry_elapsed_seconds", 0.0)
+    RUNTIME_STATE.setdefault("powerday_dry_reason", None)
+    RUNTIME_STATE.setdefault("powerday_dry_restore_checked", False)
+    RUNTIME_STATE.setdefault("powerday_free_power_period_active", False)
+    RUNTIME_STATE.setdefault("powerday_dry_heat_transition_started_at", None)
+    RUNTIME_STATE.setdefault("powerday_dry_heat_transition_pending_off", False)
     RUNTIME_STATE["idle_demand_forecast"] = None
     RUNTIME_STATE["last_trigger"] = reason
     if comfort_mode_changed:
@@ -2653,9 +3231,27 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     zone_reconciliation_changed = comfort_mode_changed or immediate_shutdown_zone_close_due
     _restore_heat_demand_fan_boost_state(now)
     _reconcile_pending_zone_state(controller, now)
+    selected_comfort_mode = str(controller.get_state(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity) or "")
+    raw_free_power_available = _is_free_power_price_state(
+        controller.get_state(GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR)
+    )
+    _sync_powerday_free_power_period(raw_free_power_available)
+    weather_points = _fresh_cached_weather_points(now)
+    powerday_forecast_assessment = None
+    free_power_heat_soak_level = POWERDAY_HEATSOAK_FULL
+    if selected_comfort_mode == COMFORT_MODE_POWER_DAY:
+        powerday_forecast_assessment = _resolve_powerday_forecast_assessment(controller, now)
+        free_power_heat_soak_level = powerday_forecast_assessment.level
+        weather_points = _fresh_cached_weather_points(now)
+    else:
+        RUNTIME_STATE["powerday_forecast_assessment"] = None
     powerday_heat_sink_active = _update_powerday_heat_sink_runtime_state(controller, now)
     powerday_battery_free_power_boost_active = _update_powerday_battery_free_power_boost_runtime_state(controller)
-    powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(controller, now)
+    powerday_free_power_later_active = _update_powerday_free_power_later_runtime_state(
+        controller,
+        now,
+        heat_soak_level=free_power_heat_soak_level,
+    )
     poweroff_active = _update_poweroff_runtime_state(controller, now)
 
     snapshot = build_snapshot(
@@ -2666,6 +3262,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         heat_sink_available=powerday_heat_sink_active,
         battery_free_power_boost_available=powerday_battery_free_power_boost_active,
         free_power_later_available=powerday_free_power_later_active,
+        free_power_heat_soak_level=free_power_heat_soak_level,
         poweroff_active=poweroff_active,
         now=now,
     )
@@ -2676,6 +3273,9 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     supported_fan_modes = controller.get_attr(climate_entity, "fan_modes")
     if not isinstance(supported_fan_modes, (list, tuple, set)):
         supported_fan_modes = None
+    supported_hvac_modes = controller.get_attr(climate_entity, "hvac_modes")
+    if not isinstance(supported_hvac_modes, (list, tuple, set)):
+        supported_hvac_modes = None
     current_setpoint = controller.get_attr(climate_entity, "temperature")
     target_temp_step = controller.get_attr(climate_entity, "target_temp_step")
     current_hvac_mode_str = str(current_hvac_mode) if current_hvac_mode is not None else None
@@ -2700,7 +3300,33 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
-        LOGGER.info("DISPATCH: manual mode selected; leaving zones and heatpump unchanged")
+        RUNTIME_STATE["powerday_dry_eligible"] = False
+        RUNTIME_STATE["powerday_dry_reason"] = "Manual HVAC selection disables automatic dry mode"
+        automatic_dry_was_active = (
+            bool(RUNTIME_STATE.get("powerday_dry_active"))
+            or (current_hvac_mode_str or "").lower() == HVAC_DRY
+        )
+        if automatic_dry_was_active:
+            _set_powerday_dry_state(
+                active=False,
+                started_at=_normalize_runtime_datetime(RUNTIME_STATE.get("powerday_dry_started_at")),
+                completed=True,
+                completed_at=normalized_now,
+                reason="Manual HVAC selection stopped automatic dry mode",
+            )
+            _set_powerday_dry_heat_transition_started_at(None, pending_off=True)
+            apply_dispatch_plan(
+                controller,
+                DispatchPlan(turn_off=True, reason="Manual selection stopped automatic dry mode"),
+                config=DEFAULT_SYSTEM_CONFIG,
+                current_hvac_mode=current_hvac_mode_str,
+                current_fan_mode=str(current_fan_mode) if current_fan_mode is not None else None,
+                current_setpoint=current_setpoint,
+            )
+        LOGGER.info(
+            "DISPATCH: manual mode selected; %s",
+            "automatic dry mode stopped" if automatic_dry_was_active else "leaving zones and heatpump unchanged",
+        )
         RUNTIME_STATE["last_error"] = None
         RUNTIME_STATE["last_successful_control_pass"] = now
         _publish_runtime_state("manual")
@@ -2814,8 +3440,60 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         downstairs_free_power_fan_boost,
         POWERDAY_DOWNSTAIRS_PRIORITY_FAN_BOOST_LEVELS if powerday_downstairs_priority_active else 0,
     )
+    dry_requested = False
+    dry_transition_turn_off = False
+    dry_decision = None
+    assessment_for_dry = powerday_forecast_assessment
+    if assessment_for_dry is None:
+        assessment_for_dry = PowerDayForecastAssessment(
+            generated_at=now,
+            level=POWERDAY_HEATSOAK_FULL,
+            daytime_peak_celsius=None,
+            evening_minimum_celsius=None,
+            evening_maximum_humidity=None,
+            source="unavailable",
+            reason="PowerDay forecast is not active",
+        )
+    if (
+        selected_comfort_mode == COMFORT_MODE_POWER_DAY
+        or bool(RUNTIME_STATE.get("powerday_dry_active"))
+        or (current_hvac_mode_str or "").lower() == HVAC_DRY
+    ):
+        dry_requested, dry_transition_turn_off, dry_decision = _resolve_powerday_dry_request(
+            controller,
+            snapshot,
+            demand,
+            assessment_for_dry,
+            weather_points=weather_points,
+            supported_hvac_modes=supported_hvac_modes,
+            current_hvac_mode=current_hvac_mode_str,
+            now=now,
+        )
+    else:
+        RUNTIME_STATE["powerday_indoor_humidity"] = parse_float(
+            controller.get_state(POWERDAY_INDOOR_HUMIDITY_SENSOR)
+        )
+        RUNTIME_STATE["powerday_dry_eligible"] = False
+        RUNTIME_STATE["powerday_dry_humidity_eligible"] = False
+        RUNTIME_STATE["powerday_dry_coldest_enabled_zone_celsius"] = None
+        RUNTIME_STATE["powerday_dry_heat_forecast_safe"] = None
+        RUNTIME_STATE["powerday_dry_cool_forecast_safe"] = None
+
+    if dry_requested:
+        zone_actions, predicted_open_zones = resolve_dry_zone_actions(snapshot)
+        demand = EquipmentDemand(
+            dry_requested=True,
+            requested_by_zones=predicted_open_zones,
+            reason=dry_decision.reason if dry_decision is not None else "PowerDay dry mode",
+        )
+        heat_demand_fan_boost_level = 0
+        last_heat_demand_fan_boost_at = None
+        heat_demand_fan_boost_reason = "dry mode disables heat-demand fan boost"
+        dispatch_plan_kwargs["base_fan_boost"] = 0
+        dispatch_plan_kwargs["additional_fan_levels"] = 0
+
     idle_demand_forecast = None
-    if not comfort_mode_changed:
+    if not comfort_mode_changed and not dry_requested and not dry_transition_turn_off:
         idle_demand_forecast = _resolve_idle_demand_forecast(
             controller,
             snapshot,
@@ -2826,9 +3504,31 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         )
     RUNTIME_STATE["idle_demand_forecast"] = idle_demand_forecast
     dispatch_plan_kwargs["idle_demand_forecast"] = idle_demand_forecast
-    plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
+    if dry_transition_turn_off:
+        zone_actions = [action for action in zone_actions if action.turn_on]
+        predicted_open_zones = _reported_open_zones(snapshot)
+        plan = DispatchPlan(
+            turn_off=True,
+            open_zones=predicted_open_zones,
+            reason="waiting for heat-to-dry reversing hold",
+        )
+    else:
+        plan = build_dispatch_plan(snapshot, demand, predicted_open_zones, **dispatch_plan_kwargs)
+    plan = _apply_dry_to_heat_transition_hold(
+        plan,
+        current_hvac_mode=current_hvac_mode_str,
+        now=now,
+    )
 
-    if comfort_mode_changed and plan.turn_off and (current_hvac_mode_str or "").lower() != HVAC_OFF:
+    dry_stopping = (
+        (current_hvac_mode_str or "").lower() == HVAC_DRY
+        and plan.hvac_mode != HVAC_DRY
+    )
+    if (
+        (comfort_mode_changed or dry_stopping)
+        and plan.turn_off
+        and (current_hvac_mode_str or "").lower() != HVAC_OFF
+    ):
         deferred_zone_closures = [action for action in zone_actions if not action.turn_on]
         if deferred_zone_closures:
             close_not_before = normalized_now + timedelta(seconds=IMMEDIATE_SHUTDOWN_ZONE_CLOSE_DELAY_SECONDS)
@@ -2951,7 +3651,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
             ]
         )
         or "none",
-        plan.reason,
+        RUNTIME_STATE["last_trigger"],
     )
     RUNTIME_STATE["last_error"] = None
     RUNTIME_STATE["last_successful_control_pass"] = now
@@ -3073,13 +3773,32 @@ def temptamer_periodic_comfort_adjustments() -> None:
 @state_trigger(*IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
 def temptamer_immediate_reconciliation_requested(*_args, **_kwargs) -> None:
     """Reconcile user-selected comfort/HVAC changes without anti-flap delays."""
+    _invalidate_pending_normal_recalculation()
     _run_enabled_control_pass(reason="immediate comfort/HVAC selection reconciliation", comfort_mode_changed=True)
+
+
+def _next_normal_recalculation_generation() -> int:
+    generation = int(RUNTIME_STATE.get("normal_recalculation_generation", 0)) + 1
+    RUNTIME_STATE["normal_recalculation_generation"] = generation
+    return generation
+
+
+def _invalidate_pending_normal_recalculation() -> None:
+    _next_normal_recalculation_generation()
+
+
+def _run_debounced_normal_recalculation(generation: int) -> None:
+    task.sleep(NORMAL_RECALCULATION_DEBOUNCE_SECONDS)
+    if generation != RUNTIME_STATE.get("normal_recalculation_generation"):
+        return
+    _run_enabled_control_pass(reason="normal state recalculation")
 
 
 @state_trigger(*NORMAL_RECALCULATION_TRIGGER_ENTITIES)
 def temptamer_normal_recalculation_requested(*_args, **_kwargs) -> None:
     """Recalculate for telemetry and adjustment changes while retaining idle safeguards."""
-    _run_enabled_control_pass(reason="normal state recalculation")
+    generation = _next_normal_recalculation_generation()
+    task.create(_run_debounced_normal_recalculation, generation)
 
 
 @state_trigger(*COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
