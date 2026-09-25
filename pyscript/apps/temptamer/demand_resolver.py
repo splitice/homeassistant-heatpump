@@ -186,6 +186,7 @@ def resolve_equipment_demand(
     *,
     operation_mode: str | None,
     allowed_zone_keys: tuple[str, ...] | None = None,
+    cooling_cycle_active: bool = False,
 ) -> EquipmentDemand:
     if snapshot.comfort_mode == COMFORT_MODE_OFF:
         return EquipmentDemand(reason="comfort mode is Off")
@@ -210,6 +211,11 @@ def resolve_equipment_demand(
                 requested_by_zones=(requested_by_zone,),
                 max_temperature_deficit=_max_cooling_fan_excess(snapshot, cool_calling_zones),
                 reason=f"{requested_by_zone} is above enable threshold",
+            )
+
+        if not cooling_cycle_active:
+            return EquipmentDemand(
+                reason="cooling cycle is idle; waiting for a zone to exceed enable threshold"
             )
 
         predicted_open_above_ideal_zones = _filter_zone_keys(

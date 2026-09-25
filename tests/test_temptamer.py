@@ -1616,6 +1616,29 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(publications["office"]["filtered_adjustment"], -3.0)
 
+    def test_airflow_release_scheduler_uses_explicit_task_capability_flag(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        release_at = now + timedelta(minutes=5)
+        publications = {
+            "office": {"airflow_release_ends_at": release_at},
+        }
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"] = None
+
+        with (
+            patch.object(temptamer_main, "TASK_CREATE_RUNS_SYNCHRONOUSLY", False),
+            patch.object(temptamer_main.task, "create") as create_task,
+        ):
+            temptamer_main._schedule_comfort_airflow_release_completion(publications, now)
+
+        create_task.assert_called_once_with(
+            temptamer_main._run_comfort_airflow_release_completion,
+            release_at,
+        )
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"],
+            release_at,
+        )
+
     def test_score_semantics_migration_reseeds_old_helpers_without_rate_limiting(self):
         now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         temptamer_main.state._values.clear()
@@ -5041,7 +5064,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -5056,6 +5084,49 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(demand.reason, "office is above ideal target")
         self.assertEqual(plan.setpoint, 25)
+
+    def test_idle_cooling_cycle_requires_a_fresh_enable_threshold_crossing(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "21.0",
+                        # The test DayLiving cooling scheme is enabled above
+                        # 22C but has an ideal target of 21C, so this is
+                        # maintain-only.
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("22.0"),
+            )
+        )
+
+        idle_demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=False,
+        )
+        latched_demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
+
+        self.assertFalse(idle_demand.cool_requested)
+        self.assertFalse(idle_demand.maintain_cool_mode)
+        self.assertEqual(
+            idle_demand.reason,
+            "cooling cycle is idle; waiting for a zone to exceed enable threshold",
+        )
+        self.assertTrue(latched_demand.maintain_cool_mode)
+        self.assertEqual(latched_demand.requested_by_zones, ("office",))
 
     def test_maintain_heat_preserves_current_lower_negative_step(self):
         snapshot = build_behavior_snapshot(
@@ -5230,7 +5301,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -5263,7 +5339,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office", "dining"), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office", "dining"),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -5295,7 +5376,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office", "dining"), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office", "dining"),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -5326,7 +5412,12 @@ class TempTamerTests(unittest.TestCase):
                 base_attr_map("21.0", temperature="22.0"),
             )
         )
-        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
 
         plan = build_dispatch_plan(
             snapshot,
@@ -5365,7 +5456,12 @@ class TempTamerTests(unittest.TestCase):
         )
 
         actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_COOL)
-        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            predicted_open,
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
 
         self.assertEqual(actions, [])
         self.assertEqual(predicted_open, ("office",))
@@ -5948,6 +6044,7 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertTrue(five_minute_plan.idle)
+        self.assertEqual(five_minute_plan.fan_mode, "low")
         self.assertEqual(five_minute_plan.setpoint, 23)
         self.assertEqual(falling_inlet_plan.setpoint, 23)
 
@@ -6735,7 +6832,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -6749,6 +6851,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "cool")
+        self.assertEqual(plan.fan_mode, "low")
         self.assertEqual(plan.setpoint, 21)
         self.assertEqual(plan.cool_release_setpoint, 21)
 
@@ -6770,7 +6873,12 @@ class TempTamerTests(unittest.TestCase):
             )
         )
 
-        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(
+            snapshot,
+            ("office",),
+            operation_mode=HVAC_COOL,
+            cooling_cycle_active=True,
+        )
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -7733,6 +7841,37 @@ class TempTamerTests(unittest.TestCase):
             "Level 4",
         )
 
+    def test_cooling_fan_reduction_is_immediate(self):
+        supported_fan_modes = tuple(f"Level {level}" for level in range(1, 7))
+        now = datetime(2026, 9, 25, 11, 13, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "Level 6",
+                "cool",
+                EquipmentDemand(cool_requested=True, max_temperature_deficit=0.3),
+                open_zone_count=3,
+                supported_fan_modes=supported_fan_modes,
+                fan_speed_decrease_at=now - timedelta(seconds=1),
+                now=now,
+            ),
+            "Level 2",
+        )
+
+    def test_powerday_free_power_fan_thresholds_do_not_apply_to_cooling(self):
+        power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
+
+        self.assertEqual(
+            resolve_fan_mode(
+                "low",
+                "cool",
+                EquipmentDemand(cool_requested=True, max_temperature_deficit=2.6),
+                comfort_mode=power_mode,
+                free_power_available=True,
+            ),
+            "low",
+        )
+
     def test_hvac_start_fan_ramp_increases_from_level_one_to_the_requested_level_over_fifteen_minutes(self):
         supported_fan_modes = tuple(f"Level {level}" for level in range(1, 7))
         started_at = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
@@ -8045,6 +8184,66 @@ class TempTamerTests(unittest.TestCase):
             service_call.call_args_list,
         )
         self.assertEqual(temptamer_main.RUNTIME_STATE["hvac_start_fan_ramp_started_at"], now)
+        self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+
+    def test_run_control_pass_cooling_latch_blocks_maintain_reentry_after_idle(self):
+        current_now = [datetime(2026, 9, 25, 11, 27, 0, tzinfo=timezone.utc)]
+        real_system_now = temptamer_main._system_now
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = current_now[0] - timedelta(minutes=1)
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_comfort_mode": "Office",
+                    "input_select.temptamer_hvac_mode": "Cool",
+                    "sensor.office_average_temperature": "22.0",
+                    "sensor.average_dining_zone_temp": "14.0",
+                    "sensor.average_bed1_2_zone_temp": "13.0",
+                    "sensor.average_bed3_4_zone_temp": "13.0",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    TEST_CLIMATE_ENTITY: "cool",
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 1",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "temperature": 22,
+            "current_temperature": 21,
+        }
+        temptamer_main.service.call = Mock()
+        temptamer_main._system_now = lambda: current_now[0]
+
+        try:
+            # A fresh enable-threshold crossing starts and latches the cycle.
+            temptamer_main.run_control_pass(reason="cooling latch start test")
+            self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+
+            # Falling below enable but remaining above ideal is valid maintain.
+            current_now[0] += timedelta(minutes=1)
+            temptamer_main.state._values["sensor.office_average_temperature"] = "21.0"
+            temptamer_main.run_control_pass(reason="cooling latch maintain test")
+            self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+
+            # Reaching ideal enters idle and clears the cycle latch.
+            current_now[0] += timedelta(minutes=1)
+            temptamer_main.state._values["sensor.office_average_temperature"] = "20.5"
+            temptamer_main.run_control_pass(reason="cooling latch idle test")
+            self.assertFalse(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+
+            # Moving above ideal alone cannot restart maintain-cool from idle.
+            current_now[0] += timedelta(minutes=1)
+            temptamer_main.state._values["sensor.office_average_temperature"] = "21.0"
+            temptamer_main.run_control_pass(reason="cooling latch reentry test")
+            self.assertFalse(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+            self.assertTrue(
+                temptamer_main.state.getattr(temptamer_main.STATUS_ENTITY_ID)["cooling_cycle_active"] is False
+            )
+        finally:
+            temptamer_main._system_now = real_system_now
 
     def test_run_control_pass_records_heat_demand_fan_boost_runtime_state(self):
         now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)

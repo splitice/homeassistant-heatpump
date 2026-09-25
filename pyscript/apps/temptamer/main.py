@@ -145,7 +145,10 @@ if USING_PYTHON_IMPORTS and "state_trigger" not in globals():  # pragma: no cove
         return decorator
 
 
-if USING_PYTHON_IMPORTS and "task" not in globals():  # pragma: no cover - used only outside PyScript runtime
+TASK_CREATE_RUNS_SYNCHRONOUSLY = USING_PYTHON_IMPORTS and "task" not in globals()
+
+
+if TASK_CREATE_RUNS_SYNCHRONOUSLY:  # pragma: no cover - used only outside PyScript runtime
     class _TaskRuntime:
         @staticmethod
         def create(func, *args, **kwargs):
@@ -238,6 +241,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "last_active_hvac_mode": None,
     "immediate_shutdown_zone_close_not_before": None,
     "last_heatcool_request_at": None,
+    "cooling_cycle_active": False,
     "downstairs_startup_priority_started_at": None,
     "downstairs_startup_priority_active": False,
     "downstairs_startup_priority_reason": None,
@@ -1383,7 +1387,9 @@ def _schedule_comfort_airflow_release_completion(
     RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"] = release_at
     # The lightweight native-Python task shim runs created tasks synchronously;
     # periodic passes cover tests while PyScript receives the real delayed task.
-    if task.__class__.__name__ == "_TaskRuntime":
+    # Do not introspect ``task.__class__`` here: PyScript treats that expression
+    # as a Home Assistant state name and raises ``task.__class__ is not defined``.
+    if TASK_CREATE_RUNS_SYNCHRONOUSLY:
         return
     task.create(_run_comfort_airflow_release_completion, release_at)
 
@@ -1682,6 +1688,7 @@ def _publish_runtime_state(status: str) -> None:
                 RUNTIME_STATE.get("immediate_shutdown_zone_close_not_before")
             ),
             "last_heatcool_request_at": _isoformat(RUNTIME_STATE.get("last_heatcool_request_at")),
+            "cooling_cycle_active": bool(RUNTIME_STATE.get("cooling_cycle_active")),
             "downstairs_startup_priority_started_at": _isoformat(
                 RUNTIME_STATE.get("downstairs_startup_priority_started_at")
             ),
@@ -3330,6 +3337,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
     RUNTIME_STATE.setdefault("immediate_shutdown_zone_close_not_before", None)
     RUNTIME_STATE.setdefault("last_heatcool_request_at", None)
+    RUNTIME_STATE.setdefault("cooling_cycle_active", False)
     RUNTIME_STATE.setdefault("downstairs_startup_priority_started_at", None)
     RUNTIME_STATE.setdefault("downstairs_startup_priority_active", False)
     RUNTIME_STATE.setdefault("downstairs_startup_priority_reason", None)
@@ -3453,6 +3461,10 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         last_heatcool_transition=RUNTIME_STATE["last_heatcool_transition"],
         now=now,
     )
+    cooling_cycle_active = bool(RUNTIME_STATE.get("cooling_cycle_active"))
+    if operating_mode != HVAC_COOL:
+        cooling_cycle_active = False
+        RUNTIME_STATE["cooling_cycle_active"] = False
     powerday_downstairs_priority_active = _update_powerday_downstairs_priority_runtime_state(
         snapshot,
         operating_mode,
@@ -3465,6 +3477,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        RUNTIME_STATE["cooling_cycle_active"] = False
         RUNTIME_STATE["cool_release_setpoint"] = None
         RUNTIME_STATE["powerday_dry_eligible"] = False
         RUNTIME_STATE["powerday_dry_reason"] = "Manual HVAC selection disables automatic dry mode"
@@ -3516,7 +3529,10 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         operation_mode=operating_mode,
         allowed_zone_keys=(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,) if powerday_downstairs_priority_active else None,
+        cooling_cycle_active=cooling_cycle_active,
     )
+    if demand.cool_requested:
+        cooling_cycle_active = True
     max_power_demand_5m_kw = parse_float(controller.get_state(EAGLE_200_MAX_POWER_DEMAND_5M_SENSOR))
     (
         preliminary_heat_demand_fan_boost_level,
@@ -3582,6 +3598,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         predicted_open_zones,
         operation_mode=operating_mode,
         allowed_zone_keys=(POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,) if powerday_downstairs_priority_active else None,
+        cooling_cycle_active=cooling_cycle_active,
     )
     (
         heat_demand_fan_boost_level,
@@ -3685,6 +3702,13 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         plan,
         current_hvac_mode=current_hvac_mode_str,
         now=now,
+    )
+    RUNTIME_STATE["cooling_cycle_active"] = bool(
+        operating_mode == HVAC_COOL
+        and plan.hvac_mode == HVAC_COOL
+        and not plan.turn_off
+        and not plan.idle
+        and (demand.cool_requested or demand.maintain_cool_mode)
     )
 
     dry_stopping = (
@@ -3797,7 +3821,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     _update_cool_release_runtime_state(plan)
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s cooling_cycle_active=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -3805,6 +3829,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
         plan.idle,
+        RUNTIME_STATE["cooling_cycle_active"],
         idle_demand_forecast.reason if idle_demand_forecast is not None else "not evaluated",
         plan.fan_mode,
         heat_demand_fan_boost_level,

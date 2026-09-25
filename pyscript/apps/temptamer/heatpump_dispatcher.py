@@ -1087,7 +1087,10 @@ def resolve_fan_mode(
         open_zone_count,
         current_speed_level=current_speed_level,
         starting=starting,
-        free_power_available=free_power_available,
+        # PowerDay's aggressive fan thresholds exist to move free heat into
+        # the house. Applying them to cooling can turn a small multi-zone
+        # cooling call into maximum airflow without a cooling heat-soak goal.
+        free_power_available=free_power_available and not cooling,
     )
     if not cooling:
         fan_speed_level += _bounded_fan_boost_level(base_fan_boost) * _fan_speed_multiplier(open_zone_count)
@@ -1100,6 +1103,11 @@ def resolve_fan_mode(
             supported_fan_modes=supported_fan_modes,
             now=now,
         )
+    if cooling:
+        # Cold airflow has an immediate comfort impact. Follow a reduced
+        # cooling request directly instead of retaining excessive airflow for
+        # the heating-oriented three-minute fan-down interval.
+        return requested_fan_mode
     return _limit_fan_speed_decrease(
         requested_fan_mode,
         current_fan_mode,
@@ -1411,6 +1419,11 @@ def build_dispatch_plan(
         return DispatchPlan(
             idle=True,
             hvac_mode=idle_hvac_mode,
+            fan_mode=(
+                _actual_fan_mode_for_level(1, supported_fan_modes)
+                if idle_hvac_mode == HVAC_COOL
+                else None
+            ),
             setpoint=idle_setpoint,
             idle_heat_step=resolved_idle_heat_step if idle_hvac_mode == HVAC_HEAT else None,
             idle_heat_step_changed=idle_heat_step_changed if idle_hvac_mode == HVAC_HEAT else False,
