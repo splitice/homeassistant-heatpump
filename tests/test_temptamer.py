@@ -53,9 +53,12 @@ from pyscript.apps.temptamer.config import (
 )
 from pyscript.apps.temptamer.comfort_adjustments import (
     apply_adjustment_hysteresis,
+    calculate_cooling_airflow_target,
     calculate_comfort_adjustments,
     calculate_humidex_adjustment,
+    cooling_airflow_fan_level,
     filter_outdoor_temperature,
+    resolve_cooling_airflow_release,
     resolve_operating_mode as resolve_comfort_adjustment_operating_mode,
     resolve_solar_index,
 )
@@ -366,6 +369,138 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertEqual(result.adjustments["office"], -0.9)
         self.assertEqual(result.adjustments["dining"], -0.9)
         self.assertEqual(result.zone_diagnostics["bedroom_1_2"]["room_aggregation"], "comfort_weighted_mean")
+
+    def test_cooling_airflow_curve_uses_physical_fan_levels(self):
+        effects = DEFAULT_COMFORT_ADJUSTMENT_CONFIG.cooling_airflow_effects
+
+        self.assertEqual(cooling_airflow_fan_level("low"), 1)
+        self.assertEqual(cooling_airflow_fan_level("medium"), 2)
+        self.assertEqual(cooling_airflow_fan_level("Level 6"), 6)
+        self.assertEqual(cooling_airflow_fan_level("LEVEL 9"), 9)
+        self.assertIsNone(cooling_airflow_fan_level("auto"))
+        for level, expected in enumerate(effects, start=1):
+            self.assertAlmostEqual(
+                calculate_cooling_airflow_target(
+                    level,
+                    effects,
+                    active_cooling=True,
+                    airflow_switch_on=True,
+                ),
+                -expected,
+            )
+        self.assertEqual(
+            calculate_cooling_airflow_target(
+                9,
+                effects,
+                active_cooling=True,
+                airflow_switch_on=True,
+            ),
+            -1.8,
+        )
+
+    def test_cooling_airflow_requires_active_cooling_and_an_open_duct(self):
+        state_overrides = {
+            "input_select.heatpump_mode_user": "Cool",
+            TEST_CLIMATE_ENTITY: "cool",
+            DEFAULT_SYSTEM_CONFIG.zones["office"].switch_entity_id: "on",
+            DEFAULT_SYSTEM_CONFIG.zones["dining"].switch_entity_id: "off",
+        }
+        active = self.calculate(
+            state_overrides,
+            {TEST_CLIMATE_ENTITY: {"hvac_action": "idle", "fan_mode": "Level 6"}},
+        )
+
+        self.assertEqual(active.airflow_target_adjustments["office"], -1.8)
+        self.assertEqual(active.airflow_target_adjustments["dining"], 0.0)
+        self.assertTrue(active.airflow_switch_states["office"])
+        self.assertEqual(active.fan_speed_level, 6)
+        self.assertEqual(active.hvac_mode, "cool")
+        self.assertEqual(active.hvac_action, "idle")
+        self.assertEqual(active.thermal_adjustments, active.raw_adjustments)
+
+        for inactive_mode in ("heat", "dry", "fan_only", "off"):
+            inactive = self.calculate(
+                {**state_overrides, TEST_CLIMATE_ENTITY: inactive_mode},
+                {TEST_CLIMATE_ENTITY: {"hvac_action": "cooling", "fan_mode": "Level 6"}},
+            )
+            self.assertEqual(inactive.airflow_target_adjustments["office"], 0.0)
+
+        unknown_fan = self.calculate(
+            state_overrides,
+            {TEST_CLIMATE_ENTITY: {"hvac_action": "cooling", "fan_mode": "auto"}},
+        )
+        self.assertEqual(unknown_fan.airflow_target_adjustments["office"], 0.0)
+
+    def test_cooling_airflow_zone_factor_scales_the_curve(self):
+        zones = tuple(
+            replace(zone, cooling_airflow_factor=0.5) if zone.key == "office" else zone
+            for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+        )
+        config = replace(DEFAULT_COMFORT_ADJUSTMENT_CONFIG, zones=zones)
+        result = self.calculate(
+            {
+                "input_select.heatpump_mode_user": "Cool",
+                TEST_CLIMATE_ENTITY: "cool",
+                DEFAULT_SYSTEM_CONFIG.zones["office"].switch_entity_id: "on",
+            },
+            {TEST_CLIMATE_ENTITY: {"hvac_action": "cooling", "fan_mode": "Level 6"}},
+            config=config,
+        )
+
+        self.assertEqual(result.airflow_target_adjustments["office"], -0.9)
+
+    def test_cooling_airflow_release_is_linear_and_heating_cancels_it(self):
+        started_at = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        active = resolve_cooling_airflow_release(
+            -1.8,
+            previous_adjustment=0.0,
+            previous_release_origin=None,
+            previous_release_started_at=None,
+            now=started_at,
+            release_seconds=300,
+        )
+        self.assertEqual(active, (-1.8, -1.8, None, "active", None))
+
+        release_start = resolve_cooling_airflow_release(
+            0.0,
+            previous_adjustment=-1.8,
+            previous_release_origin=-1.8,
+            previous_release_started_at=None,
+            now=started_at,
+            release_seconds=300,
+        )
+        self.assertEqual(release_start[0], -1.8)
+        self.assertEqual(release_start[3], "releasing")
+        self.assertEqual(release_start[4], started_at + timedelta(minutes=5))
+
+        halfway = resolve_cooling_airflow_release(
+            0.0,
+            previous_adjustment=release_start[0],
+            previous_release_origin=release_start[1],
+            previous_release_started_at=release_start[2],
+            now=started_at + timedelta(minutes=2, seconds=30),
+            release_seconds=300,
+        )
+        self.assertAlmostEqual(halfway[0], -0.9)
+        released = resolve_cooling_airflow_release(
+            0.0,
+            previous_adjustment=halfway[0],
+            previous_release_origin=halfway[1],
+            previous_release_started_at=halfway[2],
+            now=started_at + timedelta(minutes=5),
+            release_seconds=300,
+        )
+        self.assertEqual(released, (0.0, 0.0, None, "released", None))
+        cancelled = resolve_cooling_airflow_release(
+            0.0,
+            previous_adjustment=-1.8,
+            previous_release_origin=-1.8,
+            previous_release_started_at=started_at,
+            now=started_at + timedelta(minutes=1),
+            release_seconds=300,
+            cancel_immediately=True,
+        )
+        self.assertEqual(cancelled, (0.0, 0.0, None, "cancelled_by_heating", None))
 
     def test_humidex_adjustment_matches_known_warm_weather_value(self):
         self.assertAlmostEqual(calculate_humidex_adjustment(23.0, 50.0), 2.2459, places=4)
@@ -1018,12 +1153,14 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertIn("input_select.heatpump_mode_user", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("input_select.temptamer_hvac_mode", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn(f"{TEST_CLIMATE_ENTITY}.hvac_action", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+        self.assertIn(f"{TEST_CLIMATE_ENTITY}.fan_mode", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("cover.officeshutters.current_position", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("sensor.climate_indoor_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("sensor.rumpus_white_clock_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         self.assertIn("sensor.air_monitor_lite_c705_humidity", COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
         for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
             self.assertNotIn(zone.output_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
+            self.assertIn(zone.airflow_switch_entity_id, COMFORT_ADJUSTMENT_TRIGGER_ENTITIES)
             self.assertIn(zone.output_entity_id, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
             self.assertNotIn(zone.output_entity_id, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
 
@@ -1312,6 +1449,173 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             places=6,
         )
 
+    def test_publisher_adds_airflow_after_thermal_rate_limit_and_releases_it(self):
+        started_at = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        zone_keys = [zone.key for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones]
+        controller = FakeReader(
+            {zone.output_entity_id: "0.0" for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones}
+        )
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_published_adjustments"] = {
+            zone_key: {
+                "at": started_at,
+                "unrounded_thermal_adjustment": 0.0,
+                "airflow_adjustment": 0.0,
+                "unrounded_value": 0.0,
+                "value": 0.0,
+            }
+            for zone_key in zone_keys
+        }
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release"] = {}
+
+        def result(*, thermal, office_airflow, hvac_mode, valid=True):
+            return SimpleNamespace(
+                calculation_validity={zone_key: valid for zone_key in zone_keys},
+                raw_adjustments={zone_key: thermal for zone_key in zone_keys},
+                adjustments={zone_key: thermal for zone_key in zone_keys},
+                filter_warming_up={zone_key: False for zone_key in zone_keys},
+                airflow_target_adjustments={
+                    zone_key: office_airflow if zone_key == "office" else 0.0
+                    for zone_key in zone_keys
+                },
+                hvac_mode=hvac_mode,
+            )
+
+        active = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=0.0, office_airflow=-1.8, hvac_mode="cool"),
+            started_at,
+            controller,
+        )
+        self.assertEqual(active["office"]["rate_limited_thermal_adjustment"], 0.0)
+        self.assertEqual(active["office"]["airflow_adjustment"], -1.8)
+        self.assertEqual(active["office"]["filtered_adjustment"], -1.8)
+
+        rate_limited = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=-1.8, hvac_mode="cool"),
+            started_at + timedelta(minutes=15),
+            controller,
+        )
+        self.assertAlmostEqual(rate_limited["office"]["rate_limited_thermal_adjustment"], 0.2)
+        self.assertEqual(rate_limited["office"]["airflow_adjustment"], -1.8)
+        self.assertEqual(rate_limited["office"]["filtered_adjustment"], -1.6)
+
+        release_started_at = started_at + timedelta(minutes=16)
+        release_started = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=0.0, hvac_mode="off"),
+            release_started_at,
+            controller,
+        )
+        self.assertEqual(release_started["office"]["airflow_adjustment"], -1.8)
+        halfway = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=0.0, hvac_mode="off"),
+            release_started_at + timedelta(minutes=2, seconds=30),
+            controller,
+        )
+        self.assertAlmostEqual(halfway["office"]["airflow_adjustment"], -0.9)
+        released = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=0.0, hvac_mode="off"),
+            release_started_at + timedelta(minutes=5),
+            controller,
+        )
+        self.assertEqual(released["office"]["airflow_adjustment"], 0.0)
+
+        active_again = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=-1.8, hvac_mode="cool"),
+            release_started_at + timedelta(minutes=6),
+            controller,
+        )
+        self.assertEqual(active_again["office"]["airflow_adjustment"], -1.8)
+        heating = temptamer_main._resolve_published_comfort_adjustments(
+            result(thermal=2.0, office_airflow=0.0, hvac_mode="heat"),
+            release_started_at + timedelta(minutes=6, seconds=1),
+            controller,
+        )
+        self.assertEqual(heating["office"]["airflow_adjustment"], 0.0)
+        self.assertEqual(heating["office"]["airflow_status"], "cancelled_by_heating")
+
+    def test_publisher_keeps_valid_airflow_when_thermal_inputs_are_unavailable(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        zone_keys = [zone.key for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones]
+        result = SimpleNamespace(
+            calculation_validity={zone_key: False for zone_key in zone_keys},
+            raw_adjustments={zone_key: 0.0 for zone_key in zone_keys},
+            adjustments={zone_key: 0.0 for zone_key in zone_keys},
+            filter_warming_up={zone_key: False for zone_key in zone_keys},
+            airflow_target_adjustments={
+                zone_key: -1.8 if zone_key == "office" else 0.0
+                for zone_key in zone_keys
+            },
+            hvac_mode="cool",
+        )
+        controller = FakeReader(
+            {zone.output_entity_id: "0.0" for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones}
+        )
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_published_adjustments"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release"] = {}
+
+        publications = temptamer_main._resolve_published_comfort_adjustments(result, now, controller)
+
+        self.assertEqual(publications["office"]["calculation_status"], "unavailable")
+        self.assertEqual(publications["office"]["filtered_adjustment"], -1.8)
+
+    def test_publisher_does_not_double_apply_active_airflow_after_reload(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        zone_keys = [zone.key for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones]
+        result = SimpleNamespace(
+            calculation_validity={zone_key: True for zone_key in zone_keys},
+            raw_adjustments={zone_key: 3.0 for zone_key in zone_keys},
+            adjustments={zone_key: 3.0 for zone_key in zone_keys},
+            filter_warming_up={zone_key: False for zone_key in zone_keys},
+            airflow_target_adjustments={
+                zone_key: -1.8 if zone_key == "office" else 0.0
+                for zone_key in zone_keys
+            },
+            hvac_mode="cool",
+        )
+        controller = FakeReader(
+            {
+                zone.output_entity_id: "1.2" if zone.key == "office" else "3.0"
+                for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones
+            }
+        )
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_published_adjustments"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release"] = {}
+
+        publications = temptamer_main._resolve_published_comfort_adjustments(result, now, controller)
+
+        self.assertEqual(publications["office"]["rate_limited_thermal_adjustment"], 3.0)
+        self.assertEqual(publications["office"]["airflow_adjustment"], -1.8)
+        self.assertEqual(publications["office"]["filtered_adjustment"], 1.2)
+
+    def test_publisher_clamps_combined_thermal_and_airflow_score(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        zone_keys = [zone.key for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones]
+        result = SimpleNamespace(
+            calculation_validity={zone_key: True for zone_key in zone_keys},
+            raw_adjustments={zone_key: -3.0 for zone_key in zone_keys},
+            adjustments={zone_key: -3.0 for zone_key in zone_keys},
+            filter_warming_up={zone_key: False for zone_key in zone_keys},
+            airflow_target_adjustments={zone_key: -1.8 for zone_key in zone_keys},
+            hvac_mode="cool",
+        )
+        controller = FakeReader(
+            {zone.output_entity_id: "0.0" for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones}
+        )
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_published_adjustments"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid"] = {}
+        temptamer_main.RUNTIME_STATE["comfort_adjustment_airflow_release"] = {}
+
+        publications = temptamer_main._resolve_published_comfort_adjustments(
+            result,
+            now,
+            controller,
+            force_reseed=True,
+        )
+
+        self.assertEqual(publications["office"]["filtered_adjustment"], -3.0)
+
     def test_score_semantics_migration_reseeds_old_helpers_without_rate_limiting(self):
         now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         temptamer_main.state._values.clear()
@@ -1359,7 +1663,7 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             )
             calculated_office = calculations[0].adjustments["office"]
 
-            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "5\n")
+            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "7\n")
 
         self.assertEqual(published_office, calculated_office)
         self.assertNotEqual(published_office, 1.5)
@@ -1665,6 +1969,9 @@ class TempTamerLoggingTests(unittest.TestCase):
         )
         self.assertEqual(calibration["solar_mrt_coefficient"], 0.015)
         self.assertEqual(calibration["solar_adjustment_limit"], 0.5)
+        self.assertEqual(calibration["cooling_airflow_effects"], (0.2, 0.4, 0.7, 1.0, 1.4, 1.8))
+        self.assertEqual(calibration["cooling_airflow_release_seconds"], 300)
+        self.assertEqual(calibration["cooling_airflow_zones"]["office"]["factor"], 1.0)
         self.assertEqual(
             calibration["zone_humidity_entities"]["downstairs"],
             "sensor.rumpus_white_clock_humidity",
@@ -1833,12 +2140,13 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(positive.zones["office"].scheme.ideal_target, 16.7)
         self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 23.5)
 
-    def test_global_setpoint_adjustment_shifts_all_zone_thresholds_and_composes(self):
+    def test_global_setpoint_adjustment_uses_heating_sign_and_inverts_for_cooling(self):
         baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
         adjusted = build_snapshot(
             FakeReader(
                 base_state_map(
                     **{
+                        "input_select.temptamer_hvac_mode": "Cool",
                         "input_number.temptamer_setpoint_adjustment": "0.4",
                         "input_number.comfort_adjustment_office": "0.2",
                     }
@@ -1848,15 +2156,26 @@ class TempTamerTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted.global_setpoint_adjustment, 0.4)
+        self.assertEqual(adjusted.selected_hvac_mode, "Cool")
         for zone_key, baseline_zone in baseline.zones.items():
             adjusted_zone = adjusted.zones[zone_key]
-            expected_offset = 0.2 if zone_key == "office" else 0.4
-            self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside + expected_offset)
-            self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until + expected_offset)
-            self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target + expected_offset)
-            self.assertEqual(adjusted_zone.cool_scheme.enable_outside, baseline_zone.cool_scheme.enable_outside + expected_offset)
-            self.assertEqual(adjusted_zone.cool_scheme.continue_until, baseline_zone.cool_scheme.continue_until + expected_offset)
-            self.assertEqual(adjusted_zone.cool_scheme.ideal_target, baseline_zone.cool_scheme.ideal_target + expected_offset)
+            heat_offset = 0.2 if zone_key == "office" else 0.4
+            cool_offset = -0.6 if zone_key == "office" else -0.4
+            self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside + heat_offset)
+            self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until + heat_offset)
+            self.assertEqual(adjusted_zone.scheme.ideal_target, baseline_zone.scheme.ideal_target + heat_offset)
+            self.assertAlmostEqual(
+                adjusted_zone.cool_scheme.enable_outside,
+                baseline_zone.cool_scheme.enable_outside + cool_offset,
+            )
+            self.assertAlmostEqual(
+                adjusted_zone.cool_scheme.continue_until,
+                baseline_zone.cool_scheme.continue_until + cool_offset,
+            )
+            self.assertAlmostEqual(
+                adjusted_zone.cool_scheme.ideal_target,
+                baseline_zone.cool_scheme.ideal_target + cool_offset,
+            )
             self.assertEqual(adjusted.base_zone_targets[zone_key], baseline.base_zone_targets[zone_key])
         self.assertEqual(adjusted.zones["office"].comfort_adjustment, 0.2)
 
@@ -1873,12 +2192,13 @@ class TempTamerTests(unittest.TestCase):
                     self.assertEqual(adjusted.global_setpoint_adjustment, manual)
                     self.assertEqual(adjusted.zones["office"].comfort_adjustment, clamped_auto)
                     for key, zone in adjusted.zones.items():
-                        correction = (clamped_auto if key == "office" else 0.0) - manual
+                        automatic_correction = clamped_auto if key == "office" else 0.0
                         for scheme_attr in ("scheme", "cool_scheme"):
                             before = getattr(baseline.zones[key], scheme_attr)
                             after = getattr(zone, scheme_attr)
+                            manual_offset = manual if scheme_attr == "scheme" else -manual
                             expected_values = tuple(
-                                getattr(before, threshold) - correction
+                                getattr(before, threshold) + manual_offset - automatic_correction
                                 for threshold in ("enable_outside", "continue_until", "ideal_target")
                             )
                             if (
@@ -1892,7 +2212,8 @@ class TempTamerTests(unittest.TestCase):
                                 continue
                             for threshold in ("enable_outside", "continue_until", "ideal_target"):
                                 self.assertAlmostEqual(
-                                    getattr(after, threshold), getattr(before, threshold) - correction,
+                                    getattr(after, threshold),
+                                    getattr(before, threshold) + manual_offset - automatic_correction,
                                 )
 
     def test_manual_adjustment_defaults_to_zero_for_invalid_values(self):
@@ -4699,7 +5020,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertTrue(demand.cool_requested)
         self.assertAlmostEqual(demand.max_temperature_deficit, 0.5)
-        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.setpoint, 21)
         self.assertEqual(plan.fan_mode, "Level 3")
 
     def test_maintain_cooling_uses_inlet_setpoint_when_zone_is_closer_to_ideal(self):

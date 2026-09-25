@@ -57,6 +57,7 @@ from .comfort_adjustments import (
     apply_adjustment_hysteresis,
     calculate_comfort_adjustments,
     filter_outdoor_temperature,
+    resolve_cooling_airflow_release,
     round_comfort_adjustment,
     resolve_outdoor_temperature,
 )
@@ -295,6 +296,8 @@ RUNTIME_STATE: dict[str, Any] = {
     "comfort_adjustment_last_valid_cover_positions": {},
     "comfort_adjustment_last_published_adjustments": {},
     "comfort_adjustment_last_valid": {},
+    "comfort_adjustment_airflow_release": {},
+    "comfort_adjustment_airflow_release_scheduled_at": None,
     "comfort_adjustment_last_valid_mode": None,
     "comfort_adjustment_calibration_parameters": None,
     "comfort_score_semantics_restore_checked": False,
@@ -1078,6 +1081,15 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
             config.output_rate_limit_celsius,
             config.output_rate_limit_seconds,
         ),
+        "cooling_airflow_effects": config.cooling_airflow_effects,
+        "cooling_airflow_release_seconds": config.cooling_airflow_release_seconds,
+        "cooling_airflow_zones": {
+            zone.key: {
+                "switch_entity": zone.airflow_switch_entity_id,
+                "factor": zone.cooling_airflow_factor,
+            }
+            for zone in config.zones
+        },
         "rooms": rooms,
     }
 
@@ -1129,38 +1141,85 @@ def _resolve_published_comfort_adjustments(
     *,
     force_reseed: bool = False,
 ) -> dict[str, dict[str, object]]:
-    """Apply output hysteresis and retain a short, explicit last-valid hold."""
+    """Rate-limit thermal scores, then add responsive cooling-airflow scores."""
     last_valid = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_valid")
     last_published = _comfort_adjustment_runtime_mapping("comfort_adjustment_last_published_adjustments")
+    airflow_release = _comfort_adjustment_runtime_mapping("comfort_adjustment_airflow_release")
+    airflow_targets = getattr(result, "airflow_target_adjustments", {})
+    hvac_mode = str(getattr(result, "hvac_mode", "") or "").strip().lower()
+    cancel_airflow_immediately = hvac_mode in {"heat", "heating"}
     publications: dict[str, dict[str, object]] = {}
     for zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
         zone_key = zone.key
         previous_adjustment = parse_float(controller.get_state(zone.output_entity_id))
+        previous_published = last_published.get(zone_key)
+        previous_airflow_state = airflow_release.get(zone_key)
+        had_previous_airflow_state = isinstance(previous_airflow_state, dict)
+        if not had_previous_airflow_state:
+            previous_airflow_state = {}
+        target_airflow_adjustment = parse_float(airflow_targets.get(zone_key)) or 0.0
+        previous_airflow_adjustment = parse_float(previous_airflow_state.get("effective_adjustment")) or 0.0
+        if (
+            not force_reseed
+            and not had_previous_airflow_state
+            and not isinstance(previous_published, dict)
+            and target_airflow_adjustment < 0.0
+        ):
+            # After a PyScript reload the helper already includes active airflow,
+            # while in-memory component history is empty. Infer that component
+            # from the authoritative live target so it is not applied twice.
+            previous_airflow_adjustment = target_airflow_adjustment
+        (
+            effective_airflow_adjustment,
+            release_origin_adjustment,
+            release_started_at,
+            airflow_status,
+            release_ends_at,
+        ) = resolve_cooling_airflow_release(
+            target_airflow_adjustment,
+            previous_adjustment=previous_airflow_adjustment,
+            previous_release_origin=previous_airflow_state.get("release_origin_adjustment"),
+            previous_release_started_at=previous_airflow_state.get("release_started_at"),
+            now=now,
+            release_seconds=DEFAULT_COMFORT_ADJUSTMENT_CONFIG.cooling_airflow_release_seconds,
+            cancel_immediately=cancel_airflow_immediately,
+        )
+        airflow_release[zone_key] = {
+            "effective_adjustment": effective_airflow_adjustment,
+            "release_origin_adjustment": release_origin_adjustment,
+            "release_started_at": release_started_at,
+            "release_ends_at": release_ends_at,
+            "status": airflow_status,
+        }
+
         if result.calculation_validity[zone_key]:
-            raw_adjustment = result.raw_adjustments[zone_key]
-            rounded_adjustment = result.adjustments[zone_key]
-            filtered_adjustment = rounded_adjustment if force_reseed else apply_adjustment_hysteresis(
-                raw_adjustment,
-                previous_adjustment,
-                DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
+            raw_thermal_adjustment = result.raw_adjustments[zone_key]
+            rounded_thermal_adjustment = result.adjustments[zone_key]
+            previous_thermal_adjustment = parse_float(
+                previous_published.get("unrounded_thermal_adjustment")
+                if isinstance(previous_published, dict)
+                else None
             )
-            previous_published = last_published.get(zone_key)
+            if previous_thermal_adjustment is None and previous_adjustment is not None:
+                previous_thermal_adjustment = previous_adjustment - previous_airflow_adjustment
+            filtered_thermal_adjustment = (
+                rounded_thermal_adjustment
+                if force_reseed
+                else apply_adjustment_hysteresis(
+                    raw_thermal_adjustment,
+                    previous_thermal_adjustment,
+                    DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
+                )
+            )
             previous_published_at = _normalize_runtime_datetime(
                 previous_published.get("at") if isinstance(previous_published, dict) else None
             )
-            previous_rate_limited_value = parse_float(
-                previous_published.get("unrounded_value") if isinstance(previous_published, dict) else previous_adjustment
-            )
-            if previous_rate_limited_value is None:
-                previous_rate_limited_value = parse_float(
-                    previous_published.get("value") if isinstance(previous_published, dict) else previous_adjustment
-                )
-            if previous_rate_limited_value is None and result.filter_warming_up.get(zone_key, False):
-                previous_rate_limited_value = 0.0
+            if previous_thermal_adjustment is None and result.filter_warming_up.get(zone_key, False):
+                previous_thermal_adjustment = 0.0
             elapsed_seconds = (
                 (now - previous_published_at).total_seconds() if previous_published_at is not None else None
             )
-            if previous_rate_limited_value is not None and not force_reseed:
+            if previous_thermal_adjustment is not None and not force_reseed:
                 if elapsed_seconds is None:
                     allowed_change = (
                         DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_celsius
@@ -1174,92 +1233,111 @@ def _resolve_published_comfort_adjustments(
                         / DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_rate_limit_seconds
                     )
                 if allowed_change is not None:
-                    filtered_adjustment = _clamp_comfort_adjustment_change(
-                        filtered_adjustment,
-                        previous_rate_limited_value,
+                    filtered_thermal_adjustment = _clamp_comfort_adjustment_change(
+                        filtered_thermal_adjustment,
+                        previous_thermal_adjustment,
                         allowed_change,
                     )
-            rate_limited_adjustment = raw_adjustment if force_reseed else filtered_adjustment
-            filtered_adjustment = rounded_adjustment if force_reseed else round_comfort_adjustment(rate_limited_adjustment)
-            last_published[zone_key] = {
-                "at": now,
-                "unrounded_value": rate_limited_adjustment,
-                "value": filtered_adjustment,
-            }
+            rate_limited_thermal_adjustment = (
+                raw_thermal_adjustment if force_reseed else filtered_thermal_adjustment
+            )
+            calculation_status = "reseeded" if force_reseed else "calculated"
+            last_valid_age_seconds = 0.0
             last_valid[zone_key] = {
                 "at": now,
-                "raw_adjustment": raw_adjustment,
-                "rounded_adjustment": rounded_adjustment,
-                "filtered_adjustment": filtered_adjustment,
-                "unrounded_rate_limited_adjustment": rate_limited_adjustment,
+                "raw_adjustment": raw_thermal_adjustment,
+                "rounded_adjustment": rounded_thermal_adjustment,
+                "filtered_adjustment": round_comfort_adjustment(rate_limited_thermal_adjustment),
+                "unrounded_rate_limited_adjustment": rate_limited_thermal_adjustment,
+                "filtered_thermal_adjustment": rate_limited_thermal_adjustment,
             }
-            publications[zone_key] = {
-                "raw_adjustment": raw_adjustment,
-                "rounded_adjustment": rounded_adjustment,
-                "filtered_adjustment": filtered_adjustment,
-                "unrounded_rate_limited_adjustment": rate_limited_adjustment,
-                "calculation_status": "reseeded" if force_reseed else "calculated",
-                "last_valid_age_seconds": 0.0,
-            }
-            continue
-
-        if force_reseed:
-            # Never preserve a legacy-polarity helper value when source data
-            # is unavailable during the one-time score migration.
+        elif force_reseed:
             last_valid.pop(zone_key, None)
-            last_published[zone_key] = {
-                "at": now,
-                "unrounded_value": 0.0,
-                "value": 0.0,
-            }
-            publications[zone_key] = {
-                "raw_adjustment": 0.0,
-                "rounded_adjustment": 0.0,
-                "filtered_adjustment": 0.0,
-                "unrounded_rate_limited_adjustment": 0.0,
-                "calculation_status": "reseeded_unavailable",
-                "last_valid_age_seconds": None,
-            }
-            continue
-
-        previous_calculation = last_valid.get(zone_key)
-        held_at = _normalize_runtime_datetime(
-            previous_calculation.get("at") if isinstance(previous_calculation, dict) else None
-        )
-        hold_age_seconds = (now - held_at).total_seconds() if held_at is not None else None
-        if (
-            isinstance(previous_calculation, dict)
-            and hold_age_seconds is not None
-            and 0.0 <= hold_age_seconds <= DEFAULT_COMFORT_ADJUSTMENT_CONFIG.last_valid_hold_seconds
-        ):
-            raw_adjustment = parse_float(previous_calculation.get("raw_adjustment"))
-            rounded_adjustment = parse_float(previous_calculation.get("rounded_adjustment"))
-            filtered_adjustment = parse_float(previous_calculation.get("filtered_adjustment"))
-            unrounded_rate_limited_adjustment = parse_float(
-                previous_calculation.get("unrounded_rate_limited_adjustment")
+            raw_thermal_adjustment = 0.0
+            rounded_thermal_adjustment = 0.0
+            rate_limited_thermal_adjustment = 0.0
+            calculation_status = "reseeded_unavailable"
+            last_valid_age_seconds = None
+        else:
+            previous_calculation = last_valid.get(zone_key)
+            held_at = _normalize_runtime_datetime(
+                previous_calculation.get("at") if isinstance(previous_calculation, dict) else None
             )
-            if raw_adjustment is not None and rounded_adjustment is not None and filtered_adjustment is not None:
-                publications[zone_key] = {
-                    "raw_adjustment": raw_adjustment,
-                    "rounded_adjustment": rounded_adjustment,
-                    "filtered_adjustment": filtered_adjustment,
-                    "unrounded_rate_limited_adjustment": (
-                        unrounded_rate_limited_adjustment
-                        if unrounded_rate_limited_adjustment is not None
-                        else filtered_adjustment
-                    ),
-                    "calculation_status": "held_last_valid",
-                    "last_valid_age_seconds": hold_age_seconds,
-                }
-                continue
+            hold_age_seconds = (now - held_at).total_seconds() if held_at is not None else None
+            if (
+                isinstance(previous_calculation, dict)
+                and hold_age_seconds is not None
+                and 0.0 <= hold_age_seconds <= DEFAULT_COMFORT_ADJUSTMENT_CONFIG.last_valid_hold_seconds
+            ):
+                raw_thermal_adjustment = parse_float(previous_calculation.get("raw_adjustment"))
+                rounded_thermal_adjustment = parse_float(previous_calculation.get("rounded_adjustment"))
+                rate_limited_thermal_adjustment = parse_float(
+                    previous_calculation.get("filtered_thermal_adjustment")
+                )
+                if rate_limited_thermal_adjustment is None:
+                    rate_limited_thermal_adjustment = parse_float(
+                        previous_calculation.get("unrounded_rate_limited_adjustment")
+                    )
+                if (
+                    raw_thermal_adjustment is not None
+                    and rounded_thermal_adjustment is not None
+                    and rate_limited_thermal_adjustment is not None
+                ):
+                    calculation_status = "held_last_valid"
+                    last_valid_age_seconds = hold_age_seconds
+                else:
+                    raw_thermal_adjustment = 0.0
+                    rounded_thermal_adjustment = 0.0
+                    rate_limited_thermal_adjustment = 0.0
+                    calculation_status = "unavailable"
+                    last_valid_age_seconds = hold_age_seconds
+            else:
+                raw_thermal_adjustment = 0.0
+                rounded_thermal_adjustment = 0.0
+                rate_limited_thermal_adjustment = 0.0
+                calculation_status = "unavailable"
+                last_valid_age_seconds = hold_age_seconds
 
+        raw_adjustment = max(
+            COMFORT_SCORE_MINIMUM,
+            min(COMFORT_SCORE_MAXIMUM, raw_thermal_adjustment + effective_airflow_adjustment),
+        )
+        unrounded_rate_limited_adjustment = max(
+            COMFORT_SCORE_MINIMUM,
+            min(COMFORT_SCORE_MAXIMUM, rate_limited_thermal_adjustment + effective_airflow_adjustment),
+        )
+        rounded_adjustment = round_comfort_adjustment(raw_adjustment)
+        filtered_adjustment = round_comfort_adjustment(unrounded_rate_limited_adjustment)
+        if not force_reseed:
+            filtered_adjustment = round_comfort_adjustment(
+                apply_adjustment_hysteresis(
+                    unrounded_rate_limited_adjustment,
+                    previous_adjustment,
+                    DEFAULT_COMFORT_ADJUSTMENT_CONFIG.output_hysteresis,
+                )
+            )
+        last_published[zone_key] = {
+            "at": now,
+            "unrounded_thermal_adjustment": rate_limited_thermal_adjustment,
+            "airflow_adjustment": effective_airflow_adjustment,
+            "unrounded_value": unrounded_rate_limited_adjustment,
+            "value": filtered_adjustment,
+        }
         publications[zone_key] = {
-            "raw_adjustment": 0.0,
-            "rounded_adjustment": 0.0,
-            "filtered_adjustment": 0.0,
-            "unrounded_rate_limited_adjustment": 0.0,
-            "calculation_status": "unavailable",
-            "last_valid_age_seconds": hold_age_seconds,
+            "raw_thermal_adjustment": raw_thermal_adjustment,
+            "rounded_thermal_adjustment": rounded_thermal_adjustment,
+            "rate_limited_thermal_adjustment": rate_limited_thermal_adjustment,
+            "airflow_target_adjustment": target_airflow_adjustment,
+            "airflow_adjustment": effective_airflow_adjustment,
+            "airflow_status": airflow_status,
+            "airflow_release_started_at": release_started_at,
+            "airflow_release_ends_at": release_ends_at,
+            "raw_adjustment": raw_adjustment,
+            "rounded_adjustment": rounded_adjustment,
+            "filtered_adjustment": filtered_adjustment,
+            "unrounded_rate_limited_adjustment": unrounded_rate_limited_adjustment,
+            "calculation_status": calculation_status,
+            "last_valid_age_seconds": last_valid_age_seconds,
         }
     return publications
 
@@ -1268,6 +1346,46 @@ def _clamp_comfort_adjustment_change(target: float, previous: float, maximum_cha
     if maximum_change <= 0.0:
         return previous
     return max(previous - maximum_change, min(previous + maximum_change, target))
+
+
+def _run_comfort_airflow_release_completion(expected_release_at: datetime) -> None:
+    delay_seconds = max(0.0, (expected_release_at - _system_now()).total_seconds())
+    if delay_seconds > 0.0:
+        task.sleep(delay_seconds)
+    scheduled_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("comfort_adjustment_airflow_release_scheduled_at")
+    )
+    if scheduled_at != expected_release_at or _system_now() < expected_release_at:
+        return
+    RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"] = None
+    _run_comfort_adjustment_pass(reason="cooling airflow release completed")
+
+
+def _schedule_comfort_airflow_release_completion(
+    publications: dict[str, dict[str, object]],
+    now: datetime,
+) -> None:
+    release_times: list[datetime] = []
+    for publication in publications.values():
+        release_at = _normalize_runtime_datetime(publication.get("airflow_release_ends_at"))
+        if release_at is not None and release_at > now:
+            release_times.append(release_at)
+    if not release_times:
+        RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"] = None
+        return
+
+    release_at = min(release_times)
+    scheduled_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("comfort_adjustment_airflow_release_scheduled_at")
+    )
+    if scheduled_at is not None and scheduled_at <= release_at:
+        return
+    RUNTIME_STATE["comfort_adjustment_airflow_release_scheduled_at"] = release_at
+    # The lightweight native-Python task shim runs created tasks synchronously;
+    # periodic passes cover tests while PyScript receives the real delayed task.
+    if task.__class__.__name__ == "_TaskRuntime":
+        return
+    task.create(_run_comfort_airflow_release_completion, release_at)
 
 
 def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str, object]], now: datetime) -> None:
@@ -1279,12 +1397,23 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         calculation_status = str(publication["calculation_status"])
         source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
         LOGGER.info(
-            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s humidity_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s humidity=%s humidity_source=%s humidity_entity=%s humidity_temperature=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s thermal_score=%s airflow_target=%s airflow_effective=%s airflow_status=%s hvac_mode=%s hvac_action=%s fan_mode=%s fan_level=%s duct_open=%s duct_status=%s airflow_release_ends_at=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s humidity_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s humidity=%s humidity_source=%s humidity_entity=%s humidity_temperature=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
             now.isoformat(),
             zone_key,
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
             calculation_status,
             source_status,
+            publication.get("rate_limited_thermal_adjustment"),
+            publication.get("airflow_target_adjustment"),
+            publication.get("airflow_adjustment"),
+            publication.get("airflow_status"),
+            result.hvac_mode,
+            result.hvac_action,
+            result.fan_mode,
+            result.fan_speed_level,
+            result.airflow_switch_states.get(zone_key, False),
+            result.airflow_switch_statuses.get(zone_key, "unavailable"),
+            publication.get("airflow_release_ends_at"),
             result.envelope_adjustments[zone_key],
             result.solar_adjustments[zone_key],
             result.fabric_solar_scores[zone_key],
@@ -1389,15 +1518,19 @@ def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> N
         _publish_input_number_if_changed(controller, zone.output_entity_id, adjustment)
         published_adjustments.append(f"{zone.key}={float(adjustment):.1f}")
 
+    _schedule_comfort_airflow_release_completion(publications, now)
     _log_comfort_adjustment_diagnostics(result, publications, now)
 
     RUNTIME_STATE["comfort_adjustment_last_error"] = None
     LOGGER.info(
-        "COMFORT ADJUSTMENT: trigger=%s model=%s mode=%s mode_source=%s outdoor=%s downstairs_window_outdoor=%s downstairs_wall_outdoor=%s filter_warming_up=%s solar_index=%.2f reference_targets=%s values=%s",
+        "COMFORT ADJUSTMENT: trigger=%s model=%s mode=%s mode_source=%s hvac_mode=%s hvac_action=%s fan_mode=%s outdoor=%s downstairs_window_outdoor=%s downstairs_wall_outdoor=%s filter_warming_up=%s solar_index=%.2f reference_targets=%s airflow=%s values=%s",
         reason,
         DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
         result.operating_mode or "unavailable",
         result.operating_mode_source,
+        result.hvac_mode or "unavailable",
+        result.hvac_action or "unavailable",
+        result.fan_mode or "unavailable",
         f"{result.outdoor_temperature:.1f}" if result.outdoor_temperature is not None else "unavailable",
         (
             f"{result.effective_window_outdoor_temperatures['downstairs']:.1f}"
@@ -1419,6 +1552,13 @@ def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> N
             ]
         )
         or "unavailable",
+        ",".join(
+            [
+                f"{zone_key}={float(publications[zone_key]['airflow_adjustment']):+.1f}"
+                for zone_key in result.airflow_target_adjustments
+            ]
+        )
+        or "none",
         ",".join(published_adjustments),
     )
 

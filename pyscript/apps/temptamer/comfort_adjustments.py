@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import ceil, cos, exp, floor, isfinite, radians, sin
 from typing import Mapping, Protocol
 
-from .constants import COMFORT_SCORE_MAXIMUM, COMFORT_SCORE_MINIMUM
+from .constants import COMFORT_SCORE_MAXIMUM, COMFORT_SCORE_MINIMUM, SWITCH_ON_STATES
 
 
 _UNSET = object()
@@ -73,6 +73,8 @@ class ComfortAdjustmentZoneConfig:
     # Keep this as ``object`` for the PyScript evaluator; see the equivalent
     # envelope field above.
     fabric_solar: object = None
+    airflow_switch_entity_id: str | None = None
+    cooling_airflow_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,8 @@ class ComfortAdjustmentConfig:
     output_rate_limit_celsius: float = 0.2
     output_rate_limit_seconds: int = 15 * 60
     outdoor_filter_warmup_fraction: float = 0.5
+    cooling_airflow_effects: tuple[float, ...] = (0.2, 0.4, 0.7, 1.0, 1.4, 1.8)
+    cooling_airflow_release_seconds: int = 5 * 60
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,14 @@ class ComfortAdjustmentResult:
     envelope_adjustments: Mapping[str, float]
     solar_adjustments: Mapping[str, float]
     fabric_solar_scores: Mapping[str, float]
+    thermal_adjustments: Mapping[str, float]
+    airflow_target_adjustments: Mapping[str, float]
+    airflow_switch_states: Mapping[str, bool]
+    airflow_switch_statuses: Mapping[str, str]
+    fan_mode: str | None
+    fan_speed_level: int | None
+    hvac_mode: str | None
+    hvac_action: str | None
     raw_adjustments: Mapping[str, float]
     adjustments: Mapping[str, float]
     calculation_validity: Mapping[str, bool]
@@ -178,6 +190,82 @@ def _parse_float(value: object | None) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if isfinite(parsed) else None
+
+
+def cooling_airflow_fan_level(fan_mode: object | None) -> int | None:
+    """Return the physical fan level represented by a climate fan mode."""
+    normalized = str(fan_mode).strip().lower() if fan_mode is not None else ""
+    if normalized == "low":
+        return 1
+    if normalized == "medium":
+        return 2
+    if not normalized.startswith("level "):
+        return None
+    try:
+        level = int(normalized[6:].strip())
+    except ValueError:
+        return None
+    return level if level > 0 else None
+
+
+def calculate_cooling_airflow_target(
+    fan_speed_level: int | None,
+    effects: tuple[float, ...],
+    *,
+    active_cooling: bool,
+    airflow_switch_on: bool,
+    zone_factor: float = 1.0,
+) -> float:
+    """Return a negative perceived-cooling score for active duct airflow."""
+    if not active_cooling or not airflow_switch_on or fan_speed_level is None or not effects:
+        return 0.0
+    if not isfinite(zone_factor) or zone_factor <= 0.0:
+        return 0.0
+    bounded_index = min(max(1, fan_speed_level), len(effects)) - 1
+    effect = _parse_float(effects[bounded_index])
+    if effect is None or effect <= 0.0:
+        return 0.0
+    return -effect * zone_factor
+
+
+def resolve_cooling_airflow_release(
+    target_adjustment: float,
+    *,
+    previous_adjustment: object | None,
+    previous_release_origin: object | None,
+    previous_release_started_at: object | None,
+    now: datetime,
+    release_seconds: int,
+    cancel_immediately: bool = False,
+) -> tuple[float, float, datetime | None, str, datetime | None]:
+    """Resolve immediate attack and a finite linear release for cool airflow."""
+    if cancel_immediately:
+        return 0.0, 0.0, None, "cancelled_by_heating", None
+    if target_adjustment < 0.0:
+        return target_adjustment, target_adjustment, None, "active", None
+
+    previous = _parse_float(previous_adjustment)
+    if previous is None or previous >= 0.0:
+        return 0.0, 0.0, None, "inactive", None
+
+    release_started_at = _normalize_datetime(previous_release_started_at)
+    release_origin = _parse_float(previous_release_origin)
+    if release_started_at is None or release_origin is None or release_origin >= 0.0:
+        release_started_at = _normalize_datetime(now) or now.replace(tzinfo=timezone.utc)
+        release_origin = previous
+
+    duration = max(0, int(release_seconds))
+    release_ends_at = release_started_at + timedelta(seconds=duration)
+    if duration == 0:
+        return 0.0, 0.0, None, "released", None
+
+    resolved_now = _normalize_datetime(now) or now.replace(tzinfo=timezone.utc)
+    elapsed_seconds = max(0.0, (resolved_now - release_started_at).total_seconds())
+    remaining_fraction = max(0.0, 1.0 - elapsed_seconds / duration)
+    effective_adjustment = release_origin * remaining_fraction
+    if remaining_fraction <= 0.0:
+        return 0.0, 0.0, None, "released", None
+    return effective_adjustment, release_origin, release_started_at, "releasing", release_ends_at
 
 
 def _normalize_datetime(value: object | None) -> datetime | None:
@@ -1153,6 +1241,10 @@ def calculate_comfort_adjustments(
     controller_mode = reader.get_state(config.controller_hvac_mode_entity_id)
     configured_hvac_mode = reader.get_state(config.climate_entity_id)
     hvac_action = reader.get_attr(config.climate_entity_id, "hvac_action")
+    fan_mode_value = reader.get_attr(config.climate_entity_id, "fan_mode")
+    fan_mode = str(fan_mode_value) if fan_mode_value is not None else None
+    fan_speed_level = cooling_airflow_fan_level(fan_mode_value)
+    active_cooling = _normalized_mode(configured_hvac_mode) == "cool"
 
     zone_temperatures: dict[str, float | None] = {}
     zone_temperature_sources: dict[str, str] = {}
@@ -1162,6 +1254,9 @@ def calculate_comfort_adjustments(
     zone_humidity_sources: dict[str, str] = {}
     zone_humidity_entity_ids: dict[str, str | None] = {}
     humidity_adjustments: dict[str, float] = {}
+    airflow_target_adjustments: dict[str, float] = {}
+    airflow_switch_states: dict[str, bool] = {}
+    airflow_switch_statuses: dict[str, str] = {}
     for zone in config.zones:
         zone_temperature, temperature_source, room_diagnostics, input_issues = _resolve_zone_temperature_details(
             reader,
@@ -1187,6 +1282,31 @@ def calculate_comfort_adjustments(
             calculate_humidex_adjustment(zone_temperature, zone_humidity)
             if zone_temperature is not None and zone_humidity is not None
             else 0.0
+        )
+        airflow_switch_value = (
+            reader.get_state(zone.airflow_switch_entity_id)
+            if zone.airflow_switch_entity_id is not None
+            else None
+        )
+        normalized_airflow_switch = (
+            str(airflow_switch_value).strip().lower()
+            if airflow_switch_value is not None
+            else ""
+        )
+        airflow_switch_on = normalized_airflow_switch in SWITCH_ON_STATES
+        airflow_switch_states[zone.key] = airflow_switch_on
+        if zone.airflow_switch_entity_id is None:
+            airflow_switch_statuses[zone.key] = "not_configured"
+        elif normalized_airflow_switch in {"", "none", "unknown", "unavailable"}:
+            airflow_switch_statuses[zone.key] = "unavailable"
+        else:
+            airflow_switch_statuses[zone.key] = "open" if airflow_switch_on else "closed"
+        airflow_target_adjustments[zone.key] = calculate_cooling_airflow_target(
+            fan_speed_level,
+            config.cooling_airflow_effects,
+            active_cooling=active_cooling,
+            airflow_switch_on=airflow_switch_on,
+            zone_factor=zone.cooling_airflow_factor,
         )
         input_issues_by_zone[zone.key] = input_issues + humidity_issues
 
@@ -1279,6 +1399,9 @@ def calculate_comfort_adjustments(
                 "humidity_entity_id": zone_humidity_entity_ids[zone.key],
                 "humidity_temperature": zone_temperature,
                 "humidity_adjustment": humidity_adjustments[zone.key],
+                "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+                "airflow_switch_state": airflow_switch_states[zone.key],
+                "airflow_switch_status": airflow_switch_statuses[zone.key],
             }
             continue
 
@@ -1366,6 +1489,9 @@ def calculate_comfort_adjustments(
                 "humidity_entity_id": zone_humidity_entity_ids[zone.key],
                 "humidity_temperature": zone_temperature,
                 "humidity_adjustment": humidity_adjustments[zone.key],
+                "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+                "airflow_switch_state": airflow_switch_states[zone.key],
+                "airflow_switch_status": airflow_switch_statuses[zone.key],
             }
             continue
         envelope_adjustment = weighted_envelope_adjustment / comfort_weight_total
@@ -1406,6 +1532,9 @@ def calculate_comfort_adjustments(
             "humidity_entity_id": zone_humidity_entity_ids[zone.key],
             "humidity_temperature": zone_temperature,
             "humidity_adjustment": humidity_adjustments[zone.key],
+            "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+            "airflow_switch_state": airflow_switch_states[zone.key],
+            "airflow_switch_status": airflow_switch_statuses[zone.key],
             "window_k": weighted_window_k / comfort_weight_total,
             "wall_k": weighted_wall_k / comfort_weight_total,
             "total_k": weighted_total_k / comfort_weight_total,
@@ -1459,6 +1588,14 @@ def calculate_comfort_adjustments(
         envelope_adjustments=envelope_adjustments,
         solar_adjustments=solar_adjustments,
         fabric_solar_scores=fabric_solar_scores,
+        thermal_adjustments=raw_adjustments,
+        airflow_target_adjustments=airflow_target_adjustments,
+        airflow_switch_states=airflow_switch_states,
+        airflow_switch_statuses=airflow_switch_statuses,
+        fan_mode=fan_mode,
+        fan_speed_level=fan_speed_level,
+        hvac_mode=str(configured_hvac_mode).strip().lower() if configured_hvac_mode is not None else None,
+        hvac_action=str(hvac_action).strip().lower() if hvac_action is not None else None,
         raw_adjustments=raw_adjustments,
         adjustments=adjustments,
         calculation_validity=calculation_validity,

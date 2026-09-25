@@ -428,9 +428,11 @@ def build_snapshot(
                 _shift_control_scheme(zone_state.scheme, global_setpoint_adjustment),
                 comfort_adjustment,
             ),
+            # A positive manual adjustment means "warmer": raise heating
+            # thresholds but lower cooling thresholds by the same amount.
             cool_scheme=_bound_adjusted_cool_scheme(
                 _apply_comfort_score(
-                    _shift_control_scheme(zone_state.cool_scheme, global_setpoint_adjustment),
+                    _shift_control_scheme(zone_state.cool_scheme, -global_setpoint_adjustment),
                     comfort_adjustment,
                 )
             ),

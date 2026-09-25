@@ -50,7 +50,7 @@ HEAT_DEMAND_FAN_BOOST_STATE_FILE = "/config/pyscript/temptamer_fan_boost.state"
 # Persist the score convention separately from the helpers themselves.  When
 # this number changes, the publisher reseeds every helper before control reads
 # one of the old-convention values.
-COMFORT_SCORE_SEMANTICS_VERSION = 5
+COMFORT_SCORE_SEMANTICS_VERSION = 7
 COMFORT_SCORE_SEMANTICS_STATE_FILE = "/config/pyscript/temptamer_comfort_score_semantics.state"
 # Fabric solar filters represent heat retained by contents and fabric, so they
 # must survive PyScript reloads and Home Assistant restarts.
@@ -379,6 +379,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["downstairs"],
             fallback_temperature_entity_id="sensor.downstairs_zone_average_temperature",
             humidity_entity_id="sensor.rumpus_white_clock_humidity",
+            airflow_switch_entity_id=DEFAULT_ZONES["downstairs"].switch_entity_id,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.rumpus_average_temperature",
@@ -419,6 +420,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             key="bedroom_1_2",
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_1_2"],
             fallback_temperature_entity_id="sensor.average_bed1_2_zone_temp",
+            airflow_switch_entity_id=DEFAULT_ZONES["bedroom_1_2"].switch_entity_id,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_1_average_temperature",
@@ -451,6 +453,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             key="bedroom_3_4",
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_3_4"],
             fallback_temperature_entity_id="sensor.average_bed3_4_zone_temp",
+            airflow_switch_entity_id=DEFAULT_ZONES["bedroom_3_4"].switch_entity_id,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_3_average_temperature",
@@ -502,6 +505,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["office"],
             fallback_temperature_entity_id="sensor.office_average_temperature",
             humidity_entity_id="sensor.air_monitor_lite_c705_humidity",
+            airflow_switch_entity_id=DEFAULT_ZONES["office"].switch_entity_id,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.office_average_temperature",
@@ -525,6 +529,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             key="dining",
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["dining"],
             fallback_temperature_entity_id="sensor.average_dining_zone_temp",
+            airflow_switch_entity_id=DEFAULT_ZONES["dining"].switch_entity_id,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.dining_average_temperature",
@@ -582,6 +587,7 @@ _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.heatpum
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.controller_hvac_mode_entity_id)
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.climate_entity_id)
 _add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.climate_entity_id}.hvac_action")
+_add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.climate_entity_id}.fan_mode")
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.outdoor_temperature_entity_id)
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.weather_entity_id)
 _add_comfort_adjustment_trigger_entity(f"{DEFAULT_COMFORT_ADJUSTMENT_CONFIG.weather_entity_id}.*")
@@ -592,6 +598,7 @@ _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.awning_
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.house_temperature_entity_id)
 _add_comfort_adjustment_trigger_entity(DEFAULT_COMFORT_ADJUSTMENT_CONFIG.house_humidity_entity_id)
 for comfort_adjustment_zone in DEFAULT_COMFORT_ADJUSTMENT_CONFIG.zones:
+    _add_comfort_adjustment_trigger_entity(comfort_adjustment_zone.airflow_switch_entity_id)
     _add_comfort_adjustment_trigger_entity(comfort_adjustment_zone.fallback_temperature_entity_id)
     _add_comfort_adjustment_trigger_entity(comfort_adjustment_zone.humidity_entity_id)
     for comfort_adjustment_room in comfort_adjustment_zone.rooms:
