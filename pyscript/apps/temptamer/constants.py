@@ -18,6 +18,11 @@ COMFORT_MODE_AUTO = "Auto"
 # same range.
 COMFORT_SCORE_MINIMUM = -3.0
 COMFORT_SCORE_MAXIMUM = 3.0
+# Cooling thresholds describe room temperatures rather than the climate
+# entity's equipment setpoint.  This is the lowest supported room-level
+# cooling target; automatic/manual adjustments translate the whole band when
+# they would cross it.
+MIN_COOL_ROOM_TARGET = 14.0
 
 CONTROL_HVAC_MODE_HEAT = "Heat"
 CONTROL_HVAC_MODE_COOL = "Cool"
@@ -27,6 +32,7 @@ CONTROL_HVAC_MODE_MANUAL = "Manual"
 
 SCHEME_OFF = "Off"
 SCHEME_NIGHT = "Night"
+SCHEME_NIGHT_BEDROOM = "NightBedroom"
 SCHEME_DAY_LIVING = "DayLiving"
 SCHEME_DOWNSTAIRS = "Downstairs"
 SCHEME_DINING_BASIC = "DiningBasic"
@@ -49,7 +55,7 @@ POWERDAY_HEATSOAK_SUPPRESSED = "suppressed"
 
 CONTROL_INTERVAL_SECONDS = 180
 NORMAL_RECALCULATION_DEBOUNCE_SECONDS = 1.0
-FAN_SPEED_DECREASE_INTERVAL_SECONDS = 5 * 60
+FAN_SPEED_DECREASE_INTERVAL_SECONDS = 3 * 60
 HEAT_DEMAND_FAN_BOOST_INTERVAL_SECONDS = 15 * 60
 HEAT_DEMAND_FAN_BOOST_MAX_LEVEL = 7
 HEAT_DEMAND_FAN_BOOST_MIN_CONTINUE_UNTIL_GAP = 2.0

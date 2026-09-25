@@ -244,6 +244,7 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_heat_step": None,
     "idle_heat_step_changed_at": None,
     "idle_heat_zone_key": None,
+    "cool_release_setpoint": None,
     "idle_shutdown_at": None,
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
@@ -1550,6 +1551,7 @@ def _publish_runtime_state(status: str) -> None:
             "idle_heat_step": RUNTIME_STATE.get("idle_heat_step"),
             "idle_heat_step_changed_at": _isoformat(RUNTIME_STATE.get("idle_heat_step_changed_at")),
             "idle_heat_zone_key": RUNTIME_STATE.get("idle_heat_zone_key"),
+            "cool_release_setpoint": RUNTIME_STATE.get("cool_release_setpoint"),
             "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
@@ -1695,6 +1697,11 @@ def _update_idle_heat_runtime_state(plan, now: datetime) -> None:
     RUNTIME_STATE["idle_heat_step"] = plan.idle_heat_step
     if zone_changed or plan.idle_heat_step_changed:
         RUNTIME_STATE["idle_heat_step_changed_at"] = now
+
+
+def _update_cool_release_runtime_state(plan) -> None:
+    """Remember the strongest cooling-release target until active cooling resumes."""
+    RUNTIME_STATE["cool_release_setpoint"] = plan.cool_release_setpoint
 
 
 def _clear_idle_shutdown_runtime_state() -> None:
@@ -3177,6 +3184,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     RUNTIME_STATE.setdefault("idle_heat_step", None)
     RUNTIME_STATE.setdefault("idle_heat_step_changed_at", None)
     RUNTIME_STATE.setdefault("idle_heat_zone_key", None)
+    RUNTIME_STATE.setdefault("cool_release_setpoint", None)
     RUNTIME_STATE.setdefault("idle_shutdown_at", None)
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
@@ -3317,6 +3325,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
     )
 
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
+        RUNTIME_STATE["cool_release_setpoint"] = None
         RUNTIME_STATE["powerday_dry_eligible"] = False
         RUNTIME_STATE["powerday_dry_reason"] = "Manual HVAC selection disables automatic dry mode"
         automatic_dry_was_active = (
@@ -3403,6 +3412,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         "idle_shutdown_at": RUNTIME_STATE["idle_shutdown_at"],
         "idle_shutdown_heat_step": RUNTIME_STATE["idle_shutdown_heat_step"],
         "idle_shutdown_zone_key": RUNTIME_STATE["idle_shutdown_zone_key"],
+        "previous_cool_release_setpoint": RUNTIME_STATE["cool_release_setpoint"],
         "supported_fan_modes": supported_fan_modes,
         "fan_speed_decrease_at": RUNTIME_STATE["last_fan_speed_decrease_at"],
         "base_fan_boost": preliminary_heat_demand_fan_boost_level,
@@ -3644,6 +3654,7 @@ def run_control_pass(*, reason: str, comfort_mode_changed: bool = False) -> None
         now=now,
     )
     _update_idle_heat_runtime_state(plan, now)
+    _update_cool_release_runtime_state(plan)
 
     LOGGER.info(
         "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",

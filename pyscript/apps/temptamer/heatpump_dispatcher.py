@@ -228,6 +228,44 @@ def _requested_active_heat_raw(
     return max(room_target, snapshot.inlet_temp + boost_delta)
 
 
+def _requested_active_cool_raw(
+    snapshot: DemandSnapshot,
+    zone: ZoneRuntimeState,
+    target_temp_step: object | None,
+) -> float:
+    """Mirror active heat control for a room above its cooling threshold."""
+    maximum_room_target = zone.cool_scheme.enable_outside
+    # Zone deltas are stored in the heating direction (normally negative), so
+    # reflect them around the inlet temperature for the cooling mirror.
+    inlet_offset_target = snapshot.inlet_temp - zone.setpoint_delta_from_inlet
+    room_target = max(maximum_room_target, inlet_offset_target)
+    room_excess = max(0.0, zone.current_temp - zone.cool_scheme.enable_outside)
+    boost_delta = max(_target_temp_step_value(target_temp_step), room_excess)
+    return min(room_target, snapshot.inlet_temp - boost_delta)
+
+
+def _requested_maintain_cool_raw(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    current_setpoint: object | None,
+    *,
+    current_hvac_mode: str | None,
+    previous_cool_release_setpoint: object | None,
+) -> float:
+    """Release cooling without ever ratcheting its setpoint downward."""
+    trim_score = _maintain_trim_score(snapshot, predicted_open_zones, cooling=True)
+    requested = snapshot.inlet_temp if trim_score > 0 else snapshot.inlet_temp + 1.0
+    lower_bounds = [requested]
+    if (current_hvac_mode or "").lower() == HVAC_COOL:
+        current_value = parse_float(current_setpoint)
+        if current_value is not None:
+            lower_bounds.append(current_value)
+    previous_value = parse_float(previous_cool_release_setpoint)
+    if previous_value is not None:
+        lower_bounds.append(previous_value)
+    return max(lower_bounds)
+
+
 def _powerday_downstairs_free_power_direct_target_adjustment(
     snapshot: DemandSnapshot,
     demand: EquipmentDemand,
@@ -257,12 +295,13 @@ def _requested_setpoint_raw(
     current_setpoint: object | None = None,
     current_hvac_mode: str | None = None,
     idle_heat_step: int | None = None,
+    previous_cool_release_setpoint: object | None = None,
     target_temp_step: object | None = 1.0,
 ) -> float:
     if demand.cool_requested:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
-            return zone.cool_scheme.enable_outside + _powerday_downstairs_free_power_direct_target_adjustment(
+            return _requested_active_cool_raw(snapshot, zone, target_temp_step) + _powerday_downstairs_free_power_direct_target_adjustment(
                 snapshot,
                 demand,
                 predicted_open_zones,
@@ -270,8 +309,13 @@ def _requested_setpoint_raw(
         return snapshot.inlet_temp
 
     if demand.maintain_cool_mode:
-        trim_score = _maintain_trim_score(snapshot, predicted_open_zones, cooling=True)
-        return snapshot.inlet_temp if trim_score > 0 else snapshot.inlet_temp + 1.0
+        return _requested_maintain_cool_raw(
+            snapshot,
+            predicted_open_zones,
+            current_setpoint,
+            current_hvac_mode=current_hvac_mode,
+            previous_cool_release_setpoint=previous_cool_release_setpoint,
+        )
 
     if demand.heat_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
@@ -304,6 +348,7 @@ def _requested_setpoint(
     current_setpoint: object | None = None,
     current_hvac_mode: str | None = None,
     idle_heat_step: int | None = None,
+    previous_cool_release_setpoint: object | None = None,
     target_temp_step: object | None = 1.0,
 ) -> int | float:
     direct_target_adjustment = _powerday_downstairs_free_power_direct_target_adjustment(
@@ -318,6 +363,7 @@ def _requested_setpoint(
         current_setpoint=current_setpoint,
         current_hvac_mode=current_hvac_mode,
         idle_heat_step=idle_heat_step,
+        previous_cool_release_setpoint=previous_cool_release_setpoint,
         target_temp_step=target_temp_step,
     )
     normalize_requested_setpoint = (
@@ -328,10 +374,12 @@ def _requested_setpoint(
     if demand.cool_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f room_temp=%.1f excess=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             zone.cool_scheme.enable_outside,
+            zone.current_temp,
+            max(0.0, zone.current_temp - zone.cool_scheme.enable_outside),
             direct_target_adjustment,
             raw_requested_setpoint,
             normalized_setpoint,
@@ -340,10 +388,12 @@ def _requested_setpoint(
 
     if demand.maintain_cool_mode:
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f mode=maintain_cool zones=%s score=%s raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f mode=maintain_cool zones=%s score=%s current=%s previous_release=%s raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             ",".join(predicted_open_zones) if predicted_open_zones else "none",
             _maintain_trim_score(snapshot, predicted_open_zones, cooling=True),
+            current_setpoint,
+            previous_cool_release_setpoint,
             raw_requested_setpoint,
             normalized_setpoint,
         )
@@ -643,6 +693,59 @@ def _requested_idle_heat_setpoint(
             ",".join(predicted_open_zones) if predicted_open_zones else "none",
         )
     return selected_setpoint, selected_step, step_changed, minimum_setpoint_reached
+
+
+def _idle_cool_release_delta(idle_seconds: float) -> float:
+    """Return the staged positive setpoint offset used to shed cooling."""
+    if idle_seconds >= IDLE_HEAT_STAGE_6_SECONDS:
+        return IDLE_HEAT_STEP_11_DELTA
+    if idle_seconds >= IDLE_HEAT_STAGE_5_SECONDS:
+        return IDLE_HEAT_STEP_7_DELTA
+    if idle_seconds >= IDLE_HEAT_STAGE_4_SECONDS:
+        return IDLE_HEAT_STEP_4_DELTA
+    if idle_seconds >= IDLE_HEAT_STAGE_3_SECONDS:
+        return IDLE_HEAT_STEP_3_DELTA
+    if idle_seconds >= IDLE_HEAT_STAGE_2_SECONDS:
+        return IDLE_HEAT_STEP_2_DELTA
+    if idle_seconds >= IDLE_HEAT_STAGE_1_SECONDS:
+        return IDLE_HEAT_STEP_1_DELTA
+    return 0.0
+
+
+def _requested_idle_cool_setpoint(
+    snapshot: DemandSnapshot,
+    current_setpoint: object | None,
+    previous_cool_release_setpoint: object | None,
+    idle_started_at: datetime | None,
+    now: datetime | None,
+    target_temp_step: object | None,
+) -> int | float:
+    normalized_started_at = _normalize_timestamp(idle_started_at)
+    normalized_now = _normalize_timestamp(now)
+    idle_seconds = (
+        max(0.0, (normalized_now - normalized_started_at).total_seconds())
+        if normalized_started_at is not None and normalized_now is not None
+        else 0.0
+    )
+    release_delta = _idle_cool_release_delta(idle_seconds)
+    candidates = [snapshot.inlet_temp + release_delta]
+    current_value = parse_float(current_setpoint)
+    if current_value is not None:
+        candidates.append(current_value)
+    previous_value = parse_float(previous_cool_release_setpoint)
+    if previous_value is not None:
+        candidates.append(previous_value)
+    selected = normalize_cool_setpoint(max(candidates), target_temp_step)
+    LOGGER.info(
+        "SETPOINT: inlet_temp=%.1f stage=idle_cool_release idle_seconds=%.0f delta=%.1f current=%s previous_release=%s normalized=%s",
+        snapshot.inlet_temp,
+        idle_seconds,
+        release_delta,
+        current_setpoint,
+        previous_cool_release_setpoint,
+        selected,
+    )
+    return selected
 
 
 def _resolve_idle_heat_restart_step(
@@ -1040,6 +1143,7 @@ def build_dispatch_plan(
     idle_shutdown_at: datetime | None = None,
     idle_shutdown_heat_step: int | None = None,
     idle_shutdown_zone_key: str | None = None,
+    previous_cool_release_setpoint: object | None = None,
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
@@ -1216,19 +1320,22 @@ def build_dispatch_plan(
         )
 
     if demand.cool_requested or demand.maintain_cool_mode:
+        requested_setpoint = _requested_setpoint(
+            snapshot,
+            demand,
+            predicted_open_zones,
+            current_setpoint=current_setpoint,
+            current_hvac_mode=current_hvac_mode,
+            idle_heat_step=idle_heat_step,
+            previous_cool_release_setpoint=previous_cool_release_setpoint,
+            target_temp_step=target_temp_step,
+        )
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_COOL,
             fan_mode=resolve_plan_fan_mode(),
-            setpoint=_requested_setpoint(
-                snapshot,
-                demand,
-                predicted_open_zones,
-                current_setpoint=current_setpoint,
-                current_hvac_mode=current_hvac_mode,
-                idle_heat_step=idle_heat_step,
-                target_temp_step=target_temp_step,
-            ),
+            setpoint=requested_setpoint,
+            cool_release_setpoint=requested_setpoint if demand.maintain_cool_mode else None,
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
             reason=demand.reason,
@@ -1291,11 +1398,13 @@ def build_dispatch_plan(
                 target_temp_step,
             )
         else:
-            normalized_current_setpoint = parse_float(current_setpoint)
-            idle_setpoint = (
-                normalize_cool_setpoint(normalized_current_setpoint, target_temp_step)
-                if normalized_current_setpoint is not None
-                else None
+            idle_setpoint = _requested_idle_cool_setpoint(
+                snapshot,
+                current_setpoint,
+                previous_cool_release_setpoint,
+                idle_started_at,
+                now,
+                target_temp_step,
             )
             resolved_idle_heat_step = None
             idle_heat_step_changed = False
@@ -1305,6 +1414,7 @@ def build_dispatch_plan(
             setpoint=idle_setpoint,
             idle_heat_step=resolved_idle_heat_step if idle_hvac_mode == HVAC_HEAT else None,
             idle_heat_step_changed=idle_heat_step_changed if idle_hvac_mode == HVAC_HEAT else False,
+            cool_release_setpoint=idle_setpoint if idle_hvac_mode == HVAC_COOL else None,
             open_zones=predicted_open_zones,
             reason="idle: " + demand.reason,
         )

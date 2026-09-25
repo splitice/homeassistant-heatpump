@@ -39,7 +39,16 @@ def _temperature_deficit(zone: ZoneRuntimeState, threshold_name: str) -> float:
 
 
 def _temperature_excess(zone: ZoneRuntimeState, threshold: float) -> float:
-    return max(0.0, zone.current_temp - threshold)
+    return max(0.0, _cooling_control_temperature(zone) - threshold)
+
+
+def _cooling_control_temperature(zone: ZoneRuntimeState) -> float:
+    """Use a hot-room maximum while protecting an already-cold room."""
+    if zone.max_temp is None:
+        return zone.current_temp
+    if zone.min_temp is not None and zone.min_temp < zone.cool_scheme.continue_until:
+        return zone.current_temp
+    return max(zone.current_temp, zone.max_temp)
 
 
 def _heat_reopen_threshold(zone: ZoneRuntimeState) -> float:
@@ -91,7 +100,7 @@ def _closing_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
     if not zone.is_enabled_by_mode:
         return f"mode disabled by scheme {zone.scheme.name}"
     if operation_mode == HVAC_COOL:
-        return f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+        return f"{_cooling_control_temperature(zone):.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
     if operation_mode == HVAC_HEAT:
         return f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
     return "startup reconcile requires zone to be closed"
@@ -145,7 +154,7 @@ def _resolve_authoritative_startup_actions(
 
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp <= zone.cool_scheme.continue_until
+        return _cooling_control_temperature(zone) <= zone.cool_scheme.continue_until
     return zone.current_temp >= zone.scheme.continue_until
 
 
@@ -174,7 +183,7 @@ def resolve_high_fan_office_closure(
         comparison = ">="
     else:
         threshold = min(office_zone.cool_scheme.enable_outside - 1.0, office_zone.cool_scheme.continue_until)
-        is_at_high_fan_close_threshold = office_zone.current_temp <= threshold
+        is_at_high_fan_close_threshold = _cooling_control_temperature(office_zone) <= threshold
         comparison = "<="
 
     if not is_at_high_fan_close_threshold:
@@ -201,7 +210,7 @@ def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, d
 
 def _closing_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
     if operation_mode == HVAC_COOL:
-        return (zone.current_temp - zone.cool_scheme.continue_until, _last_change_key(zone))
+        return (_cooling_control_temperature(zone) - zone.cool_scheme.continue_until, _last_change_key(zone))
     return (-(zone.current_temp - zone.scheme.continue_until), _last_change_key(zone))
 
 
@@ -508,7 +517,7 @@ def resolve_zone_actions(
                 zone_key=zone.key,
                 turn_on=False,
                 reason=(
-                    f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+                    f"{_cooling_control_temperature(zone):.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
                     if operation_mode == HVAC_COOL
                     else f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
                 ),

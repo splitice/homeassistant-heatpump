@@ -118,6 +118,7 @@ class DispatchPlan:
     setpoint: int | float | None = None
     idle_heat_step: int | None = None
     idle_heat_step_changed: bool = False
+    cool_release_setpoint: int | float | None = None
     requested_by_zones: tuple[str, ...] = field(default_factory=tuple)
     open_zones: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""

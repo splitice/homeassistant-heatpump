@@ -70,12 +70,31 @@ def _max_excess(
     for zone_key in zone_keys:
         zone = snapshot.zones[zone_key]
         threshold = threshold_resolver(zone)
+        # The maximum sensor may qualify a zone for cooling continuation, but
+        # the representative/average temperature controls demand severity.
+        # Otherwise one locally hot sensor over-drives both fan and compressor.
         excess = max(0.0, zone.current_temp - threshold)
         if selected_zone_key is None or excess > selected_excess:
             selected_zone_key = zone_key
             selected_excess = excess
 
     return selected_zone_key, selected_excess
+
+
+def _max_cooling_fan_excess(snapshot: DemandSnapshot, zone_keys: tuple[str, ...]) -> float:
+    """Measure cooling airflow need against unadjusted room comfort targets.
+
+    Operative-temperature adjustments may legitimately strengthen the
+    compressor request, but using that shifted threshold for fan selection can
+    turn a small physical room-temperature gap into maximum airflow.
+    """
+    maximum_excess = 0.0
+    for zone_key in zone_keys:
+        zone = snapshot.zones[zone_key]
+        base_targets = snapshot.base_zone_targets.get(zone_key)
+        base_cool_target = base_targets[1] if base_targets is not None else zone.cool_scheme.ideal_target
+        maximum_excess = max(maximum_excess, zone.current_temp - base_cool_target)
+    return max(0.0, maximum_excess)
 
 
 def _filter_zone_keys(candidate_zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
@@ -189,7 +208,7 @@ def resolve_equipment_demand(
             return EquipmentDemand(
                 cool_requested=True,
                 requested_by_zones=(requested_by_zone,),
-                max_temperature_deficit=max_excess,
+                max_temperature_deficit=_max_cooling_fan_excess(snapshot, cool_calling_zones),
                 reason=f"{requested_by_zone} is above enable threshold",
             )
 
@@ -206,7 +225,10 @@ def resolve_equipment_demand(
             return EquipmentDemand(
                 maintain_cool_mode=True,
                 requested_by_zones=(continue_zone,),
-                max_temperature_deficit=continue_excess,
+                max_temperature_deficit=_max_cooling_fan_excess(
+                    snapshot,
+                    predicted_open_above_ideal_zones,
+                ),
                 reason=f"{continue_zone} is above ideal target",
             )
 

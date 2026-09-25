@@ -15,6 +15,7 @@ from .constants import (
     SCHEME_DOWNSTAIRS,
     SCHEME_DINING_BASIC,
     SCHEME_NIGHT,
+    SCHEME_NIGHT_BEDROOM,
     SCHEME_OFF,
 )
 from .comfort_modes import (
@@ -138,6 +139,7 @@ TEMPTAMER_LOGGING_CATEGORIES = {
 DEFAULT_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
+    SCHEME_NIGHT_BEDROOM: ControlScheme(name=SCHEME_NIGHT_BEDROOM, enable_outside=15.0, continue_until=17.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
         enable_outside=18.6,
@@ -167,7 +169,13 @@ DEFAULT_HEAT_CONTROL_SCHEMES = {
 
 DEFAULT_COOL_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
-    SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
+    SCHEME_NIGHT: ControlScheme(
+        name=SCHEME_NIGHT,
+        enable_outside=21.5,
+        continue_until=19.5,
+        ideal_target=20.5,
+    ),
+    SCHEME_NIGHT_BEDROOM: ControlScheme(name=SCHEME_NIGHT_BEDROOM, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
         enable_outside=21.5,
@@ -186,7 +194,12 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
         continue_until=17.0,
         ideal_target=15.0,
     ),
-    SCHEME_BEDROOM: ControlScheme(name=SCHEME_BEDROOM, enable_outside=16.0, continue_until=14.0, ideal_target=14.0),
+    SCHEME_BEDROOM: ControlScheme(
+        name=SCHEME_BEDROOM,
+        enable_outside=22.0,
+        continue_until=20.0,
+        ideal_target=21.5,
+    ),
     SCHEME_BATHROOM: ControlScheme(
         name=SCHEME_BATHROOM, 
         enable_outside=31,
@@ -242,8 +255,8 @@ DEFAULT_COMFORT_MODE_NIGHT_MAPPING = {
     "office": SCHEME_NIGHT,
     "dining": SCHEME_NIGHT,
     "downstairs": SCHEME_NIGHT,
-    "bedroom_1_2": SCHEME_NIGHT,
-    "bedroom_3_4": SCHEME_NIGHT,
+    "bedroom_1_2": SCHEME_NIGHT_BEDROOM,
+    "bedroom_3_4": SCHEME_NIGHT_BEDROOM,
 }
 
 DEFAULT_COMFORT_MODE_DAY_MAPPING = {

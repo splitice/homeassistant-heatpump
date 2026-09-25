@@ -19,6 +19,7 @@ from .constants import (
     CONTROL_HVAC_MODE_HEATCOOL,
     CONTROL_HVAC_MODE_MANUAL,
     CONTROL_HVAC_MODE_OFF,
+    MIN_COOL_ROOM_TARGET,
     POWERDAY_HEATSOAK_FULL,
     POWERDAY_HEATSOAK_SUPPRESSED,
     SCHEME_OFF,
@@ -155,10 +156,50 @@ def _apply_comfort_score(scheme: ControlScheme, comfort_score: float) -> Control
     return _shift_control_scheme(scheme, -comfort_score)
 
 
+def _bound_adjusted_cool_scheme(scheme: ControlScheme) -> ControlScheme:
+    """Keep adjusted cooling room thresholds ordered and above the safety floor.
+
+    Translate the whole band when it crosses the floor so its hysteresis width
+    is retained.  Then repair legacy configurations whose continue threshold
+    is above their ideal target.
+    """
+    if scheme.name == SCHEME_OFF:
+        return scheme
+
+    coldest_threshold = min(scheme.enable_outside, scheme.ideal_target, scheme.continue_until)
+    floor_shift = max(0.0, MIN_COOL_ROOM_TARGET - coldest_threshold)
+    shifted_enable = scheme.enable_outside + floor_shift
+    shifted_ideal = scheme.ideal_target + floor_shift
+    shifted_continue = scheme.continue_until + floor_shift
+
+    # Preserve all three values while assigning them to the cooling band's
+    # required order.  This also repairs older configured bands whose ideal
+    # and continuation thresholds were reversed.
+    bounded_enable, bounded_ideal, bounded_continue = sorted(
+        (shifted_enable, shifted_ideal, shifted_continue),
+        reverse=True,
+    )
+    return replace(
+        scheme,
+        enable_outside=bounded_enable,
+        ideal_target=bounded_ideal,
+        continue_until=bounded_continue,
+    )
+
+
 def _can_use_min_sensor_for_heating(zone: ZoneRuntimeState, threshold: float) -> bool:
     if zone.min_temp is None or zone.min_temp >= threshold:
         return False
     if zone.max_temp is not None and zone.max_temp > zone.scheme.continue_until:
+        return False
+    return True
+
+
+def _can_use_max_sensor_for_cooling(zone: ZoneRuntimeState, threshold: float) -> bool:
+    """Mirror heating's minimum-sensor guard for a locally hot room."""
+    if zone.max_temp is None or zone.max_temp <= threshold:
+        return False
+    if zone.min_temp is not None and zone.min_temp < zone.cool_scheme.continue_until:
         return False
     return True
 
@@ -387,9 +428,11 @@ def build_snapshot(
                 _shift_control_scheme(zone_state.scheme, global_setpoint_adjustment),
                 comfort_adjustment,
             ),
-            cool_scheme=_apply_comfort_score(
-                _shift_control_scheme(zone_state.cool_scheme, global_setpoint_adjustment),
-                comfort_adjustment,
+            cool_scheme=_bound_adjusted_cool_scheme(
+                _apply_comfort_score(
+                    _shift_control_scheme(zone_state.cool_scheme, global_setpoint_adjustment),
+                    comfort_adjustment,
+                )
             ),
             comfort_adjustment=comfort_adjustment,
         )
@@ -429,11 +472,17 @@ def build_snapshot(
         else:
             # Secondary activation for cooling: if a max sensor exists and it's above the enable threshold
             # AND the average/current temp is still above the ideal target
-            if zone.max_temp is not None and zone.max_temp > zone.cool_scheme.enable_outside and zone.current_temp > zone.cool_scheme.ideal_target:
+            if _can_use_max_sensor_for_cooling(zone, zone.cool_scheme.enable_outside) and zone.current_temp > zone.cool_scheme.ideal_target:
                 cool_calling_list.append(key)
-        if zone.current_temp > zone.cool_scheme.continue_until:
+        if zone.current_temp > zone.cool_scheme.continue_until or _can_use_max_sensor_for_cooling(
+            zone,
+            zone.cool_scheme.continue_until,
+        ):
             continue_cooling_list.append(key)
-        if zone.current_temp > zone.cool_scheme.ideal_target:
+        if zone.current_temp > zone.cool_scheme.ideal_target or _can_use_max_sensor_for_cooling(
+            zone,
+            zone.cool_scheme.ideal_target,
+        ):
             above_ideal_list.append(key)
         else:
             at_or_below_ideal_list.append(key)

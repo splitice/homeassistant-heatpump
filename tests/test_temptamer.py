@@ -82,6 +82,7 @@ from pyscript.apps.temptamer.constants import (
     SCHEME_DOWNSTAIRS,
     SCHEME_DINING_BASIC,
     SCHEME_NIGHT,
+    SCHEME_NIGHT_BEDROOM,
     SCHEME_OFF,
 )
 from pyscript.apps.temptamer.demand_resolver import resolve_equipment_demand, resolve_operating_mode
@@ -244,6 +245,7 @@ def comfort_adjustment_attr_map(**overrides):
 TEST_HEAT_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_NIGHT],
+    SCHEME_NIGHT_BEDROOM: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_NIGHT_BEDROOM],
     SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=20.0, continue_until=22.0, ideal_target=21.0),
     SCHEME_DOWNSTAIRS: ControlScheme(name=SCHEME_DOWNSTAIRS, enable_outside=20.5, continue_until=22.5, ideal_target=21.5),
     SCHEME_DINING_BASIC: DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DINING_BASIC],
@@ -254,6 +256,7 @@ TEST_HEAT_CONTROL_SCHEMES = {
 TEST_COOL_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: ControlScheme(name=SCHEME_NIGHT, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
+    SCHEME_NIGHT_BEDROOM: DEFAULT_SYSTEM_CONFIG.cool_control_schemes[SCHEME_NIGHT_BEDROOM],
     SCHEME_DAY_LIVING: ControlScheme(name=SCHEME_DAY_LIVING, enable_outside=22.0, continue_until=20.0, ideal_target=21.0),
     SCHEME_DOWNSTAIRS: ControlScheme(name=SCHEME_DOWNSTAIRS, enable_outside=22.5, continue_until=20.5, ideal_target=21.5),
     SCHEME_DINING_BASIC: ControlScheme(name=SCHEME_DINING_BASIC, enable_outside=16.0, continue_until=13.0, ideal_target=15.0),
@@ -1728,7 +1731,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["office"].applied_comfort_mode, "DayLiving")
         self.assertEqual(snapshot.zones["office"].scheme.name, "DayLiving")
         self.assertEqual(snapshot.zones["dining"].scheme.name, "Night")
-        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, "Night")
+        self.assertEqual(snapshot.zones["bedroom_1_2"].scheme.name, SCHEME_NIGHT_BEDROOM)
 
     def test_positive_comfort_score_lowers_every_zone_threshold_and_delays_heat_demand(self):
         baseline = build_snapshot(
@@ -1761,6 +1764,48 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(adjusted_zone.cool_scheme.ideal_target, baseline_zone.cool_scheme.ideal_target - 0.5)
         self.assertIn("office", baseline.heat_calling_zones)
         self.assertNotIn("office", adjusted.heat_calling_zones)
+
+    def test_adjusted_bedroom_cooling_band_is_translated_above_room_safety_floor(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "1",
+                        "input_number.comfort_adjustment_bed_3_4": "3.0",
+                        "input_number.temptamer_setpoint_adjustment": "-1.0",
+                        "sensor.average_bed3_4_zone_temp": "20.8",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        bedroom = snapshot.zones["bedroom_3_4"]
+        self.assertEqual(snapshot.base_zone_targets["bedroom_3_4"][1], 14.0)
+        self.assertEqual(bedroom.cool_scheme.enable_outside, 18.0)
+        self.assertEqual(bedroom.cool_scheme.ideal_target, 16.0)
+        self.assertEqual(bedroom.cool_scheme.continue_until, 14.0)
+        self.assertGreaterEqual(
+            bedroom.cool_scheme.enable_outside,
+            bedroom.cool_scheme.ideal_target,
+        )
+        self.assertGreaterEqual(
+            bedroom.cool_scheme.ideal_target,
+            bedroom.cool_scheme.continue_until,
+        )
+        demand = resolve_equipment_demand(snapshot, ("bedroom_3_4",), operation_mode=HVAC_COOL)
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("bedroom_3_4",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            current_setpoint="17.0",
+        )
+        self.assertTrue(demand.cool_requested)
+        self.assertEqual(plan.setpoint, 19)
 
     def test_comfort_adjustment_defaults_and_clamps_invalid_helper_values(self):
         unavailable = build_snapshot(
@@ -1815,7 +1860,7 @@ class TempTamerTests(unittest.TestCase):
             self.assertEqual(adjusted.base_zone_targets[zone_key], baseline.base_zone_targets[zone_key])
         self.assertEqual(adjusted.zones["office"].comfort_adjustment, 0.2)
 
-    def test_manual_adjustment_is_unclamped_while_automatic_score_is_clamped(self):
+    def test_manual_adjustment_is_unclamped_before_cooling_safety_bound(self):
         baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
         for manual in (-2.5, 2.5):
             for automatic in (-9.0, 9.0):
@@ -1832,6 +1877,19 @@ class TempTamerTests(unittest.TestCase):
                         for scheme_attr in ("scheme", "cool_scheme"):
                             before = getattr(baseline.zones[key], scheme_attr)
                             after = getattr(zone, scheme_attr)
+                            expected_values = tuple(
+                                getattr(before, threshold) - correction
+                                for threshold in ("enable_outside", "continue_until", "ideal_target")
+                            )
+                            if (
+                                scheme_attr == "cool_scheme"
+                                and after.name != SCHEME_OFF
+                                and min(expected_values) < 14.0
+                            ):
+                                self.assertGreaterEqual(after.continue_until, 14.0)
+                                self.assertGreaterEqual(after.enable_outside, after.ideal_target)
+                                self.assertGreaterEqual(after.ideal_target, after.continue_until)
+                                continue
                             for threshold in ("enable_outside", "continue_until", "ideal_target"):
                                 self.assertAlmostEqual(
                                     getattr(after, threshold), getattr(before, threshold) - correction,
@@ -1966,7 +2024,13 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(day_snapshot.zones["office"].scheme.name, SCHEME_DAY_LIVING)
         self.assertEqual(day_snapshot.zones["downstairs"].scheme.name, SCHEME_NIGHT)
         self.assertIsInstance(night_snapshot.comfort_mode_behavior, NightComfortMode)
-        self.assertTrue(all(zone.scheme.name == SCHEME_NIGHT for zone in night_snapshot.zones.values()))
+        self.assertTrue(
+            all(
+                zone.scheme.name
+                == (SCHEME_NIGHT_BEDROOM if zone_key in {"bedroom_1_2", "bedroom_3_4"} else SCHEME_NIGHT)
+                for zone_key, zone in night_snapshot.zones.items()
+            )
+        )
 
     def test_poweroff_forces_the_heatpump_off_until_activation(self):
         snapshot = build_behavior_snapshot(
@@ -3411,6 +3475,13 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SYSTEM_CONFIG.global_setpoint_adjustment_entity, GLOBAL_SETPOINT_ADJUSTMENT_ENTITY)
         self.assertIn(GLOBAL_SETPOINT_ADJUSTMENT_ENTITY, NORMAL_RECALCULATION_TRIGGER_ENTITIES)
 
+    def test_default_bedroom_cooling_band_uses_habitable_room_targets(self):
+        scheme = DEFAULT_SYSTEM_CONFIG.cool_control_schemes[SCHEME_BEDROOM]
+
+        self.assertEqual(scheme.enable_outside, 22.0)
+        self.assertEqual(scheme.ideal_target, 21.5)
+        self.assertEqual(scheme.continue_until, 20.0)
+
     def test_control_trigger_sets_separate_user_reconciliation_from_normal_recalculation(self):
         self.assertIn(DEFAULT_SYSTEM_CONFIG.comfort_mode_entity, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
         self.assertIn(DEFAULT_SYSTEM_CONFIG.hvac_mode_entity, IMMEDIATE_RECONCILIATION_TRIGGER_ENTITIES)
@@ -4558,7 +4629,78 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "cool")
         self.assertEqual(plan.requested_by_zones, ("office",))
-        self.assertEqual(plan.setpoint, 22)
+        self.assertEqual(plan.setpoint, 23)
+
+    def test_active_cooling_mirrors_heat_with_inlet_relative_minimum_drive(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "22.0",
+                        "sensor.office_average_temperature": "22.2",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("25.0"),
+            )
+        )
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+        )
+
+        self.assertTrue(demand.cool_requested)
+        self.assertEqual(plan.setpoint, 24)
+
+    def test_maximum_sensor_continues_cooling_without_increasing_active_drive(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "input_number.comfort_adjustment_office": "2.7",
+                        "input_number.temptamer_setpoint_adjustment": "-1.0",
+                        "sensor.office_average_temperature": "21.5",
+                        "sensor.office_minimum_temperature": "20.7",
+                        "sensor.office_maximum_temperature": "22.3",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                        "switch.wt32_hpctrl_e8dbd0_bed_12": "on",
+                        "switch.wt32_hpctrl_e8dbd0_bed_34": "on",
+                        "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "on",
+                    }
+                ),
+                base_attr_map("22.0", target_temp_step=0.5),
+            )
+        )
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            target_temp_step=0.5,
+            supported_fan_modes=tuple(f"Level {level}" for level in range(1, 7)),
+        )
+
+        self.assertTrue(demand.cool_requested)
+        self.assertAlmostEqual(demand.max_temperature_deficit, 0.5)
+        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.fan_mode, "Level 3")
 
     def test_maintain_cooling_uses_inlet_setpoint_when_zone_is_closer_to_ideal(self):
         snapshot = build_behavior_snapshot(
@@ -4845,6 +4987,96 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(demand.maintain_cool_mode)
         self.assertEqual(plan.hvac_mode, "cool")
         self.assertEqual(plan.setpoint, 23.5)
+
+    def test_maintain_cooling_never_reduces_previous_release_setpoint(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "20.0",
+                        "sensor.office_average_temperature": "21.2",
+                        "sensor.average_dining_zone_temp": "14.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("21.0", temperature="22.0"),
+            )
+        )
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+
+        plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            current_setpoint="22.0",
+            previous_cool_release_setpoint=24.0,
+        )
+
+        self.assertTrue(demand.maintain_cool_mode)
+        self.assertEqual(plan.setpoint, 24)
+        self.assertEqual(plan.cool_release_setpoint, 24)
+
+    def test_open_zone_maximum_sensor_continues_cooling_until_hot_room_recovers(self):
+        now = datetime(2026, 5, 7, 12, 10, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.office_minimum_temperature": "20.1",
+                        "sensor.office_maximum_temperature": "22.1",
+                        "sensor.average_dining_zone_temp": "13.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_COOL)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(predicted_open, ("office",))
+        self.assertTrue(demand.maintain_cool_mode)
+        self.assertEqual(demand.requested_by_zones, ("office",))
+        self.assertEqual(demand.max_temperature_deficit, 0.0)
+
+    def test_cooling_ignores_maximum_sensor_when_minimum_is_below_continue_threshold(self):
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "20.5",
+                        "sensor.office_minimum_temperature": "19.9",
+                        "sensor.office_maximum_temperature": "22.1",
+                        "sensor.average_dining_zone_temp": "13.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                    }
+                ),
+                base_attr_map("21.0"),
+            )
+        )
+
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+
+        self.assertNotIn("office", snapshot.cool_calling_zones)
+        self.assertNotIn("office", snapshot.above_ideal_zones)
+        self.assertFalse(demand.cool_requested)
+        self.assertFalse(demand.maintain_cool_mode)
 
     def test_no_heat_demand_enters_idle_once_all_zones_reach_continue_threshold(self):
         snapshot = build_behavior_snapshot(
@@ -5350,6 +5582,53 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.idle)
         self.assertEqual(plan.setpoint, 18)
         self.assertEqual(plan.idle_heat_step, -4)
+
+    def test_cooling_idle_release_raises_setpoint_in_stages_without_ratcheting_down(self):
+        now = datetime(2026, 1, 1, 12, 5, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.home_temperature": "19.0",
+                        "sensor.office_average_temperature": "19.5",
+                        "sensor.average_dining_zone_temp": "12.0",
+                        "sensor.average_bed1_2_zone_temp": "11.0",
+                        "sensor.average_bed3_4_zone_temp": "11.0",
+                    }
+                ),
+                base_attr_map("21.0", temperature="21.0"),
+            )
+        )
+        demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
+
+        five_minute_plan = build_dispatch_plan(
+            snapshot,
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            current_setpoint="21.0",
+            previous_cool_release_setpoint=21.0,
+            idle_started_at=now - timedelta(minutes=5),
+            now=now,
+        )
+        falling_inlet_plan = build_dispatch_plan(
+            replace(snapshot, inlet_temp=18.0),
+            demand,
+            ("office",),
+            current_hvac_mode="cool",
+            current_fan_mode="low",
+            current_setpoint="21.0",
+            previous_cool_release_setpoint=five_minute_plan.cool_release_setpoint,
+            idle_started_at=now - timedelta(minutes=6),
+            now=now,
+        )
+
+        self.assertTrue(five_minute_plan.idle)
+        self.assertEqual(five_minute_plan.setpoint, 23)
+        self.assertEqual(falling_inlet_plan.setpoint, 23)
 
     def test_heating_idle_stage_3_does_not_raise_existing_inlet_minus_4_setpoint(self):
         now = datetime(2026, 1, 1, 12, 12, 0, tzinfo=timezone.utc)
@@ -6149,7 +6428,8 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(plan.idle)
         self.assertFalse(plan.turn_off)
         self.assertEqual(plan.hvac_mode, "cool")
-        self.assertEqual(plan.setpoint, 18)
+        self.assertEqual(plan.setpoint, 21)
+        self.assertEqual(plan.cool_release_setpoint, 21)
 
     def test_cooling_continues_until_all_zones_drop_to_ideal_target(self):
         snapshot = build_behavior_snapshot(
