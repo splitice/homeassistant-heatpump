@@ -42,6 +42,10 @@ def _temperature_excess(zone: ZoneRuntimeState, threshold: float) -> float:
     return max(0.0, zone.current_temp - threshold)
 
 
+def _heat_reopen_threshold(zone: ZoneRuntimeState) -> float:
+    return (zone.scheme.enable_outside + zone.scheme.ideal_target) / 2
+
+
 def _can_toggle(zone: ZoneRuntimeState, now: datetime, comfort_mode_changed: bool) -> bool:
     if comfort_mode_changed or zone.last_switch_change is None:
         return True
@@ -67,16 +71,125 @@ def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list
     return result
 
 
-def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str) -> bool:
+def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp > zone.cool_scheme.continue_until
-    return zone.current_temp < zone.scheme.continue_until
+        return zone.current_temp > zone.cool_scheme.ideal_target
+    if reconcile_all and zone.current_temp < zone.scheme.continue_until:
+        return True
+    return zone.current_temp < _heat_reopen_threshold(zone)
+
+
+def _opening_reason(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> str:
+    if operation_mode == HVAC_COOL:
+        return f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
+    if reconcile_all and zone.current_temp < zone.scheme.continue_until and zone.current_temp >= _heat_reopen_threshold(zone):
+        return f"{zone.current_temp:.1f} is below continue-until threshold {zone.scheme.continue_until:.1f}"
+    return f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"
+
+
+def _closing_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
+    if not zone.is_enabled_by_mode:
+        return f"mode disabled by scheme {zone.scheme.name}"
+    if operation_mode == HVAC_COOL:
+        return f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+    if operation_mode == HVAC_HEAT:
+        return f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
+    return "startup reconcile requires zone to be closed"
+
+
+def _resolve_authoritative_startup_actions(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    operation_mode: str,
+    existing_actions: list[ZoneAction],
+) -> list[ZoneAction]:
+    desired_open_zones = set(predicted_open_zones)
+    existing_actions_by_zone = {action.zone_key: action for action in existing_actions}
+    authoritative_actions: list[ZoneAction] = []
+
+    for zone_key in snapshot.zones:
+        existing_action = existing_actions_by_zone.get(zone_key)
+        if zone_key in desired_open_zones:
+            reason = existing_action.reason if existing_action is not None else _opening_reason(
+                snapshot.zones[zone_key],
+                operation_mode,
+                reconcile_all=True,
+            )
+            authoritative_actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=True,
+                    reason=reason,
+                    safety_required=existing_action.safety_required if existing_action is not None else False,
+                    discretionary=False,
+                )
+            )
+            continue
+
+        reason = existing_action.reason if existing_action is not None else _closing_reason(
+            snapshot.zones[zone_key],
+            operation_mode,
+        )
+        authoritative_actions.append(
+            ZoneAction(
+                zone_key=zone_key,
+                turn_on=False,
+                reason=reason,
+                safety_required=False,
+                discretionary=False,
+            )
+        )
+
+    return authoritative_actions
 
 
 def _zone_should_close(zone: ZoneRuntimeState, operation_mode: str) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp <= zone.cool_scheme.ideal_target
-    return zone.current_temp >= zone.scheme.ideal_target
+        return zone.current_temp <= zone.cool_scheme.continue_until
+    return zone.current_temp >= zone.scheme.continue_until
+
+
+def resolve_high_fan_office_closure(
+    snapshot: DemandSnapshot,
+    predicted_open_zones: tuple[str, ...],
+    *,
+    operation_mode: str | None,
+    requested_fan_speed_level: int | None,
+) -> ZoneAction | None:
+    """Close Office at a high fan speed without overriding its continuation target."""
+    if requested_fan_speed_level is None or requested_fan_speed_level <= 5:
+        return None
+    if operation_mode not in {HVAC_HEAT, HVAC_COOL}:
+        return None
+
+    office_zone = snapshot.zones.get("office")
+    if office_zone is None or not office_zone.switch_is_on or office_zone.key not in predicted_open_zones:
+        return None
+    if len(predicted_open_zones) <= MIN_OPEN_ZONES:
+        return None
+
+    if operation_mode == HVAC_HEAT:
+        threshold = max(office_zone.scheme.enable_outside + 1.0, office_zone.scheme.continue_until)
+        is_at_high_fan_close_threshold = office_zone.current_temp >= threshold
+        comparison = ">="
+    else:
+        threshold = min(office_zone.cool_scheme.enable_outside - 1.0, office_zone.cool_scheme.continue_until)
+        is_at_high_fan_close_threshold = office_zone.current_temp <= threshold
+        comparison = "<="
+
+    if not is_at_high_fan_close_threshold:
+        return None
+
+    return ZoneAction(
+        zone_key=office_zone.key,
+        turn_on=False,
+        reason=(
+            f"requested fan level {requested_fan_speed_level} is above 5 and Office is "
+            f"{office_zone.current_temp:.1f}{comparison}{threshold:.1f}, at or beyond its high-fan closing threshold; "
+            "another zone remains open for safety"
+        ),
+        discretionary=False,
+    )
 
 
 def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
@@ -88,8 +201,8 @@ def _opening_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, d
 
 def _closing_rank(zone: ZoneRuntimeState, operation_mode: str) -> tuple[float, datetime]:
     if operation_mode == HVAC_COOL:
-        return (zone.current_temp - zone.cool_scheme.ideal_target, _last_change_key(zone))
-    return (-(zone.current_temp - zone.scheme.ideal_target), _last_change_key(zone))
+        return (zone.current_temp - zone.cool_scheme.continue_until, _last_change_key(zone))
+    return (-(zone.current_temp - zone.scheme.continue_until), _last_change_key(zone))
 
 
 def _safety_open_rank(zone: ZoneRuntimeState, operation_mode: str, *, continue_threshold: bool) -> tuple[float, timedelta]:
@@ -108,17 +221,7 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
             enabled_zones.append(zone)
 
     if not enabled_zones:
-        open_zones: list[ZoneRuntimeState] = []
-        for zone in snapshot.zones.values():
-            if zone.switch_is_on:
-                open_zones.append(zone)
-        if not open_zones:
-            return None
-        ranked_open_zones: list[tuple[timedelta, ZoneRuntimeState]] = []
-        for zone in open_zones:
-            ranked_open_zones.append((_recent_change_rank(zone), zone))
-        open_zones = _sorted_by_rank(ranked_open_zones)
-        return open_zones[0].key
+        return None
 
     continue_zones: list[ZoneRuntimeState] = []
     for zone in enabled_zones:
@@ -139,24 +242,34 @@ def _select_safety_open_zone(snapshot: DemandSnapshot, operation_mode: str) -> s
     return enabled_zones[0].key
 
 
+def _has_active_thermal_demand(snapshot: DemandSnapshot, operation_mode: str) -> bool:
+    if operation_mode == HVAC_COOL:
+        return bool(snapshot.cool_calling_zones or snapshot.continue_cooling_zones)
+    if operation_mode == HVAC_HEAT:
+        return bool(snapshot.heat_calling_zones or snapshot.continue_heating_zones)
+    return False
+
+
 def _zone_temperature_reason(zone: ZoneRuntimeState, operation_mode: str | None) -> str:
     if not zone.is_enabled_by_mode:
         return f"mode disabled by scheme {zone.scheme.name}"
     if operation_mode == HVAC_COOL:
         if zone.current_temp > zone.cool_scheme.enable_outside:
             return f"above enable threshold {zone.current_temp:.1f}>{zone.cool_scheme.enable_outside:.1f}"
-        if zone.current_temp > zone.cool_scheme.continue_until:
-            return f"above continue-until threshold {zone.current_temp:.1f}>{zone.cool_scheme.continue_until:.1f}"
         if zone.current_temp > zone.cool_scheme.ideal_target:
             return f"above ideal target {zone.current_temp:.1f}>{zone.cool_scheme.ideal_target:.1f}"
-        return f"at or below ideal target {zone.current_temp:.1f}<={zone.cool_scheme.ideal_target:.1f}"
+        if zone.current_temp > zone.cool_scheme.continue_until:
+            return f"above continue-until threshold {zone.current_temp:.1f}>{zone.cool_scheme.continue_until:.1f}"
+        return f"at or below continue-until target {zone.current_temp:.1f}<={zone.cool_scheme.continue_until:.1f}"
     if zone.current_temp < zone.scheme.enable_outside:
         return f"below enable threshold {zone.current_temp:.1f}<{zone.scheme.enable_outside:.1f}"
-    if zone.current_temp < zone.scheme.continue_until:
-        return f"below continue-until threshold {zone.current_temp:.1f}<{zone.scheme.continue_until:.1f}"
+    if zone.current_temp < _heat_reopen_threshold(zone):
+        return f"below heat reopen threshold {zone.current_temp:.1f}<{_heat_reopen_threshold(zone):.1f}"
     if zone.current_temp < zone.scheme.ideal_target:
         return f"below ideal target {zone.current_temp:.1f}<{zone.scheme.ideal_target:.1f}"
-    return f"at or above ideal target {zone.current_temp:.1f}>={zone.scheme.ideal_target:.1f}"
+    if zone.current_temp < zone.scheme.continue_until:
+        return f"below continue-until threshold {zone.current_temp:.1f}<{zone.scheme.continue_until:.1f}"
+    return f"at or above continue-until target {zone.current_temp:.1f}>={zone.scheme.continue_until:.1f}"
 
 
 def describe_zone_predictions(
@@ -166,8 +279,11 @@ def describe_zone_predictions(
     *,
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
+    startup_reconcile: bool = False,
+    hold_closing_zones: bool = False,
 ) -> tuple[str, ...]:
     predicted_open = set(predicted_open_zones)
+    reconcile_all = comfort_mode_changed or startup_reconcile
     descriptions: list[str] = []
 
     for zone_key, zone in snapshot.zones.items():
@@ -187,11 +303,23 @@ def describe_zone_predictions(
 
         if zone.key in predicted_open:
             if zone.switch_is_on:
-                status_parts.append("kept open")
+                if (
+                    hold_closing_zones
+                    and zone.is_enabled_by_mode
+                    and operation_mode in {HVAC_HEAT, HVAC_COOL}
+                    and _zone_should_close(zone, operation_mode)
+                ):
+                    status_parts.append("held open for heatpump fan rundown")
+                else:
+                    status_parts.append("kept open")
             else:
                 status_parts.append("predicted to open")
         else:
-            if zone.is_enabled_by_mode and operation_mode in {HVAC_HEAT, HVAC_COOL} and _zone_should_open(zone, operation_mode):
+            if zone.is_enabled_by_mode and operation_mode in {HVAC_HEAT, HVAC_COOL} and _zone_should_open(
+                zone,
+                operation_mode,
+                reconcile_all=reconcile_all,
+            ):
                 if _can_toggle(zone, now, comfort_mode_changed):
                     status_parts.append("eligible to open but another zone ranked ahead")
                 else:
@@ -218,9 +346,18 @@ def resolve_zone_actions(
     *,
     operation_mode: str | None = None,
     comfort_mode_changed: bool = False,
+    startup_reconcile: bool = False,
+    downstairs_priority_active: bool = False,
+    downstairs_zone_key: str | None = None,
+    upstairs_zone_keys: tuple[str, ...] = (),
+    downstairs_startup_priority_active: bool = False,
+    downstairs_startup_priority_zone_key: str | None = None,
+    requested_fan_speed_level: int | None = None,
+    hold_closing_zones: bool = False,
 ) -> tuple[list[ZoneAction], tuple[str, ...]]:
     actions: list[ZoneAction] = []
     predicted_open: set[str] = set()
+    reconcile_all = comfort_mode_changed or startup_reconcile
     for key, zone in snapshot.zones.items():
         if zone.switch_is_on:
             predicted_open.add(key)
@@ -228,7 +365,23 @@ def resolve_zone_actions(
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_MANUAL:
         return actions, tuple(sorted(predicted_open))
 
+    if snapshot.poweroff_forced_off:
+        if hold_closing_zones:
+            return actions, tuple(sorted(predicted_open))
+        for key in tuple(sorted(predicted_open)):
+            actions.append(
+                ZoneAction(
+                    zone_key=key,
+                    turn_on=False,
+                    reason="PowerOff is waiting for its activation conditions",
+                    discretionary=False,
+                )
+            )
+        return actions, tuple()
+
     if snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_OFF:
+        if hold_closing_zones:
+            return actions, tuple(sorted(predicted_open))
         for key in tuple(sorted(predicted_open)):
             actions.append(
                 ZoneAction(
@@ -240,14 +393,77 @@ def resolve_zone_actions(
             )
         return actions, tuple()
 
+    if downstairs_priority_active and operation_mode == HVAC_HEAT and downstairs_zone_key in snapshot.zones:
+        downstairs_zone = snapshot.zones[downstairs_zone_key]
+        if downstairs_zone.is_enabled_by_mode and not downstairs_zone.switch_is_on:
+            actions.append(
+                ZoneAction(
+                    zone_key=downstairs_zone_key,
+                    turn_on=True,
+                    reason="PowerDay downstairs-priority heat soak",
+                    discretionary=False,
+                )
+            )
+
+        for zone_key in upstairs_zone_keys:
+            upstairs_zone = snapshot.zones.get(zone_key)
+            if upstairs_zone is None or not upstairs_zone.switch_is_on:
+                continue
+            actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=False,
+                    reason="PowerDay downstairs-priority heat soak",
+                    discretionary=False,
+                )
+            )
+
+        return actions, (downstairs_zone_key,)
+
+    if (
+        downstairs_startup_priority_active
+        and operation_mode in {HVAC_HEAT, HVAC_COOL}
+        and downstairs_startup_priority_zone_key in snapshot.zones
+    ):
+        downstairs_zone = snapshot.zones[downstairs_startup_priority_zone_key]
+        if downstairs_zone.is_enabled_by_mode and not downstairs_zone.switch_is_on:
+            actions.append(
+                ZoneAction(
+                    zone_key=downstairs_startup_priority_zone_key,
+                    turn_on=True,
+                    reason="downstairs startup priority after an extended heat/cool request gap",
+                    discretionary=False,
+                )
+            )
+        return actions, (downstairs_startup_priority_zone_key,)
+
     if operation_mode not in {HVAC_HEAT, HVAC_COOL}:
         return actions, tuple(sorted(predicted_open))
 
     discretionary_used = 0
+    active_thermal_demand = _has_active_thermal_demand(snapshot, operation_mode)
+
+    for zone in snapshot.zones.values():
+        if zone.switch_is_on and not zone.is_enabled_by_mode:
+            if hold_closing_zones:
+                continue
+            predicted_open.discard(zone.key)
+            actions.append(
+                ZoneAction(
+                    zone_key=zone.key,
+                    turn_on=False,
+                    reason=_closing_reason(zone, operation_mode),
+                    discretionary=False,
+                )
+            )
 
     opening_candidates: list[ZoneRuntimeState] = []
     for zone in snapshot.zones.values():
-        if zone.is_enabled_by_mode and not zone.switch_is_on and _zone_should_open(zone, operation_mode):
+        if zone.is_enabled_by_mode and not zone.switch_is_on and _zone_should_open(
+            zone,
+            operation_mode,
+            reconcile_all=reconcile_all,
+        ):
             opening_candidates.append(zone)
     ranked_opening_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
     for zone in opening_candidates:
@@ -255,15 +471,16 @@ def resolve_zone_actions(
     opening_candidates = _sorted_by_rank(ranked_opening_candidates)
 
     closing_candidates: list[ZoneRuntimeState] = []
-    for zone in snapshot.zones.values():
-        if zone.switch_is_on and zone.is_enabled_by_mode and _zone_should_close(zone, operation_mode):
-            closing_candidates.append(zone)
+    if not hold_closing_zones:
+        for zone in snapshot.zones.values():
+            if zone.switch_is_on and zone.is_enabled_by_mode and _zone_should_close(zone, operation_mode):
+                closing_candidates.append(zone)
     ranked_closing_candidates: list[tuple[tuple[float, datetime], ZoneRuntimeState]] = []
     for zone in closing_candidates:
         ranked_closing_candidates.append((_closing_rank(zone, operation_mode), zone))
     closing_candidates = _sorted_by_rank(ranked_closing_candidates)
 
-    if comfort_mode_changed:
+    if reconcile_all:
         for zone in opening_candidates:
             if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
                 continue
@@ -272,37 +489,35 @@ def resolve_zone_actions(
                 ZoneAction(
                     zone_key=zone.key,
                     turn_on=True,
-                    reason=(
-                        f"{zone.current_temp:.1f} is above continue-until target {zone.cool_scheme.continue_until:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}"
-                    ),
+                    reason=_opening_reason(zone, operation_mode, reconcile_all=reconcile_all),
                 )
             )
 
     for zone in closing_candidates:
-        if zone.key not in predicted_open or len(predicted_open) <= MIN_OPEN_ZONES:
+        is_last_open_zone = len(predicted_open) <= MIN_OPEN_ZONES
+        may_close_final_zone = comfort_mode_changed and not active_thermal_demand
+        if zone.key not in predicted_open or (is_last_open_zone and not may_close_final_zone):
             continue
         if not _can_toggle(zone, now, comfort_mode_changed):
             continue
-        if not comfort_mode_changed and discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
+        if not reconcile_all and discretionary_used >= MAX_DISCRETIONARY_ZONE_CHANGES_PER_PASS:
             break
         predicted_open.remove(zone.key)
         actions.append(
             ZoneAction(
                 zone_key=zone.key,
                 turn_on=False,
-                    reason=(
-                        f"{zone.current_temp:.1f} is at or below ideal target {zone.cool_scheme.ideal_target:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is at or above ideal target {zone.scheme.ideal_target:.1f}"
-                    ),
+                reason=(
+                    f"{zone.current_temp:.1f} is at or below continue-until target {zone.cool_scheme.continue_until:.1f}"
+                    if operation_mode == HVAC_COOL
+                    else f"{zone.current_temp:.1f} is at or above continue-until target {zone.scheme.continue_until:.1f}"
+                ),
             )
         )
-        if not comfort_mode_changed:
+        if not reconcile_all:
             discretionary_used += 1
 
-    if not comfort_mode_changed:
+    if not reconcile_all:
         for zone in opening_candidates:
             if zone.key in predicted_open or not _can_toggle(zone, now, comfort_mode_changed):
                 continue
@@ -313,16 +528,26 @@ def resolve_zone_actions(
                 ZoneAction(
                     zone_key=zone.key,
                     turn_on=True,
-                    reason=(
-                        f"{zone.current_temp:.1f} is above continue-until target {zone.cool_scheme.continue_until:.1f}"
-                        if operation_mode == HVAC_COOL
-                        else f"{zone.current_temp:.1f} is below continue-until target {zone.scheme.continue_until:.1f}"
-                    ),
+                    reason=_opening_reason(zone, operation_mode, reconcile_all=reconcile_all),
                 )
             )
             discretionary_used += 1
 
-    if not predicted_open:
+    high_fan_office_closure = (
+        None
+        if hold_closing_zones
+        else resolve_high_fan_office_closure(
+            snapshot,
+            tuple(sorted(predicted_open)),
+            operation_mode=operation_mode,
+            requested_fan_speed_level=requested_fan_speed_level,
+        )
+    )
+    if high_fan_office_closure is not None:
+        predicted_open.remove(high_fan_office_closure.zone_key)
+        actions.append(high_fan_office_closure)
+
+    if not predicted_open and active_thermal_demand:
         safety_zone_key = _select_safety_open_zone(snapshot, operation_mode)
         if safety_zone_key:
             zone = snapshot.zones[safety_zone_key]
@@ -344,4 +569,43 @@ def resolve_zone_actions(
             elif zone.switch_is_on:
                 predicted_open.add(zone.key)
 
+    if startup_reconcile:
+        return _resolve_authoritative_startup_actions(
+            snapshot,
+            tuple(sorted(predicted_open)),
+            operation_mode,
+            actions,
+        ), tuple(sorted(predicted_open))
+
     return actions, tuple(sorted(predicted_open))
+
+
+def resolve_dry_zone_actions(snapshot: DemandSnapshot) -> tuple[list[ZoneAction], tuple[str, ...]]:
+    """Open every enabled zone for safe whole-house dry-mode airflow."""
+    opening_actions: list[ZoneAction] = []
+    closing_actions: list[ZoneAction] = []
+    predicted_open: list[str] = []
+    for zone_key, zone in snapshot.zones.items():
+        if zone.is_enabled_by_mode:
+            predicted_open.append(zone_key)
+            if not zone.switch_is_on:
+                opening_actions.append(
+                    ZoneAction(
+                        zone_key=zone_key,
+                        turn_on=True,
+                        reason="PowerDay dry mode requires whole-house airflow",
+                        safety_required=True,
+                        discretionary=False,
+                    )
+                )
+        elif zone.switch_is_on:
+            closing_actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=False,
+                    reason="zone comfort mode is Off during PowerDay dry mode",
+                    discretionary=False,
+                )
+            )
+    predicted_open.sort()
+    return opening_actions + closing_actions, tuple(predicted_open)
