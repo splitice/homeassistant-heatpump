@@ -8,6 +8,8 @@ from math import isfinite
 from .config import (
     POWERDAY_DRY_ABORT_MIN_ZONE_CELSIUS,
     POWERDAY_DRY_CONDITIONAL_INDOOR_HUMIDITY_THRESHOLD,
+    POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS,
+    POWERDAY_DRY_COOLING_EXIT_EXCESS_CELSIUS,
     POWERDAY_DRY_FORECAST_HUMIDITY_END_TIME,
     POWERDAY_DRY_FORECAST_HUMIDITY_START_TIME,
     POWERDAY_DRY_FORECAST_HUMIDITY_THRESHOLD,
@@ -53,6 +55,13 @@ class DehumidificationDecision:
     humidity_eligible: bool
     coldest_enabled_zone_celsius: float | None
     reason: str
+    entry_kind: str | None = None
+    energy_eligible: bool = False
+    energy_source: str | None = None
+    cooling_excess_celsius: float | None = None
+    cooling_threshold_celsius: float | None = None
+    coldest_target_zone_celsius: float | None = None
+    cooldown_active: bool = False
 
 
 def _finite_float(value: object | None) -> float | None:
@@ -165,10 +174,17 @@ def _supports_dry_mode(supported_hvac_modes: Iterable[object] | None) -> bool:
     return False
 
 
-def _coldest_enabled_zone(snapshot: DemandSnapshot) -> float | None:
+def _coldest_enabled_zone(
+    snapshot: DemandSnapshot,
+    zone_keys: Iterable[str] | None = None,
+) -> float | None:
     coldest: float | None = None
-    for zone in snapshot.zones.values():
-        if not zone.is_enabled_by_mode:
+    selected_zone_keys = set(zone_keys) if zone_keys is not None else None
+    for zone_key, zone in snapshot.zones.items():
+        if selected_zone_keys is not None:
+            if zone_key not in selected_zone_keys:
+                continue
+        elif not zone.is_enabled_by_mode:
             continue
         candidates = [zone.current_temp]
         if zone.min_temp is not None:
@@ -191,8 +207,14 @@ def resolve_powerday_dehumidification(
     cool_forecast_safe: bool,
     cycle_completed: bool,
     currently_active: bool,
+    cooling_demand: bool = False,
+    cooling_excess_celsius: float = 0.0,
+    cooling_zone_keys: Iterable[str] | None = None,
+    active_entry_kind: str | None = None,
+    cooldown_active: bool = False,
+    cooling_exit_confirmed: bool = True,
 ) -> DehumidificationDecision:
-    """Resolve whether forecast-aware PowerDay may request dry mode."""
+    """Resolve idle dehumidification or low-demand cooling substitution."""
     parsed_humidity = _finite_float(indoor_humidity)
     if parsed_humidity is not None and not 0.0 <= parsed_humidity <= 100.0:
         parsed_humidity = None
@@ -210,14 +232,31 @@ def resolve_powerday_dehumidification(
             and forecast_humidity_high
         )
     )
-    coldest_zone = _coldest_enabled_zone(snapshot)
+    substitution_selected = bool(
+        cooling_demand
+        and snapshot.selected_hvac_mode in {CONTROL_HVAC_MODE_COOL, CONTROL_HVAC_MODE_HEATCOOL}
+    )
+    entry_kind = "cooling_substitution" if substitution_selected else "idle"
+    target_zone_keys = cooling_zone_keys if substitution_selected else None
+    coldest_zone = _coldest_enabled_zone(snapshot, target_zone_keys)
+    energy_sources: list[str] = []
+    if snapshot.free_power_available:
+        energy_sources.append("free_power")
+    if snapshot.battery_free_power_boost_available:
+        energy_sources.append("battery_latch")
+    substitution_energy_eligible = bool(energy_sources)
+    energy_source = "+".join(energy_sources) if energy_sources else None
+    parsed_cooling_excess = _finite_float(cooling_excess_celsius)
+    if parsed_cooling_excess is None:
+        parsed_cooling_excess = 0.0
+    cooling_threshold = (
+        POWERDAY_DRY_COOLING_EXIT_EXCESS_CELSIUS
+        if currently_active and active_entry_kind == "cooling_substitution"
+        else POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS
+    )
 
     if snapshot.comfort_mode != COMFORT_MODE_POWER_DAY:
         reason = "comfort mode is not PowerDay"
-    elif not snapshot.free_power_available:
-        reason = "free power is not available"
-    elif snapshot.free_power_heat_soak_level != POWERDAY_HEATSOAK_SUPPRESSED:
-        reason = f"heatsoak level is {snapshot.free_power_heat_soak_level}"
     elif not _supports_dry_mode(supported_hvac_modes):
         reason = "climate entity does not advertise dry mode"
     elif parsed_humidity is None:
@@ -227,10 +266,48 @@ def resolve_powerday_dehumidification(
             f"humidity gate is false: indoor {parsed_humidity:.1f}%; "
             f"evening forecast {forecast_humidity if forecast_humidity is not None else 'unknown'}%"
         )
-    elif has_thermal_demand:
-        reason = "normal heating or cooling demand takes priority"
-    elif cycle_completed:
-        reason = "dry cycle is already complete for this free-power period"
+    elif cycle_completed or cooldown_active:
+        reason = "dry cycle cooldown is active"
+    elif substitution_selected:
+        if not substitution_energy_eligible:
+            reason = "neither free power nor the battery boost latch is available"
+        elif (
+            parsed_cooling_excess >= cooling_threshold
+            and not (
+                currently_active
+                and active_entry_kind == "cooling_substitution"
+                and not cooling_exit_confirmed
+            )
+        ):
+            reason = (
+                f"cooling excess {parsed_cooling_excess:.2f}C >= "
+                f"dry threshold {cooling_threshold:.2f}C"
+            )
+        elif snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_HEATCOOL and not heat_forecast_safe:
+            reason = "heating demand is predicted within 30 minutes"
+        else:
+            confirmation_status = (
+                "; high-demand exit confirmation pending"
+                if parsed_cooling_excess >= cooling_threshold
+                else ""
+            )
+            return DehumidificationDecision(
+                eligible=True,
+                humidity_eligible=True,
+                coldest_enabled_zone_celsius=coldest_zone,
+                reason=(
+                    f"cooling-substitution dry eligible: indoor {parsed_humidity:.1f}%; "
+                    f"cooling excess {parsed_cooling_excess:.2f}C; energy {energy_source}"
+                    f"{confirmation_status}"
+                ),
+                entry_kind=entry_kind,
+                energy_eligible=True,
+                energy_source=energy_source,
+                cooling_excess_celsius=parsed_cooling_excess,
+                cooling_threshold_celsius=cooling_threshold,
+                coldest_target_zone_celsius=coldest_zone,
+                cooldown_active=False,
+            )
     elif coldest_zone is None:
         reason = "no enabled zone temperature is available"
     elif currently_active and coldest_zone <= POWERDAY_DRY_ABORT_MIN_ZONE_CELSIUS:
@@ -243,6 +320,12 @@ def resolve_powerday_dehumidification(
             f"coldest enabled zone {coldest_zone:.1f}C < "
             f"start floor {POWERDAY_DRY_START_MIN_ZONE_CELSIUS:.1f}C"
         )
+    elif not snapshot.free_power_available:
+        reason = "free power is not available"
+    elif snapshot.free_power_heat_soak_level != POWERDAY_HEATSOAK_SUPPRESSED:
+        reason = f"heatsoak level is {snapshot.free_power_heat_soak_level}"
+    elif has_thermal_demand:
+        reason = "normal heating or cooling demand takes priority"
     elif snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_HEAT and not heat_forecast_safe:
         reason = "heating demand is predicted within 30 minutes"
     elif snapshot.selected_hvac_mode == CONTROL_HVAC_MODE_COOL and not cool_forecast_safe:
@@ -266,6 +349,10 @@ def resolve_powerday_dehumidification(
                 f"dry eligible: indoor {parsed_humidity:.1f}%; "
                 f"evening forecast {forecast_humidity if forecast_humidity is not None else 'unknown'}%"
             ),
+            entry_kind=entry_kind,
+            energy_eligible=True,
+            energy_source="free_power",
+            coldest_target_zone_celsius=coldest_zone,
         )
 
     return DehumidificationDecision(
@@ -273,4 +360,15 @@ def resolve_powerday_dehumidification(
         humidity_eligible=humidity_eligible,
         coldest_enabled_zone_celsius=coldest_zone,
         reason=reason,
+        entry_kind=entry_kind,
+        energy_eligible=(
+            substitution_energy_eligible if substitution_selected else snapshot.free_power_available
+        ),
+        energy_source=energy_source if substitution_selected else (
+            "free_power" if snapshot.free_power_available else None
+        ),
+        cooling_excess_celsius=parsed_cooling_excess if substitution_selected else None,
+        cooling_threshold_celsius=cooling_threshold if substitution_selected else None,
+        coldest_target_zone_celsius=coldest_zone,
+        cooldown_active=cycle_completed or cooldown_active,
     )

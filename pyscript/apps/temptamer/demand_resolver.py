@@ -81,20 +81,41 @@ def _max_excess(
     return selected_zone_key, selected_excess
 
 
-def _max_cooling_fan_excess(snapshot: DemandSnapshot, zone_keys: tuple[str, ...]) -> float:
-    """Measure cooling airflow need against unadjusted room comfort targets.
+def _cooling_qualification_temperature(zone: ZoneRuntimeState) -> float:
+    """Return the sensor value allowed to qualify a zone for cooling."""
+    if zone.max_temp is None:
+        return zone.current_temp
+    if zone.min_temp is not None and zone.min_temp < zone.cool_scheme.continue_until:
+        return zone.current_temp
+    return max(zone.current_temp, zone.max_temp)
 
-    Operative-temperature adjustments may legitimately strengthen the
-    compressor request, but using that shifted threshold for fan selection can
-    turn a small physical room-temperature gap into maximum airflow.
+
+def _canonical_cooling_severity(
+    snapshot: DemandSnapshot,
+    zone_keys: tuple[str, ...],
+) -> tuple[str | None, float | None, float | None, float]:
+    """Measure cooling strength from average temperatures and base targets.
+
+    Adjusted thresholds and maximum sensors may qualify a zone, but neither
+    contributes to compressor or fan strength. This keeps a locally hot sensor
+    or a comfort offset from turning a small physical average-temperature gap
+    into an aggressive cooling request.
     """
+    selected_zone_key: str | None = None
+    selected_temperature: float | None = None
+    selected_target: float | None = None
     maximum_excess = 0.0
     for zone_key in zone_keys:
         zone = snapshot.zones[zone_key]
         base_targets = snapshot.base_zone_targets.get(zone_key)
         base_cool_target = base_targets[1] if base_targets is not None else zone.cool_scheme.ideal_target
-        maximum_excess = max(maximum_excess, zone.current_temp - base_cool_target)
-    return max(0.0, maximum_excess)
+        excess = max(0.0, zone.current_temp - base_cool_target)
+        if selected_zone_key is None or excess > maximum_excess:
+            selected_zone_key = zone_key
+            selected_temperature = zone.current_temp
+            selected_target = base_cool_target
+            maximum_excess = excess
+    return selected_zone_key, selected_temperature, selected_target, maximum_excess
 
 
 def _filter_zone_keys(candidate_zone_keys: tuple[str, ...], allowed_zone_keys: tuple[str, ...]) -> tuple[str, ...]:
@@ -204,12 +225,25 @@ def resolve_equipment_demand(
 
     if operation_mode == HVAC_COOL:
         cool_calling_zones = _filter_zone_keys(snapshot.cool_calling_zones, effective_zone_keys)
-        requested_by_zone, max_excess = _max_excess(snapshot, cool_calling_zones, lambda zone: zone.cool_scheme.enable_outside)
+        requested_by_zone, _ = _max_excess(
+            snapshot,
+            cool_calling_zones,
+            lambda zone: zone.cool_scheme.enable_outside,
+        )
         if requested_by_zone is not None:
+            severity_zone, severity_temperature, severity_target, canonical_excess = (
+                _canonical_cooling_severity(snapshot, cool_calling_zones)
+            )
             return EquipmentDemand(
                 cool_requested=True,
                 requested_by_zones=(requested_by_zone,),
-                max_temperature_deficit=_max_cooling_fan_excess(snapshot, cool_calling_zones),
+                max_temperature_deficit=canonical_excess,
+                qualification_temperature=_cooling_qualification_temperature(
+                    snapshot.zones[requested_by_zone]
+                ),
+                severity_temperature=severity_temperature,
+                severity_target_temperature=severity_target,
+                severity_zone_key=severity_zone,
                 reason=f"{requested_by_zone} is above enable threshold",
             )
 
@@ -222,19 +256,25 @@ def resolve_equipment_demand(
             _filter_zone_keys(snapshot.above_ideal_zones, effective_zone_keys),
             predicted_open_zones,
         )
-        continue_zone, continue_excess = _max_excess(
+        continue_zone, _ = _max_excess(
             snapshot,
             predicted_open_above_ideal_zones,
             lambda zone: zone.cool_scheme.ideal_target,
         )
         if continue_zone is not None:
+            severity_zone, severity_temperature, severity_target, canonical_excess = (
+                _canonical_cooling_severity(snapshot, predicted_open_above_ideal_zones)
+            )
             return EquipmentDemand(
                 maintain_cool_mode=True,
                 requested_by_zones=(continue_zone,),
-                max_temperature_deficit=_max_cooling_fan_excess(
-                    snapshot,
-                    predicted_open_above_ideal_zones,
+                max_temperature_deficit=canonical_excess,
+                qualification_temperature=_cooling_qualification_temperature(
+                    snapshot.zones[continue_zone]
                 ),
+                severity_temperature=severity_temperature,
+                severity_target_temperature=severity_target,
+                severity_zone_key=severity_zone,
                 reason=f"{continue_zone} is above ideal target",
             )
 

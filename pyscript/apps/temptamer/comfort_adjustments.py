@@ -128,6 +128,7 @@ class ComfortAdjustmentConfig:
     output_rate_limit_seconds: int = 15 * 60
     outdoor_filter_warmup_fraction: float = 0.5
     cooling_airflow_effects: tuple[float, ...] = (0.2, 0.4, 0.7, 1.0, 1.4, 1.8)
+    dry_cooling_airflow_fan_level: int = 2
     cooling_airflow_release_seconds: int = 5 * 60
 
 
@@ -1243,8 +1244,17 @@ def calculate_comfort_adjustments(
     hvac_action = reader.get_attr(config.climate_entity_id, "hvac_action")
     fan_mode_value = reader.get_attr(config.climate_entity_id, "fan_mode")
     fan_mode = str(fan_mode_value) if fan_mode_value is not None else None
-    fan_speed_level = cooling_airflow_fan_level(fan_mode_value)
-    active_cooling = _normalized_mode(configured_hvac_mode) == "cool"
+    # Dry mode also delivers cold supply air.  HVAC mode, rather than
+    # hvac_action, is the authoritative signal for the airflow comfort model.
+    configured_airflow_mode = (
+        str(configured_hvac_mode).strip().lower() if configured_hvac_mode is not None else ""
+    )
+    fan_speed_level = (
+        config.dry_cooling_airflow_fan_level
+        if configured_airflow_mode == "dry"
+        else cooling_airflow_fan_level(fan_mode_value)
+    )
+    active_cooling = configured_airflow_mode in {"cool", "cooling", "dry"}
 
     zone_temperatures: dict[str, float | None] = {}
     zone_temperature_sources: dict[str, str] = {}

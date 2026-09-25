@@ -50,7 +50,7 @@ HEAT_DEMAND_FAN_BOOST_STATE_FILE = "/config/pyscript/temptamer_fan_boost.state"
 # Persist the score convention separately from the helpers themselves.  When
 # this number changes, the publisher reseeds every helper before control reads
 # one of the old-convention values.
-COMFORT_SCORE_SEMANTICS_VERSION = 7
+COMFORT_SCORE_SEMANTICS_VERSION = 9
 COMFORT_SCORE_SEMANTICS_STATE_FILE = "/config/pyscript/temptamer_comfort_score_semantics.state"
 # Fabric solar filters represent heat retained by contents and fabric, so they
 # must survive PyScript reloads and Home Assistant restarts.
@@ -92,6 +92,13 @@ POWERDAY_DRY_UNCONDITIONAL_INDOOR_HUMIDITY_THRESHOLD = 50.0
 POWERDAY_DRY_START_MIN_ZONE_CELSIUS = 20.0
 POWERDAY_DRY_ABORT_MIN_ZONE_CELSIUS = 19.0
 POWERDAY_DRY_MAX_SECONDS = 30 * 60
+POWERDAY_DRY_COOLDOWN_SECONDS = 30 * 60
+POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS = 1.75
+POWERDAY_DRY_COOLING_EXIT_EXCESS_CELSIUS = 2.0
+POWERDAY_DRY_COOLING_EXIT_CONFIRMATION_PASSES = 2
+POWERDAY_DRY_COOLING_EXIT_CONFIRMATION_SECONDS = 30
+COOLING_FAN_INCREASE_CONFIRMATION_PASSES = 2
+COOLING_FAN_INCREASE_CONFIRMATION_SECONDS = 30
 POWERDAY_DRY_HEAT_TRANSITION_SECONDS = 5 * 60
 POWERDAY_DRY_CYCLE_STATE_FILE = "/config/pyscript/temptamer_powerday_dry.state"
 POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY = "downstairs"
@@ -171,16 +178,16 @@ DEFAULT_COOL_CONTROL_SCHEMES = {
     SCHEME_OFF: ControlScheme(name=SCHEME_OFF, enable_outside=0.0, continue_until=0.0, ideal_target=0.0),
     SCHEME_NIGHT: ControlScheme(
         name=SCHEME_NIGHT,
-        enable_outside=21.5,
-        continue_until=19.5,
-        ideal_target=20.5,
+        enable_outside=22,
+        continue_until=20,
+        ideal_target=21,
     ),
     SCHEME_NIGHT_BEDROOM: ControlScheme(name=SCHEME_NIGHT_BEDROOM, enable_outside=17.0, continue_until=15.0, ideal_target=16.0),
     SCHEME_DAY_LIVING: ControlScheme(
         name=SCHEME_DAY_LIVING,
-        enable_outside=21.5,
-        continue_until=19.5,
-        ideal_target=20.5,
+        enable_outside=22,
+        continue_until=20,
+        ideal_target=21,
     ),
     SCHEME_DOWNSTAIRS: ControlScheme(
         name=SCHEME_DOWNSTAIRS,

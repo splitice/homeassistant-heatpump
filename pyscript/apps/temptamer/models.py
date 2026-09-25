@@ -105,6 +105,10 @@ class EquipmentDemand:
     maintain_cool_mode: bool = False
     requested_by_zones: tuple[str, ...] = field(default_factory=tuple)
     max_temperature_deficit: float = 0.0
+    qualification_temperature: float | None = None
+    severity_temperature: float | None = None
+    severity_target_temperature: float | None = None
+    severity_zone_key: str | None = None
     reason: str = ""
 
 

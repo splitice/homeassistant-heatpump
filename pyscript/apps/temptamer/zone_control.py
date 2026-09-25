@@ -82,7 +82,7 @@ def _sorted_by_rank(ranked_zones: list[tuple[object, ZoneRuntimeState]]) -> list
 
 def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> bool:
     if operation_mode == HVAC_COOL:
-        return zone.current_temp > zone.cool_scheme.ideal_target
+        return _cooling_control_temperature(zone) > zone.cool_scheme.ideal_target
     if reconcile_all and zone.current_temp < zone.scheme.continue_until:
         return True
     return zone.current_temp < _heat_reopen_threshold(zone)
@@ -90,7 +90,11 @@ def _zone_should_open(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_
 
 def _opening_reason(zone: ZoneRuntimeState, operation_mode: str, *, reconcile_all: bool = False) -> str:
     if operation_mode == HVAC_COOL:
-        return f"{zone.current_temp:.1f} is above ideal target {zone.cool_scheme.ideal_target:.1f}"
+        qualification_temperature = _cooling_control_temperature(zone)
+        return (
+            f"qualification temperature {qualification_temperature:.1f} is above ideal target "
+            f"{zone.cool_scheme.ideal_target:.1f}; average {zone.current_temp:.1f}"
+        )
     if reconcile_all and zone.current_temp < zone.scheme.continue_until and zone.current_temp >= _heat_reopen_threshold(zone):
         return f"{zone.current_temp:.1f} is below continue-until threshold {zone.scheme.continue_until:.1f}"
     return f"{zone.current_temp:.1f} is below heat reopen threshold {_heat_reopen_threshold(zone):.1f}"

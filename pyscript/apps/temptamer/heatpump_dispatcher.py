@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .comfort_modes import DefaultComfortMode
-from .config import DEFAULT_SYSTEM_CONFIG, POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST
+from .config import (
+    COOLING_FAN_INCREASE_CONFIRMATION_PASSES,
+    COOLING_FAN_INCREASE_CONFIRMATION_SECONDS,
+    DEFAULT_SYSTEM_CONFIG,
+    POWERDAY_DOWNSTAIRS_FREE_POWER_DIRECT_TARGET_BOOST,
+)
 from .constants import (
     COMFORT_MODE_OFF,
     COMFORT_MODE_POWER_DAY,
@@ -232,6 +237,7 @@ def _requested_active_cool_raw(
     snapshot: DemandSnapshot,
     zone: ZoneRuntimeState,
     target_temp_step: object | None,
+    cooling_excess: float,
 ) -> float:
     """Mirror active heat control for a room above its cooling threshold."""
     maximum_room_target = zone.cool_scheme.enable_outside
@@ -239,8 +245,7 @@ def _requested_active_cool_raw(
     # reflect them around the inlet temperature for the cooling mirror.
     inlet_offset_target = snapshot.inlet_temp - zone.setpoint_delta_from_inlet
     room_target = max(maximum_room_target, inlet_offset_target)
-    room_excess = max(0.0, zone.current_temp - zone.cool_scheme.enable_outside)
-    boost_delta = max(_target_temp_step_value(target_temp_step), room_excess)
+    boost_delta = max(_target_temp_step_value(target_temp_step), cooling_excess)
     return min(room_target, snapshot.inlet_temp - boost_delta)
 
 
@@ -301,7 +306,12 @@ def _requested_setpoint_raw(
     if demand.cool_requested:
         if demand.requested_by_zones:
             zone = snapshot.zones[demand.requested_by_zones[0]]
-            return _requested_active_cool_raw(snapshot, zone, target_temp_step) + _powerday_downstairs_free_power_direct_target_adjustment(
+            return _requested_active_cool_raw(
+                snapshot,
+                zone,
+                target_temp_step,
+                demand.max_temperature_deficit,
+            ) + _powerday_downstairs_free_power_direct_target_adjustment(
                 snapshot,
                 demand,
                 predicted_open_zones,
@@ -374,12 +384,15 @@ def _requested_setpoint(
     if demand.cool_requested and demand.requested_by_zones:
         zone = snapshot.zones[demand.requested_by_zones[0]]
         LOGGER.info(
-            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f room_temp=%.1f excess=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
+            "SETPOINT: inlet_temp=%.1f zone=%s enable_outside=%.1f qualification_temperature=%s severity_zone=%s severity_temperature=%s severity_target=%s cooling_excess=%.1f direct_target_adjustment=%+.1f raw=%.1f normalized=%s",
             snapshot.inlet_temp,
             zone.key,
             zone.cool_scheme.enable_outside,
-            zone.current_temp,
-            max(0.0, zone.current_temp - zone.cool_scheme.enable_outside),
+            demand.qualification_temperature,
+            demand.severity_zone_key,
+            demand.severity_temperature,
+            demand.severity_target_temperature,
+            demand.max_temperature_deficit,
             direct_target_adjustment,
             raw_requested_setpoint,
             normalized_setpoint,
@@ -865,6 +878,54 @@ def fan_speed_level(fan_mode: str | None) -> int | None:
     return _fan_speed_level(fan_mode)
 
 
+def resolve_confirmed_cooling_fan_mode(
+    requested_fan_mode: str | None,
+    current_fan_mode: str | None,
+    pending_fan_mode: str | None,
+    pending_started_at: datetime | None,
+    pending_passes: int,
+    *,
+    now: datetime | None,
+) -> tuple[str | None, str | None, datetime | None, int, bool]:
+    """Confirm cooling fan increases while allowing reductions immediately."""
+    requested_level = _fan_speed_level(requested_fan_mode)
+    current_level = _fan_speed_level(current_fan_mode)
+    if (
+        requested_fan_mode is None
+        or requested_level is None
+        or current_level is None
+        or requested_level <= current_level
+    ):
+        return requested_fan_mode, None, None, 0, False
+
+    normalized_now = _normalize_timestamp(now)
+    normalized_started_at = _normalize_timestamp(pending_started_at)
+    same_candidate = (
+        pending_fan_mode is not None
+        and pending_fan_mode.strip().lower() == requested_fan_mode.strip().lower()
+    )
+    if not same_candidate:
+        normalized_started_at = normalized_now
+        pending_passes = 1
+    else:
+        pending_passes = max(0, int(pending_passes)) + 1
+        if normalized_started_at is None:
+            normalized_started_at = normalized_now
+
+    elapsed_seconds = (
+        max(0.0, (normalized_now - normalized_started_at).total_seconds())
+        if normalized_now is not None and normalized_started_at is not None
+        else 0.0
+    )
+    confirmed = bool(
+        pending_passes >= COOLING_FAN_INCREASE_CONFIRMATION_PASSES
+        or elapsed_seconds >= COOLING_FAN_INCREASE_CONFIRMATION_SECONDS
+    )
+    if confirmed:
+        return requested_fan_mode, None, None, 0, True
+    return current_fan_mode, requested_fan_mode, normalized_started_at, pending_passes, False
+
+
 def is_fan_speed_decrease(current_fan_mode: str | None, requested_fan_mode: str | None) -> bool:
     """Return whether applying the requested mode lowers the actual fan speed."""
     current_level = _fan_speed_level(current_fan_mode)
@@ -1192,6 +1253,7 @@ def build_dispatch_plan(
         return DispatchPlan(
             turn_off=False,
             hvac_mode=HVAC_DRY,
+            fan_mode=None,
             requested_by_zones=demand.requested_by_zones,
             open_zones=predicted_open_zones,
             reason=demand.reason,

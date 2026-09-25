@@ -44,6 +44,7 @@ from pyscript.apps.temptamer.config import (
     POWERDAY_DOWNSTAIRS_PRIORITY_ZONE_KEY,
     POWERDAY_FREE_POWER_PV_AVERAGE_WINDOW_SECONDS,
     POWERDAY_HEAT_SINK_MIN_SECONDS,
+    POWERDAY_DRY_COOLDOWN_SECONDS,
     POWERDAY_DRY_HEAT_TRANSITION_SECONDS,
     POWERDAY_DRY_MAX_SECONDS,
     POWEROFF_MIN_ACTIVATION_SECONDS,
@@ -96,6 +97,7 @@ from pyscript.apps.temptamer.heatpump_dispatcher import (
     normalize_heat_setpoint,
     normalize_setpoint,
     resolve_fan_mode,
+    resolve_confirmed_cooling_fan_mode,
     resolve_heat_demand_fan_boost,
     resolve_hvac_start_fan_ramp_mode,
     resolve_idle_started_at,
@@ -418,7 +420,15 @@ class ComfortAdjustmentTests(unittest.TestCase):
         self.assertEqual(active.hvac_action, "idle")
         self.assertEqual(active.thermal_adjustments, active.raw_adjustments)
 
-        for inactive_mode in ("heat", "dry", "fan_only", "off"):
+        dry = self.calculate(
+            {**state_overrides, TEST_CLIMATE_ENTITY: "dry"},
+            {TEST_CLIMATE_ENTITY: {"hvac_action": "idle", "fan_mode": "auto"}},
+        )
+        self.assertEqual(dry.airflow_target_adjustments["office"], -0.4)
+        self.assertEqual(dry.fan_mode, "auto")
+        self.assertEqual(dry.fan_speed_level, 2)
+
+        for inactive_mode in ("heat", "fan_only", "off"):
             inactive = self.calculate(
                 {**state_overrides, TEST_CLIMATE_ENTITY: inactive_mode},
                 {TEST_CLIMATE_ENTITY: {"hvac_action": "cooling", "fan_mode": "Level 6"}},
@@ -1366,6 +1376,45 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(restored["office"], saved["office"])
 
+    def test_fabric_solar_state_concurrent_writes_use_independent_temp_files(self):
+        import json
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        barrier = Barrier(2)
+        real_json_dump = json.dump
+
+        def synchronized_dump(payload, state_file, **kwargs):
+            real_json_dump(payload, state_file, **kwargs)
+            barrier.wait(timeout=5)
+
+        payloads = (
+            {"version": 1, "values": {"fabric_solar_office": 10.0}},
+            {"version": 1, "values": {"fabric_solar_office": 20.0}},
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_file = Path(temporary_directory) / "fabric_solar.json"
+            with (
+                patch("json.dump", side_effect=synchronized_dump),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [
+                    executor.submit(
+                        temptamer_main._write_comfort_fabric_solar_filter_state,
+                        str(state_file),
+                        payload,
+                    )
+                    for payload in payloads
+                ]
+                write_errors = [future.result(timeout=5) for future in futures]
+
+            self.assertEqual(write_errors, [None, None])
+            self.assertIn(
+                json.loads(state_file.read_text(encoding="utf-8")),
+                payloads,
+            )
+            self.assertEqual(list(Path(temporary_directory).glob("*.tmp")), [])
+
     def test_cover_position_holds_last_valid_before_configured_fallback(self):
         first_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
         temptamer_main.RUNTIME_STATE["comfort_adjustment_last_valid_cover_positions"] = {}
@@ -1686,7 +1735,7 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
             )
             calculated_office = calculations[0].adjustments["office"]
 
-            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "7\n")
+            self.assertEqual(semantics_state_file.read_text(encoding="utf-8"), "9\n")
 
         self.assertEqual(published_office, calculated_office)
         self.assertNotEqual(published_office, 1.5)
@@ -1867,7 +1916,7 @@ class ComfortAdjustmentRuntimeTests(unittest.TestCase):
         ):
             temptamer_main.run_comfort_adjustment_pass(reason="test")
 
-        self.assertEqual(calculate.call_args.kwargs["reference_zone_targets"]["office"], (19.7, 20.5))
+        self.assertEqual(calculate.call_args.kwargs["reference_zone_targets"]["office"], (19.7, 21.0))
 
         self.assertIn(
             call(
@@ -2033,6 +2082,59 @@ class TempTamerTests(unittest.TestCase):
         temptamer_main.HEAT_DEMAND_FAN_BOOST_STATE_FILE = self.original_fan_boost_state_file
         self.fan_boost_state_directory.cleanup()
 
+    def test_startup_runs_comfort_pass_before_control(self):
+        events = []
+        with (
+            patch.object(
+                temptamer_main,
+                "_run_comfort_adjustment_pass",
+                side_effect=lambda **_kwargs: events.append("comfort") or True,
+            ),
+            patch.object(temptamer_main, "_control_is_enabled", return_value=True),
+            patch.object(temptamer_main, "_publish_runtime_state"),
+            patch.object(
+                temptamer_main,
+                "_run_enabled_control_pass",
+                side_effect=lambda **_kwargs: events.append("control"),
+            ),
+        ):
+            temptamer_main.temptamer_initialize()
+
+        self.assertEqual(events, ["comfort", "control"])
+
+    def test_control_passes_are_serialized_and_overlapping_triggers_are_coalesced(self):
+        events = []
+        temptamer_main.RUNTIME_STATE["control_pass_in_progress"] = False
+
+        def run_impl(*, reason, comfort_mode_changed=False):
+            events.append(("start", reason, comfort_mode_changed))
+            if reason == "outer":
+                temptamer_main.run_control_pass(
+                    reason="new telemetry",
+                    comfort_mode_changed=True,
+                )
+                temptamer_main.run_control_pass(reason="newer telemetry")
+            events.append(("end", reason, comfort_mode_changed))
+
+        with (
+            patch.object(temptamer_main, "_run_control_pass_impl", side_effect=run_impl),
+            patch.object(temptamer_main.task, "unique") as unique,
+        ):
+            temptamer_main.run_control_pass(reason="outer")
+
+        self.assertEqual(
+            events,
+            [
+                ("start", "outer", False),
+                ("end", "outer", False),
+                ("start", "newer telemetry", True),
+                ("end", "newer telemetry", True),
+            ],
+        )
+        self.assertFalse(temptamer_main.RUNTIME_STATE["control_pass_in_progress"])
+        self.assertFalse(temptamer_main.RUNTIME_STATE["control_pass_rerun_pending"])
+        unique.assert_called_once_with(temptamer_main.CONTROL_PASS_TASK_NAME)
+
     def test_build_snapshot_uses_house_sensor_fallback_and_zone_overrides(self):
         reader = FakeReader(
             base_state_map(
@@ -2084,7 +2186,7 @@ class TempTamerTests(unittest.TestCase):
         baseline_zone = baseline.zones["office"]
         adjusted_zone = adjusted.zones["office"]
 
-        self.assertEqual(adjusted.base_zone_targets["office"], (19.7, 20.5))
+        self.assertEqual(adjusted.base_zone_targets["office"], (19.7, 21.0))
         self.assertEqual(adjusted_zone.comfort_adjustment, 0.5)
         self.assertEqual(adjusted_zone.scheme.enable_outside, baseline_zone.scheme.enable_outside - 0.5)
         self.assertEqual(adjusted_zone.scheme.continue_until, baseline_zone.scheme.continue_until - 0.5)
@@ -2135,7 +2237,7 @@ class TempTamerTests(unittest.TestCase):
             current_setpoint="17.0",
         )
         self.assertTrue(demand.cool_requested)
-        self.assertEqual(plan.setpoint, 19)
+        self.assertEqual(plan.setpoint, 17)
 
     def test_comfort_adjustment_defaults_and_clamps_invalid_helper_values(self):
         unavailable = build_snapshot(
@@ -2161,7 +2263,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(positive.zones["office"].comfort_adjustment, 3.0)
         self.assertEqual(negative.zones["office"].comfort_adjustment, -3.0)
         self.assertEqual(positive.zones["office"].scheme.ideal_target, 16.7)
-        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 23.5)
+        self.assertEqual(negative.zones["office"].cool_scheme.ideal_target, 24.0)
 
     def test_global_setpoint_adjustment_uses_heating_sign_and_inverts_for_cooling(self):
         baseline = build_snapshot(FakeReader(base_state_map(), base_attr_map()))
@@ -2302,16 +2404,18 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(snapshot.zones["downstairs"].current_temp, 18.4)
         self.assertEqual(snapshot.zones["downstairs"].scheme.name, SCHEME_DOWNSTAIRS)
 
-    def test_downstairs_scheme_is_half_a_degree_above_day_living_for_heat_and_cool(self):
-        for control_schemes in (
-            DEFAULT_SYSTEM_CONFIG.heat_control_schemes,
-            DEFAULT_SYSTEM_CONFIG.cool_control_schemes,
-        ):
-            day_living_scheme = control_schemes[SCHEME_DAY_LIVING]
-            downstairs_scheme = control_schemes[SCHEME_DOWNSTAIRS]
-            self.assertEqual(downstairs_scheme.enable_outside, day_living_scheme.enable_outside + 0.5)
-            self.assertEqual(downstairs_scheme.continue_until, day_living_scheme.continue_until + 0.5)
-            self.assertEqual(downstairs_scheme.ideal_target, day_living_scheme.ideal_target + 0.5)
+    def test_downstairs_scheme_offsets_match_current_heat_and_cool_configuration(self):
+        heat_day_living = DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DAY_LIVING]
+        heat_downstairs = DEFAULT_SYSTEM_CONFIG.heat_control_schemes[SCHEME_DOWNSTAIRS]
+        self.assertEqual(heat_downstairs.enable_outside, heat_day_living.enable_outside + 0.5)
+        self.assertEqual(heat_downstairs.continue_until, heat_day_living.continue_until + 0.5)
+        self.assertEqual(heat_downstairs.ideal_target, heat_day_living.ideal_target + 0.5)
+
+        cool_day_living = DEFAULT_SYSTEM_CONFIG.cool_control_schemes[SCHEME_DAY_LIVING]
+        cool_downstairs = DEFAULT_SYSTEM_CONFIG.cool_control_schemes[SCHEME_DOWNSTAIRS]
+        self.assertEqual(cool_downstairs.enable_outside, cool_day_living.enable_outside)
+        self.assertEqual(cool_downstairs.continue_until, cool_day_living.continue_until)
+        self.assertEqual(cool_downstairs.ideal_target, cool_day_living.ideal_target)
 
     def test_default_comfort_modes_are_mode_objects(self):
         day_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes["Day"]
@@ -2917,7 +3021,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(
             resolve_fan_mode(
-                "Level 1",
+                "Level 2",
                 "heat",
                 demand,
                 open_zone_count=4,
@@ -4973,7 +5077,7 @@ class TempTamerTests(unittest.TestCase):
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(plan.hvac_mode, "cool")
         self.assertEqual(plan.requested_by_zones, ("office",))
-        self.assertEqual(plan.setpoint, 23)
+        self.assertEqual(plan.setpoint, 22)
 
     def test_active_cooling_mirrors_heat_with_inlet_relative_minimum_drive(self):
         snapshot = build_behavior_snapshot(
@@ -5031,20 +5135,32 @@ class TempTamerTests(unittest.TestCase):
         )
         demand = resolve_equipment_demand(snapshot, ("office",), operation_mode=HVAC_COOL)
 
-        plan = build_dispatch_plan(
-            snapshot,
-            demand,
-            ("office",),
-            current_hvac_mode="cool",
-            current_fan_mode="low",
-            target_temp_step=0.5,
-            supported_fan_modes=tuple(f"Level {level}" for level in range(1, 7)),
-        )
+        with self.assertLogs("pyscript.temptamer", level="INFO") as captured:
+            plan = build_dispatch_plan(
+                snapshot,
+                demand,
+                ("office",),
+                current_hvac_mode="cool",
+                current_fan_mode="low",
+                target_temp_step=0.5,
+                supported_fan_modes=tuple(f"Level {level}" for level in range(1, 7)),
+            )
 
         self.assertTrue(demand.cool_requested)
         self.assertAlmostEqual(demand.max_temperature_deficit, 0.5)
-        self.assertEqual(plan.setpoint, 21)
+        self.assertEqual(demand.qualification_temperature, 22.3)
+        self.assertEqual(demand.severity_temperature, 21.5)
+        self.assertEqual(demand.severity_target_temperature, 21.0)
+        self.assertEqual(plan.setpoint, 21.5)
         self.assertEqual(plan.fan_mode, "Level 3")
+        self.assertTrue(
+            any(
+                "qualification_temperature=22.3" in message
+                and "severity_temperature=21.5" in message
+                and "cooling_excess=0.5" in message
+                for message in captured.output
+            )
+        )
 
     def test_maintain_cooling_uses_inlet_setpoint_when_zone_is_closer_to_ideal(self):
         snapshot = build_behavior_snapshot(
@@ -5468,6 +5584,38 @@ class TempTamerTests(unittest.TestCase):
         self.assertTrue(demand.maintain_cool_mode)
         self.assertEqual(demand.requested_by_zones, ("office",))
         self.assertEqual(demand.max_temperature_deficit, 0.0)
+
+    def test_maximum_sensor_can_open_zone_without_increasing_cooling_severity(self):
+        now = datetime(2026, 5, 7, 12, 10, tzinfo=timezone.utc)
+        snapshot = build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_hvac_mode": "Cool",
+                        "input_select.temptamer_comfort_mode": "Office",
+                        "sensor.office_average_temperature": "21.1",
+                        "sensor.office_minimum_temperature": "20.1",
+                        "sensor.office_maximum_temperature": "22.6",
+                        "sensor.average_dining_zone_temp": "13.0",
+                        "sensor.average_bed1_2_zone_temp": "13.0",
+                        "sensor.average_bed3_4_zone_temp": "13.0",
+                        "switch.wt32_hpctrl_e8dbd0_office": "off",
+                    }
+                ),
+                base_attr_map("21.0"),
+            ),
+            now=now,
+        )
+
+        actions, predicted_open = resolve_zone_actions(snapshot, now, operation_mode=HVAC_COOL)
+        demand = resolve_equipment_demand(snapshot, predicted_open, operation_mode=HVAC_COOL)
+
+        self.assertTrue(any(action.zone_key == "office" and action.turn_on for action in actions))
+        self.assertIn("office", predicted_open)
+        self.assertTrue(demand.cool_requested)
+        self.assertEqual(demand.qualification_temperature, 22.6)
+        self.assertEqual(demand.severity_temperature, 21.1)
+        self.assertAlmostEqual(demand.max_temperature_deficit, 0.1)
 
     def test_cooling_ignores_maximum_sensor_when_minimum_is_below_continue_threshold(self):
         snapshot = build_behavior_snapshot(
@@ -7098,6 +7246,47 @@ class TempTamerTests(unittest.TestCase):
         self.assertFalse(service_call.called)
         self.assertEqual(temptamer_main.state.get(temptamer_main.STATUS_ENTITY_ID), "manual")
 
+    def test_manual_mode_never_turns_off_an_automatically_started_dry_cycle(self):
+        now = datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc)
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.RUNTIME_STATE["powerday_dry_active"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_entry_kind"] = "cooling_substitution"
+        temptamer_main.RUNTIME_STATE["powerday_dry_started_at"] = now - timedelta(minutes=5)
+        temptamer_main.state._values.update(
+            base_state_map(
+                **{
+                    "input_select.temptamer_hvac_mode": "Manual",
+                    "switch.wt32_hpctrl_e8dbd0_office": "on",
+                    TEST_CLIMATE_ENTITY: HVAC_DRY,
+                }
+            )
+        )
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "fan_mode": "Level 3",
+            "temperature": 19,
+            "current_temperature": 19,
+        }
+        service_call = Mock()
+        temptamer_main.service.call = service_call
+
+        with (
+            patch.object(temptamer_main, "_system_now", return_value=now),
+            patch.object(temptamer_main, "_persist_powerday_dry_cycle_state"),
+        ):
+            temptamer_main.run_control_pass(reason="manual dry ownership test")
+
+        self.assertFalse(service_call.called)
+        self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+        self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_completed"])
+        self.assertFalse(
+            temptamer_main.RUNTIME_STATE["powerday_dry_heat_transition_pending_off"]
+        )
+        self.assertEqual(temptamer_main.state.get(temptamer_main.STATUS_ENTITY_ID), "manual")
+
     def test_run_control_pass_uses_supported_level_fan_modes(self):
         temptamer_main.state._values.clear()
         temptamer_main.state._attrs.clear()
@@ -7858,6 +8047,67 @@ class TempTamerTests(unittest.TestCase):
             "Level 2",
         )
 
+    def test_cooling_fan_increase_requires_two_matching_passes(self):
+        now = datetime(2026, 9, 25, 13, 49, 33, tzinfo=timezone.utc)
+
+        first = resolve_confirmed_cooling_fan_mode(
+            "Level 6",
+            "Level 3",
+            None,
+            None,
+            0,
+            now=now,
+        )
+        second = resolve_confirmed_cooling_fan_mode(
+            "Level 6",
+            "Level 3",
+            first[1],
+            first[2],
+            first[3],
+            now=now + timedelta(seconds=1),
+        )
+
+        self.assertEqual(first[0], "Level 3")
+        self.assertFalse(first[4])
+        self.assertEqual(second[0], "Level 6")
+        self.assertTrue(second[4])
+
+    def test_cooling_fan_increase_confirms_after_thirty_seconds(self):
+        started_at = datetime(2026, 9, 25, 13, 49, 0, tzinfo=timezone.utc)
+
+        selected, pending, pending_since, passes, confirmed = (
+            resolve_confirmed_cooling_fan_mode(
+                "Level 6",
+                "Level 3",
+                "Level 6",
+                started_at,
+                1,
+                now=started_at + timedelta(seconds=30),
+            )
+        )
+
+        self.assertEqual(selected, "Level 6")
+        self.assertIsNone(pending)
+        self.assertIsNone(pending_since)
+        self.assertEqual(passes, 0)
+        self.assertTrue(confirmed)
+
+    def test_cooling_fan_reduction_bypasses_increase_confirmation(self):
+        selected, pending, started_at, passes, confirmed = resolve_confirmed_cooling_fan_mode(
+            "Level 3",
+            "Level 6",
+            "Level 6",
+            datetime(2026, 9, 25, 13, 49, 0, tzinfo=timezone.utc),
+            1,
+            now=datetime(2026, 9, 25, 13, 49, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(selected, "Level 3")
+        self.assertIsNone(pending)
+        self.assertIsNone(started_at)
+        self.assertEqual(passes, 0)
+        self.assertFalse(confirmed)
+
     def test_powerday_free_power_fan_thresholds_do_not_apply_to_cooling(self):
         power_mode = DEFAULT_SYSTEM_CONFIG.comfort_modes[COMFORT_MODE_POWER_DAY]
 
@@ -8199,7 +8449,7 @@ class TempTamerTests(unittest.TestCase):
                 **{
                     "input_select.temptamer_comfort_mode": "Office",
                     "input_select.temptamer_hvac_mode": "Cool",
-                    "sensor.office_average_temperature": "22.0",
+                    "sensor.office_average_temperature": "22.1",
                     "sensor.average_dining_zone_temp": "14.0",
                     "sensor.average_bed1_2_zone_temp": "13.0",
                     "sensor.average_bed3_4_zone_temp": "13.0",
@@ -8224,19 +8474,19 @@ class TempTamerTests(unittest.TestCase):
 
             # Falling below enable but remaining above ideal is valid maintain.
             current_now[0] += timedelta(minutes=1)
-            temptamer_main.state._values["sensor.office_average_temperature"] = "21.0"
+            temptamer_main.state._values["sensor.office_average_temperature"] = "21.5"
             temptamer_main.run_control_pass(reason="cooling latch maintain test")
             self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
 
             # Reaching ideal enters idle and clears the cycle latch.
             current_now[0] += timedelta(minutes=1)
-            temptamer_main.state._values["sensor.office_average_temperature"] = "20.5"
+            temptamer_main.state._values["sensor.office_average_temperature"] = "21.0"
             temptamer_main.run_control_pass(reason="cooling latch idle test")
             self.assertFalse(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
 
             # Moving above ideal alone cannot restart maintain-cool from idle.
             current_now[0] += timedelta(minutes=1)
-            temptamer_main.state._values["sensor.office_average_temperature"] = "21.0"
+            temptamer_main.state._values["sensor.office_average_temperature"] = "21.5"
             temptamer_main.run_control_pass(reason="cooling latch reentry test")
             self.assertFalse(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
             self.assertTrue(
@@ -8395,7 +8645,7 @@ class TempTamerTests(unittest.TestCase):
 
         self.assertEqual(
             resolve_fan_mode(
-                "Level 2",
+                "Level 1",
                 "heat",
                 demand,
                 open_zone_count=3,
@@ -9032,6 +9282,172 @@ class PowerDayForecastTests(unittest.TestCase):
         self.assertFalse(blocked_temperature.eligible)
         self.assertIn("start floor", blocked_temperature.reason)
 
+    def test_low_cooling_demand_can_use_free_or_battery_energy_with_hysteresis(self):
+        free_snapshot = self._snapshot(level=POWERDAY_HEATSOAK_FULL, hvac_mode="Cool", temperature=23.0)
+        battery_snapshot = replace(
+            free_snapshot,
+            free_power_available=False,
+            battery_free_power_boost_available=True,
+        )
+        no_energy_snapshot = replace(
+            battery_snapshot,
+            battery_free_power_boost_available=False,
+        )
+
+        def decide(snapshot, excess, *, active=False, heat_safe=True):
+            return resolve_powerday_dehumidification(
+                snapshot,
+                self._assessment(level=POWERDAY_HEATSOAK_FULL),
+                indoor_humidity=51.0,
+                supported_hvac_modes=("cool", "dry"),
+                has_thermal_demand=True,
+                heat_forecast_safe=heat_safe,
+                cool_forecast_safe=False,
+                cycle_completed=False,
+                currently_active=active,
+                cooling_demand=True,
+                cooling_excess_celsius=excess,
+                cooling_zone_keys=("office",),
+                active_entry_kind="cooling_substitution" if active else None,
+            )
+
+        free = decide(free_snapshot, 1.74)
+        battery = decide(battery_snapshot, 1.74)
+        no_energy = decide(no_energy_snapshot, 1.74)
+        entry_boundary = decide(free_snapshot, 1.75)
+        held = decide(free_snapshot, 1.99, active=True)
+        pending_exit = resolve_powerday_dehumidification(
+            free_snapshot,
+            self._assessment(level=POWERDAY_HEATSOAK_FULL),
+            indoor_humidity=51.0,
+            supported_hvac_modes=("cool", "dry"),
+            has_thermal_demand=True,
+            heat_forecast_safe=True,
+            cool_forecast_safe=False,
+            cycle_completed=False,
+            currently_active=True,
+            cooling_demand=True,
+            cooling_excess_celsius=2.0,
+            cooling_zone_keys=("office",),
+            active_entry_kind="cooling_substitution",
+            cooling_exit_confirmed=False,
+        )
+        exit_boundary = decide(free_snapshot, 2.0, active=True)
+        heatcool_imminent_heat = decide(
+            replace(free_snapshot, selected_hvac_mode="HeatCool"),
+            1.0,
+            heat_safe=False,
+        )
+
+        self.assertTrue(free.eligible)
+        self.assertEqual(free.entry_kind, "cooling_substitution")
+        self.assertEqual(free.energy_source, "free_power")
+        self.assertTrue(battery.eligible)
+        self.assertEqual(battery.energy_source, "battery_latch")
+        self.assertFalse(no_energy.eligible)
+        self.assertFalse(entry_boundary.eligible)
+        self.assertTrue(held.eligible)
+        self.assertTrue(pending_exit.eligible)
+        self.assertIn("confirmation pending", pending_exit.reason)
+        self.assertFalse(exit_boundary.eligible)
+        self.assertEqual(exit_boundary.cooling_threshold_celsius, 2.0)
+        self.assertFalse(heatcool_imminent_heat.eligible)
+        self.assertIn("heating demand", heatcool_imminent_heat.reason)
+
+    def test_active_cooling_substitution_survives_zone_expansion_but_not_safety_exit(self):
+        snapshot = self._snapshot(level=POWERDAY_HEATSOAK_FULL, hvac_mode="Cool", temperature=23.0)
+        expanded_zones = resolve_powerday_dehumidification(
+            snapshot,
+            self._assessment(level=POWERDAY_HEATSOAK_FULL),
+            indoor_humidity=51.0,
+            supported_hvac_modes=("cool", "dry"),
+            has_thermal_demand=True,
+            heat_forecast_safe=True,
+            cool_forecast_safe=False,
+            cycle_completed=False,
+            currently_active=True,
+            cooling_demand=True,
+            cooling_excess_celsius=1.0,
+            cooling_zone_keys=("office", "bedroom_3_4"),
+            active_entry_kind="cooling_substitution",
+            cooling_exit_confirmed=False,
+        )
+        humidity_safety_exit = resolve_powerday_dehumidification(
+            snapshot,
+            self._assessment(level=POWERDAY_HEATSOAK_FULL),
+            indoor_humidity=45.0,
+            supported_hvac_modes=("cool", "dry"),
+            has_thermal_demand=True,
+            heat_forecast_safe=True,
+            cool_forecast_safe=False,
+            cycle_completed=False,
+            currently_active=True,
+            cooling_demand=True,
+            cooling_excess_celsius=2.1,
+            cooling_zone_keys=("office", "bedroom_3_4"),
+            active_entry_kind="cooling_substitution",
+            cooling_exit_confirmed=False,
+        )
+
+        self.assertTrue(expanded_zones.eligible)
+        self.assertEqual(expanded_zones.entry_kind, "cooling_substitution")
+        self.assertFalse(humidity_safety_exit.eligible)
+        self.assertIn("humidity gate is false", humidity_safety_exit.reason)
+
+    def test_low_cooling_dry_reports_only_planned_zone_temperature(self):
+        snapshot = self._snapshot(hvac_mode="Cool", temperature=23.0)
+        zones = dict(snapshot.zones)
+        zones["bedroom_3_4"] = replace(
+            zones["bedroom_3_4"],
+            current_temp=18.0,
+            min_temp=18.0,
+        )
+        snapshot = replace(snapshot, zones=zones)
+
+        decision = resolve_powerday_dehumidification(
+            snapshot,
+            self._assessment(),
+            indoor_humidity=51.0,
+            supported_hvac_modes=("cool", "dry"),
+            has_thermal_demand=True,
+            heat_forecast_safe=True,
+            cool_forecast_safe=False,
+            cycle_completed=False,
+            currently_active=False,
+            cooling_demand=True,
+            cooling_excess_celsius=1.0,
+            cooling_zone_keys=("office",),
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.coldest_target_zone_celsius, 23.0)
+
+    def test_low_cooling_dry_does_not_apply_idle_temperature_floors(self):
+        snapshot = self._snapshot(hvac_mode="Cool", temperature=19.0)
+
+        for active in (False, True):
+            with self.subTest(active=active):
+                decision = resolve_powerday_dehumidification(
+                    snapshot,
+                    self._assessment(),
+                    indoor_humidity=51.0,
+                    supported_hvac_modes=("cool", "dry"),
+                    has_thermal_demand=True,
+                    heat_forecast_safe=True,
+                    cool_forecast_safe=False,
+                    cycle_completed=False,
+                    currently_active=active,
+                    cooling_demand=True,
+                    cooling_excess_celsius=1.0,
+                    cooling_zone_keys=("office",),
+                    active_entry_kind="cooling_substitution" if active else None,
+                )
+
+                self.assertTrue(decision.eligible)
+                self.assertEqual(decision.entry_kind, "cooling_substitution")
+                self.assertEqual(decision.coldest_target_zone_celsius, 19.0)
+                self.assertNotIn("floor", decision.reason)
+
     def test_dehumidification_heatcool_requires_both_forecasts_to_be_safe(self):
         snapshot = self._snapshot(hvac_mode="HeatCool")
         for heat_safe, cool_safe, expected in ((True, True, True), (False, True, False), (True, False, False)):
@@ -9057,7 +9473,7 @@ class PowerDayForecastTests(unittest.TestCase):
             (replace(snapshot, free_power_heat_soak_level=POWERDAY_HEATSOAK_REDUCED), ("heat", "dry"), False, False, "reduced"),
             (snapshot, ("heat",), False, False, "does not advertise"),
             (snapshot, ("heat", "dry"), True, False, "takes priority"),
-            (snapshot, ("heat", "dry"), False, True, "already complete"),
+            (snapshot, ("heat", "dry"), False, True, "cooldown"),
             (replace(snapshot, selected_hvac_mode="Off"), ("heat", "dry"), False, False, "does not allow"),
             (replace(snapshot, selected_hvac_mode="Manual"), ("heat", "dry"), False, False, "does not allow"),
         )
@@ -9242,6 +9658,163 @@ class PowerDayForecastTests(unittest.TestCase):
         self.assertFalse(any(command.args[1] == "set_fan_mode" for command in climate_commands))
         self.assertFalse(any(command.args[1] == "set_temperature" for command in climate_commands))
 
+    def test_substituted_dry_dispatch_leaves_fan_on_device_auto_without_setpoint(self):
+        snapshot = self._snapshot(hvac_mode="Cool", temperature=23.0)
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(dry_requested=True, requested_by_zones=("office",)),
+            ("office",),
+            current_hvac_mode=HVAC_COOL,
+            current_fan_mode="Level 1",
+            current_setpoint=19.0,
+        )
+
+        self.assertEqual(plan.hvac_mode, HVAC_DRY)
+        self.assertIsNone(plan.fan_mode)
+        self.assertIsNone(plan.setpoint)
+        self.assertEqual(plan.open_zones, ("office",))
+
+    def test_substituted_dry_strips_any_accidental_fan_request(self):
+        now = datetime(2026, 9, 25, 13, 49, 0, tzinfo=timezone.utc)
+        plan = DispatchPlan(
+            hvac_mode=HVAC_DRY,
+            fan_mode="Level 3",
+            open_zones=("office",),
+        )
+        temptamer_main.RUNTIME_STATE["powerday_dry_active"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_entry_kind"] = "cooling_substitution"
+        temptamer_main.RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = "Level 3"
+
+        stabilized = temptamer_main._stabilize_cooling_fan_plan(
+            plan,
+            current_hvac_mode=HVAC_DRY,
+            current_fan_mode="auto",
+            now=now,
+        )
+
+        self.assertIsNone(stabilized.fan_mode)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_dry_cooling_fan_mode"], "Level 3")
+
+    def test_control_pass_substitutes_low_cooling_and_returns_directly_to_cool(self):
+        now = datetime(2026, 9, 12, 11, 0, tzinfo=timezone.utc)
+        states = base_state_map(**{
+            "input_select.temptamer_comfort_mode": COMFORT_MODE_POWER_DAY,
+            "input_select.temptamer_hvac_mode": "Cool",
+            GOODWE_CURRENT_ELECTRICITY_PRICE_SENSOR: "0",
+            GOODWE_BATTERY_REMAINING_SENSOR: "50",
+            "sensor.climate_indoor_humidity": "51.0",
+            "sensor.home_temperature": "21.0",
+            "sensor.office_average_temperature": "22.1",
+            "sensor.average_dining_zone_temp": "16.5",
+            "sensor.downstairs_zone_average_temperature": "20.0",
+            "sensor.average_bed1_2_zone_temp": "20.0",
+            "sensor.average_bed3_4_zone_temp": "20.0",
+            "switch.wt32_hpctrl_e8dbd0_office": "on",
+            TEST_CLIMATE_ENTITY: HVAC_COOL,
+        })
+        temptamer_main.state._values.clear()
+        temptamer_main.state._attrs.clear()
+        temptamer_main.state._values.update(states)
+        temptamer_main.state._attrs[TEST_CLIMATE_ENTITY] = {
+            "current_temperature": 21.0,
+            "temperature": 19.0,
+            "target_temp_step": 0.5,
+            "fan_mode": "Level 6",
+            "fan_modes": [f"Level {level}" for level in range(1, 7)],
+            "hvac_modes": ["off", "heat", "cool", "dry"],
+        }
+        temptamer_main.RUNTIME_STATE.clear()
+        temptamer_main.RUNTIME_STATE.update(deepcopy(self.original_runtime_state))
+        temptamer_main.RUNTIME_STATE["last_successful_control_pass"] = now - timedelta(minutes=1)
+        temptamer_main.RUNTIME_STATE["powerday_dry_restore_checked"] = True
+        service_mock = Mock()
+        temptamer_main.service.call = service_mock
+
+        with (
+            patch.object(temptamer_main, "_system_now", return_value=now),
+            patch.object(
+                temptamer_main,
+                "_resolve_powerday_forecast_assessment",
+                return_value=self._assessment(level=POWERDAY_HEATSOAK_FULL),
+            ),
+            patch.object(temptamer_main, "_forecast_safe_for_operation", return_value=True),
+            patch.object(temptamer_main, "_persist_powerday_dry_cycle_state"),
+            patch.object(temptamer_main, "_restore_heat_demand_fan_boost_state"),
+            patch.object(temptamer_main, "_persist_heat_demand_fan_boost_state"),
+        ):
+            temptamer_main.run_control_pass(reason="low-cooling dry entry")
+
+            self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+            self.assertEqual(
+                temptamer_main.RUNTIME_STATE["powerday_dry_entry_kind"],
+                "cooling_substitution",
+            )
+            self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+            self.assertEqual(
+                temptamer_main.RUNTIME_STATE["powerday_dry_cooling_fan_mode"],
+                "Level 1",
+            )
+            self.assertEqual(
+                temptamer_main.RUNTIME_STATE["powerday_dry_boundary_scheduled_at"],
+                now + timedelta(seconds=POWERDAY_DRY_MAX_SECONDS),
+            )
+            self.assertIn(
+                call(
+                    "climate",
+                    "set_hvac_mode",
+                    blocking=True,
+                    entity_id=TEST_CLIMATE_ENTITY,
+                    hvac_mode=HVAC_DRY,
+                ),
+                service_mock.call_args_list,
+            )
+            self.assertFalse(
+                any(
+                    command.args[:2] == ("climate", "set_fan_mode")
+                    for command in service_mock.call_args_list
+                )
+            )
+            opened_zone_entities = {
+                command.kwargs.get("entity_id")
+                for command in service_mock.call_args_list
+                if command.args[:2] == ("switch", "turn_on")
+            }
+            self.assertFalse(opened_zone_entities)
+
+            service_mock.reset_mock()
+            temptamer_main.state._values[TEST_CLIMATE_ENTITY] = HVAC_DRY
+            temptamer_main.state._values["sensor.office_average_temperature"] = "23.0"
+            temptamer_main.run_control_pass(reason="low-cooling dry exit")
+            self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+            self.assertEqual(
+                temptamer_main.RUNTIME_STATE["powerday_dry_high_demand_passes"],
+                1,
+            )
+            temptamer_main.run_control_pass(reason="confirmed low-cooling dry exit")
+
+        self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+        self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_dry_completed"])
+        self.assertIsNotNone(temptamer_main.RUNTIME_STATE["powerday_dry_cooldown_until"])
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["powerday_dry_boundary_scheduled_at"],
+            temptamer_main.RUNTIME_STATE["powerday_dry_cooldown_until"],
+        )
+        self.assertTrue(temptamer_main.RUNTIME_STATE["cooling_cycle_active"])
+        self.assertIn("cooling excess", temptamer_main.RUNTIME_STATE["powerday_dry_direct_exit_reason"])
+        self.assertIn(
+            call(
+                "climate",
+                "set_hvac_mode",
+                blocking=True,
+                entity_id=TEST_CLIMATE_ENTITY,
+                hvac_mode=HVAC_COOL,
+            ),
+            service_mock.call_args_list,
+        )
+        self.assertFalse(
+            any(command.args[:2] == ("climate", "turn_off") for command in service_mock.call_args_list)
+        )
+
     def test_heat_to_dry_waits_five_minutes_and_dry_stops_at_maximum_runtime(self):
         now = datetime(2026, 9, 12, 11, 0, tzinfo=timezone.utc)
         snapshot = self._snapshot(humidity=51.0, temperature=23.0)
@@ -9314,6 +9887,49 @@ class PowerDayForecastTests(unittest.TestCase):
                 dry_started_at + timedelta(seconds=POWERDAY_DRY_MAX_SECONDS),
             )
             self.assertIn("maximum dry runtime", decision.reason)
+
+    def test_completed_dry_cycle_restarts_after_shared_cooldown(self):
+        now = datetime(2026, 9, 12, 11, 0, tzinfo=timezone.utc)
+        snapshot = self._snapshot(humidity=51.0, temperature=23.0)
+        controller = FakeReader(
+            base_state_map(**{"sensor.climate_indoor_humidity": "51.0"}),
+            base_attr_map("21.0"),
+        )
+        temptamer_main.RUNTIME_STATE["powerday_dry_completed"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_completed_at"] = now
+        temptamer_main.RUNTIME_STATE["powerday_dry_cooldown_until"] = now + timedelta(
+            seconds=POWERDAY_DRY_COOLDOWN_SECONDS
+        )
+        with (
+            patch.object(temptamer_main, "_forecast_safe_for_operation", return_value=True),
+            patch.object(temptamer_main, "_persist_powerday_dry_cycle_state"),
+        ):
+            blocked, _turn_off, blocked_decision = temptamer_main._resolve_powerday_dry_request(
+                controller,
+                snapshot,
+                EquipmentDemand(reason="idle"),
+                self._assessment(),
+                weather_points=(),
+                supported_hvac_modes=("heat", "dry"),
+                current_hvac_mode="off",
+                now=now + timedelta(seconds=POWERDAY_DRY_COOLDOWN_SECONDS - 1),
+            )
+            restarted, _turn_off, restarted_decision = temptamer_main._resolve_powerday_dry_request(
+                controller,
+                snapshot,
+                EquipmentDemand(reason="idle"),
+                self._assessment(),
+                weather_points=(),
+                supported_hvac_modes=("heat", "dry"),
+                current_hvac_mode="off",
+                now=now + timedelta(seconds=POWERDAY_DRY_COOLDOWN_SECONDS),
+            )
+
+        self.assertFalse(blocked)
+        self.assertIn("cooldown", blocked_decision.reason)
+        self.assertTrue(restarted)
+        self.assertTrue(restarted_decision.eligible)
+        self.assertEqual(temptamer_main.RUNTIME_STATE["powerday_dry_entry_kind"], "idle")
 
     def test_restored_dry_cycle_fails_safe_for_missing_start_or_observed_heat(self):
         now = datetime(2026, 9, 12, 11, 0, tzinfo=timezone.utc)
@@ -9456,6 +10072,28 @@ class PowerDayForecastTests(unittest.TestCase):
         self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_completed"])
         self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_free_power_period_active"])
         persist.assert_called_once()
+
+    def test_battery_latch_keeps_dry_energy_opportunity_active_after_free_power(self):
+        temptamer_main.RUNTIME_STATE["powerday_dry_restore_checked"] = True
+        temptamer_main.RUNTIME_STATE["powerday_free_power_period_active"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_energy_opportunity_active"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_active"] = True
+        temptamer_main.RUNTIME_STATE["powerday_dry_entry_kind"] = "cooling_substitution"
+        with patch.object(temptamer_main, "_persist_powerday_dry_cycle_state") as persist:
+            temptamer_main._sync_powerday_free_power_period(False, True, True)
+
+            self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+            self.assertTrue(temptamer_main.RUNTIME_STATE["powerday_dry_energy_opportunity_active"])
+
+            temptamer_main._sync_powerday_free_power_period(False, False, True)
+
+        self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_active"])
+        self.assertFalse(temptamer_main.RUNTIME_STATE["powerday_dry_energy_opportunity_active"])
+        self.assertEqual(
+            temptamer_main.RUNTIME_STATE["powerday_dry_direct_exit_reason"],
+            "dry-energy opportunity ended",
+        )
+        self.assertEqual(persist.call_count, 2)
 
 
 class IdleDemandForecastTests(unittest.TestCase):
