@@ -109,6 +109,7 @@ from .idle_demand_forecast import (
     forecast_idle_demand,
     parse_hourly_weather_forecast,
 )
+from .idle_mixing import IdleMixingDecision, resolve_idle_mixing
 from .models import DispatchPlan, EquipmentDemand
 from .powerday_forecast import (
     DehumidificationDecision,
@@ -117,7 +118,12 @@ from .powerday_forecast import (
     resolve_powerday_dehumidification,
 )
 from .state_reader import build_snapshot, is_switch_on, parse_float
-from .zone_control import describe_zone_predictions, resolve_dry_zone_actions, resolve_zone_actions
+from .zone_control import (
+    describe_zone_predictions,
+    resolve_dry_zone_actions,
+    resolve_idle_mixing_zone_actions,
+    resolve_zone_actions,
+)
 
 USING_PYTHON_IMPORTS = __name__.startswith("pyscript.") or __name__ == "__main__"
 
@@ -264,6 +270,14 @@ RUNTIME_STATE: dict[str, Any] = {
     "idle_shutdown_at": None,
     "idle_shutdown_heat_step": None,
     "idle_shutdown_zone_key": None,
+    "idle_mixing_active": False,
+    "idle_mixing_started_at": None,
+    "idle_mixing_cooldown_until": None,
+    "idle_mixing_reason": None,
+    "idle_mixing_office_temperature": None,
+    "idle_mixing_downstairs_temperature": None,
+    "idle_mixing_office_excess": None,
+    "idle_mixing_temperature_spread": None,
     "last_fan_speed_decrease_at": None,
     "hvac_off_started_at": None,
     "hvac_start_fan_ramp_started_at": None,
@@ -503,10 +517,22 @@ def _has_active_equipment_demand(demand) -> bool:
         demand.heat_requested
         or demand.cool_requested
         or demand.fan_only_requested
+        or demand.circulation_requested
         or demand.dry_requested
         or demand.maintain_heat_mode
         or demand.maintain_cool_mode
     )
+
+
+def _record_idle_mixing_decision(decision: IdleMixingDecision) -> None:
+    RUNTIME_STATE["idle_mixing_active"] = decision.active
+    RUNTIME_STATE["idle_mixing_started_at"] = decision.started_at
+    RUNTIME_STATE["idle_mixing_cooldown_until"] = decision.cooldown_until
+    RUNTIME_STATE["idle_mixing_reason"] = decision.reason
+    RUNTIME_STATE["idle_mixing_office_temperature"] = decision.office_temperature
+    RUNTIME_STATE["idle_mixing_downstairs_temperature"] = decision.downstairs_temperature
+    RUNTIME_STATE["idle_mixing_office_excess"] = decision.office_excess
+    RUNTIME_STATE["idle_mixing_temperature_spread"] = decision.temperature_spread
 
 
 def _resolve_idle_demand_forecast(
@@ -1754,6 +1780,14 @@ def _publish_runtime_state(status: str) -> None:
             "idle_shutdown_at": _isoformat(RUNTIME_STATE.get("idle_shutdown_at")),
             "idle_shutdown_heat_step": RUNTIME_STATE.get("idle_shutdown_heat_step"),
             "idle_shutdown_zone_key": RUNTIME_STATE.get("idle_shutdown_zone_key"),
+            "idle_mixing_active": bool(RUNTIME_STATE.get("idle_mixing_active")),
+            "idle_mixing_started_at": _isoformat(RUNTIME_STATE.get("idle_mixing_started_at")),
+            "idle_mixing_cooldown_until": _isoformat(RUNTIME_STATE.get("idle_mixing_cooldown_until")),
+            "idle_mixing_reason": RUNTIME_STATE.get("idle_mixing_reason"),
+            "idle_mixing_office_temperature": RUNTIME_STATE.get("idle_mixing_office_temperature"),
+            "idle_mixing_downstairs_temperature": RUNTIME_STATE.get("idle_mixing_downstairs_temperature"),
+            "idle_mixing_office_excess": RUNTIME_STATE.get("idle_mixing_office_excess"),
+            "idle_mixing_temperature_spread": RUNTIME_STATE.get("idle_mixing_temperature_spread"),
             "idle_demand_forecast_generated_at": _isoformat(
                 idle_demand_forecast.generated_at if idle_demand_forecast is not None else None
             ),
@@ -1948,6 +1982,8 @@ def _reconcile_pending_zone_state(controller: PyscriptController, now: datetime)
 
 
 def _update_idle_heat_runtime_state(plan, now: datetime) -> None:
+    if plan.circulation:
+        return
     if not (plan.idle and plan.hvac_mode == HVAC_HEAT and plan.open_zones):
         RUNTIME_STATE["idle_heat_step"] = None
         RUNTIME_STATE["idle_heat_step_changed_at"] = None
@@ -3793,6 +3829,14 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     RUNTIME_STATE.setdefault("idle_shutdown_at", None)
     RUNTIME_STATE.setdefault("idle_shutdown_heat_step", None)
     RUNTIME_STATE.setdefault("idle_shutdown_zone_key", None)
+    RUNTIME_STATE.setdefault("idle_mixing_active", False)
+    RUNTIME_STATE.setdefault("idle_mixing_started_at", None)
+    RUNTIME_STATE.setdefault("idle_mixing_cooldown_until", None)
+    RUNTIME_STATE.setdefault("idle_mixing_reason", None)
+    RUNTIME_STATE.setdefault("idle_mixing_office_temperature", None)
+    RUNTIME_STATE.setdefault("idle_mixing_downstairs_temperature", None)
+    RUNTIME_STATE.setdefault("idle_mixing_office_excess", None)
+    RUNTIME_STATE.setdefault("idle_mixing_temperature_spread", None)
     RUNTIME_STATE.setdefault("immediate_shutdown_zone_close_not_before", None)
     RUNTIME_STATE.setdefault("last_heatcool_request_at", None)
     RUNTIME_STATE.setdefault("cooling_cycle_active", False)
@@ -4210,6 +4254,58 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     RUNTIME_STATE["idle_demand_forecast"] = idle_demand_forecast
     dispatch_plan_kwargs["idle_demand_forecast"] = idle_demand_forecast
     if dry_transition_turn_off:
+        mixing_decision = IdleMixingDecision(
+            active=False,
+            zone_keys=(),
+            started_at=None,
+            cooldown_until=RUNTIME_STATE.get("idle_mixing_cooldown_until"),
+            office_temperature=None,
+            downstairs_temperature=None,
+            office_excess=None,
+            temperature_spread=None,
+            reason="heat-to-dry transition takes priority over idle mixing",
+        )
+    else:
+        mixing_decision = resolve_idle_mixing(
+            snapshot,
+            demand,
+            operation_mode=operating_mode,
+            supported_hvac_modes=supported_hvac_modes,
+            idle_started_at=RUNTIME_STATE.get("idle_started_at"),
+            active=bool(RUNTIME_STATE.get("idle_mixing_active")),
+            started_at=RUNTIME_STATE.get("idle_mixing_started_at"),
+            cooldown_until=RUNTIME_STATE.get("idle_mixing_cooldown_until"),
+            now=now,
+        )
+    if mixing_decision.active:
+        (
+            zone_actions,
+            predicted_open_zones,
+            mixing_airflow_ready,
+            mixing_airflow_reason,
+        ) = resolve_idle_mixing_zone_actions(
+            snapshot,
+            now,
+            zone_actions,
+            predicted_open_zones,
+            mixing_decision.zone_keys,
+        )
+        if mixing_airflow_ready:
+            demand = EquipmentDemand(
+                circulation_requested=True,
+                requested_by_zones=mixing_decision.zone_keys,
+                reason=mixing_decision.reason,
+            )
+        else:
+            mixing_decision = replace(
+                mixing_decision,
+                active=False,
+                zone_keys=(),
+                started_at=None,
+                reason=f"{mixing_decision.reason}; {mixing_airflow_reason}",
+            )
+    _record_idle_mixing_decision(mixing_decision)
+    if dry_transition_turn_off:
         zone_actions = [action for action in zone_actions if action.turn_on]
         predicted_open_zones = _reported_open_zones(snapshot)
         plan = DispatchPlan(
@@ -4388,7 +4484,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     )
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s cooling_cycle_active=%s qualification_temperature=%s severity_zone=%s severity_temperature=%s severity_target=%s cooling_excess=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s circulation=%s cooling_cycle_active=%s qualification_temperature=%s severity_zone=%s severity_temperature=%s severity_target=%s cooling_excess=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -4396,6 +4492,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         ",".join(plan.requested_by_zones) if plan.requested_by_zones else "none",
         plan.hvac_mode or "off",
         plan.idle,
+        plan.circulation,
         RUNTIME_STATE["cooling_cycle_active"],
         normal_demand.qualification_temperature,
         normal_demand.severity_zone_key,

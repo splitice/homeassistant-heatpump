@@ -1123,7 +1123,7 @@ def resolve_fan_mode(
     hvac_start_fan_ramp_started_at: datetime | None = None,
     now: datetime | None = None,
 ) -> str | None:
-    if demand.fan_only_requested:
+    if demand.fan_only_requested or demand.circulation_requested:
         return _limit_fan_speed_decrease(
             _actual_fan_mode_for_level(1, supported_fan_modes),
             current_fan_mode,
@@ -1187,6 +1187,8 @@ def _reported_open_zone_count(snapshot: DemandSnapshot) -> int:
 
 
 def _resolved_idle_hvac_mode(current_mode: str, operation_mode: str | None) -> str | None:
+    if operation_mode in {HVAC_HEAT, HVAC_COOL} and current_mode == HVAC_FAN_ONLY:
+        return operation_mode
     if operation_mode in {HVAC_HEAT, HVAC_COOL} and current_mode in {HVAC_HEAT, HVAC_COOL}:
         return operation_mode
     if current_mode in {HVAC_HEAT, HVAC_COOL}:
@@ -1235,6 +1237,7 @@ def build_dispatch_plan(
         demand.heat_requested
         or demand.maintain_heat_mode
         or demand.fan_only_requested
+        or demand.circulation_requested
         or demand.dry_requested
         or demand.cool_requested
         or demand.maintain_cool_mode
@@ -1280,6 +1283,18 @@ def build_dispatch_plan(
             additional_fan_levels=additional_fan_levels,
             hvac_start_fan_ramp_started_at=hvac_start_fan_ramp_started_at,
             now=now,
+        )
+
+    if demand.circulation_requested:
+        return DispatchPlan(
+            turn_off=False,
+            idle=True,
+            circulation=True,
+            hvac_mode=HVAC_FAN_ONLY,
+            fan_mode=_actual_fan_mode_for_level(1, supported_fan_modes),
+            requested_by_zones=demand.requested_by_zones,
+            open_zones=predicted_open_zones,
+            reason=demand.reason,
         )
 
     if demand.fan_only_requested:
@@ -1431,7 +1446,7 @@ def build_dispatch_plan(
         normalized_now = _normalize_timestamp(now)
         normalized_idle_started_at = _normalize_timestamp(idle_started_at)
         idle_minimum_elapsed = (
-            current_mode == idle_hvac_mode
+            current_mode in {idle_hvac_mode, HVAC_FAN_ONLY}
             and normalized_now is not None
             and normalized_idle_started_at is not None
             and normalized_now - normalized_idle_started_at >= timedelta(seconds=MIN_IDLE_SECONDS)

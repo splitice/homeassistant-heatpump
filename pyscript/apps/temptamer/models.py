@@ -100,6 +100,7 @@ class EquipmentDemand:
     heat_requested: bool = False
     cool_requested: bool = False
     fan_only_requested: bool = False
+    circulation_requested: bool = False
     dry_requested: bool = False
     maintain_heat_mode: bool = False
     maintain_cool_mode: bool = False
@@ -116,6 +117,7 @@ class EquipmentDemand:
 class DispatchPlan:
     turn_off: bool = False
     idle: bool = False
+    circulation: bool = False
     idle_shutdown: bool = False
     hvac_mode: str | None = None
     fan_mode: str | None = None

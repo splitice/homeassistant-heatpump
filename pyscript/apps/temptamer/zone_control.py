@@ -593,6 +593,58 @@ def resolve_zone_actions(
     return actions, tuple(sorted(predicted_open))
 
 
+def resolve_idle_mixing_zone_actions(
+    snapshot: DemandSnapshot,
+    now: datetime,
+    existing_actions: list[ZoneAction],
+    predicted_open_zones: tuple[str, ...],
+    requested_zone_keys: tuple[str, ...],
+) -> tuple[list[ZoneAction], tuple[str, ...], bool, str]:
+    """Force the circulation pair open only when both ducts can be made available."""
+    requested = set(requested_zone_keys)
+    if not requested:
+        return existing_actions, predicted_open_zones, False, "idle mixing requested no airflow zones"
+
+    for zone_key in requested_zone_keys:
+        zone = snapshot.zones.get(zone_key)
+        if zone is None or not zone.is_enabled_by_mode:
+            return (
+                existing_actions,
+                predicted_open_zones,
+                False,
+                f"idle mixing zone {zone_key} is unavailable or disabled",
+            )
+        if not zone.switch_is_on and zone_key not in predicted_open_zones and not _can_toggle(zone, now, False):
+            return (
+                existing_actions,
+                predicted_open_zones,
+                False,
+                f"idle mixing zone {zone_key} is held closed by anti-flap delay",
+            )
+
+    actions = [
+        action
+        for action in existing_actions
+        if not (action.zone_key in requested and not action.turn_on)
+    ]
+    predicted_open = set(predicted_open_zones)
+    existing_open_actions = {action.zone_key for action in actions if action.turn_on}
+    for zone_key in requested_zone_keys:
+        zone = snapshot.zones[zone_key]
+        predicted_open.add(zone_key)
+        if not zone.switch_is_on and zone_key not in existing_open_actions:
+            actions.append(
+                ZoneAction(
+                    zone_key=zone_key,
+                    turn_on=True,
+                    reason="idle mixing requires Office and Downstairs airflow",
+                    discretionary=False,
+                )
+            )
+
+    return actions, tuple(sorted(predicted_open)), True, "idle mixing airflow zones are available"
+
+
 def resolve_dry_zone_actions(snapshot: DemandSnapshot) -> tuple[list[ZoneAction], tuple[str, ...]]:
     """Open every enabled zone for safe whole-house dry-mode airflow."""
     opening_actions: list[ZoneAction] = []

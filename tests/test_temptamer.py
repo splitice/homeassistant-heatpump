@@ -109,6 +109,7 @@ from pyscript.apps.temptamer.idle_demand_forecast import (
     forecast_temperature_at,
     parse_hourly_weather_forecast,
 )
+from pyscript.apps.temptamer.idle_mixing import resolve_idle_mixing
 from pyscript.apps.temptamer.logging_control import (
     get_temptamer_logger,
     install_temptamer_log_filter,
@@ -125,6 +126,7 @@ from pyscript.apps.temptamer.state_reader import build_snapshot
 from pyscript.apps.temptamer.zone_control import (
     describe_zone_predictions,
     resolve_high_fan_office_closure,
+    resolve_idle_mixing_zone_actions,
     resolve_dry_zone_actions,
     resolve_zone_actions,
 )
@@ -8705,7 +8707,7 @@ class TempTamerTests(unittest.TestCase):
             supported_fan_modes=("Level 1", "Level 2", "Level 3"),
         )
 
-        self.assertEqual(plan.fan_mode, "Level 2")
+        self.assertEqual(plan.fan_mode, "Level 1")
 
     def test_dispatch_plan_triples_fan_when_effective_open_zones_reach_four(self):
         snapshot = build_behavior_snapshot(
@@ -8968,6 +8970,172 @@ class TempTamerTests(unittest.TestCase):
             ),
             "low",
         )
+
+
+class IdleMixingTests(unittest.TestCase):
+    def _snapshot(self, *, office_temp="24.0", downstairs_temp="22.6", office_on=False):
+        return build_behavior_snapshot(
+            FakeReader(
+                base_state_map(
+                    **{
+                        "input_select.temptamer_comfort_mode": "Day",
+                        "input_select.temptamer_comfort_mode_dining": "Off",
+                        "input_select.temptamer_comfort_mode_downstairs": "Auto",
+                        "input_select.temptamer_comfort_mode_bed12": "Off",
+                        "input_select.temptamer_comfort_mode_bed34": "Off",
+                        "sensor.office_average_temperature": office_temp,
+                        "sensor.downstairs_zone_average_temperature": downstairs_temp,
+                        "switch.wt32_hpctrl_e8dbd0_office": "on" if office_on else "off",
+                        "switch.roof_wt32_hpctrl_e8dbd0_downstairs": "on",
+                    }
+                ),
+                base_attr_map("23.0"),
+            )
+        )
+
+    def test_starts_after_idle_delay_when_office_is_hotter_than_downstairs(self):
+        now = datetime(2026, 9, 28, 16, 45, tzinfo=timezone.utc)
+        decision = resolve_idle_mixing(
+            self._snapshot(),
+            EquipmentDemand(reason="all zones satisfied"),
+            operation_mode=HVAC_HEAT,
+            supported_hvac_modes=(HVAC_HEAT, HVAC_FAN_ONLY, "off"),
+            idle_started_at=now - timedelta(minutes=5),
+            active=False,
+            started_at=None,
+            cooldown_until=None,
+            now=now,
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.zone_keys, ("downstairs", "office"))
+        self.assertEqual(decision.started_at, now)
+        self.assertAlmostEqual(decision.office_excess, 3.0)
+        self.assertAlmostEqual(decision.temperature_spread, 1.4)
+
+    def test_does_not_start_before_idle_delay(self):
+        now = datetime(2026, 9, 28, 16, 45, tzinfo=timezone.utc)
+        decision = resolve_idle_mixing(
+            self._snapshot(),
+            EquipmentDemand(reason="all zones satisfied"),
+            operation_mode=HVAC_HEAT,
+            supported_hvac_modes=(HVAC_HEAT, HVAC_FAN_ONLY),
+            idle_started_at=now - timedelta(minutes=4, seconds=59),
+            active=False,
+            started_at=None,
+            cooldown_until=None,
+            now=now,
+        )
+
+        self.assertFalse(decision.active)
+        self.assertIn("entry delay", decision.reason)
+
+    def test_active_mixing_uses_exit_hysteresis_and_starts_cooldown(self):
+        now = datetime(2026, 9, 28, 16, 50, tzinfo=timezone.utc)
+        continuing = resolve_idle_mixing(
+            self._snapshot(office_temp="23.1", downstairs_temp="22.6", office_on=True),
+            EquipmentDemand(reason="all zones satisfied"),
+            operation_mode=HVAC_HEAT,
+            supported_hvac_modes=(HVAC_HEAT, HVAC_FAN_ONLY),
+            idle_started_at=now - timedelta(minutes=10),
+            active=True,
+            started_at=now - timedelta(minutes=5),
+            cooldown_until=None,
+            now=now,
+        )
+        stopped = resolve_idle_mixing(
+            self._snapshot(office_temp="23.0", downstairs_temp="22.6", office_on=True),
+            EquipmentDemand(reason="all zones satisfied"),
+            operation_mode=HVAC_HEAT,
+            supported_hvac_modes=(HVAC_HEAT, HVAC_FAN_ONLY),
+            idle_started_at=now - timedelta(minutes=10),
+            active=True,
+            started_at=now - timedelta(minutes=5),
+            cooldown_until=None,
+            now=now,
+        )
+
+        self.assertTrue(continuing.active)
+        self.assertFalse(stopped.active)
+        self.assertEqual(stopped.cooldown_until, now + timedelta(minutes=10))
+
+    def test_real_thermal_demand_stops_mixing_immediately(self):
+        now = datetime(2026, 9, 28, 16, 50, tzinfo=timezone.utc)
+        decision = resolve_idle_mixing(
+            self._snapshot(office_on=True),
+            EquipmentDemand(heat_requested=True, requested_by_zones=("downstairs",)),
+            operation_mode=HVAC_HEAT,
+            supported_hvac_modes=(HVAC_HEAT, HVAC_FAN_ONLY),
+            idle_started_at=now - timedelta(minutes=10),
+            active=True,
+            started_at=now - timedelta(minutes=5),
+            cooldown_until=None,
+            now=now,
+        )
+
+        self.assertFalse(decision.active)
+        self.assertIn("thermal demand", decision.reason)
+
+    def test_zone_actions_open_office_and_retain_downstairs(self):
+        snapshot = self._snapshot()
+        now = datetime(2026, 9, 28, 16, 45, tzinfo=timezone.utc)
+        actions, open_zones, ready, reason = resolve_idle_mixing_zone_actions(
+            snapshot,
+            now,
+            [],
+            ("downstairs",),
+            ("downstairs", "office"),
+        )
+
+        self.assertTrue(ready, reason)
+        self.assertEqual(open_zones, ("downstairs", "office"))
+        self.assertEqual([(action.zone_key, action.turn_on) for action in actions], [("office", True)])
+
+    def test_dispatches_idle_level_one_fan_only_and_preserves_idle_timestamp(self):
+        snapshot = self._snapshot(office_on=True)
+        now = datetime(2026, 9, 28, 16, 50, tzinfo=timezone.utc)
+        idle_started_at = now - timedelta(minutes=10)
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(
+                circulation_requested=True,
+                requested_by_zones=("downstairs", "office"),
+                reason="idle mixing test",
+            ),
+            ("downstairs", "office"),
+            current_hvac_mode=HVAC_HEAT,
+            current_fan_mode="Level 3",
+            supported_fan_modes=("Level 1", "Level 2", "Level 3"),
+            idle_started_at=idle_started_at,
+            operation_mode=HVAC_HEAT,
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertTrue(plan.circulation)
+        self.assertEqual(plan.hvac_mode, HVAC_FAN_ONLY)
+        self.assertEqual(plan.fan_mode, "Level 2")
+        self.assertEqual(resolve_idle_started_at(idle_started_at, plan, current_hvac_mode=HVAC_HEAT, now=now), idle_started_at)
+
+    def test_returns_from_fan_only_to_heat_idle_without_resetting_idle_period(self):
+        snapshot = self._snapshot(office_temp="23.0", downstairs_temp="22.6", office_on=True)
+        now = datetime(2026, 9, 28, 16, 55, tzinfo=timezone.utc)
+        idle_started_at = now - timedelta(minutes=15)
+        plan = build_dispatch_plan(
+            snapshot,
+            EquipmentDemand(reason="mixing complete"),
+            ("downstairs", "office"),
+            current_hvac_mode=HVAC_FAN_ONLY,
+            current_fan_mode="Level 1",
+            current_setpoint="17.0",
+            operation_mode=HVAC_HEAT,
+            idle_started_at=idle_started_at,
+            now=now,
+        )
+
+        self.assertTrue(plan.idle)
+        self.assertEqual(plan.hvac_mode, HVAC_HEAT)
+        self.assertEqual(resolve_idle_started_at(idle_started_at, plan, current_hvac_mode=HVAC_FAN_ONLY, now=now), idle_started_at)
 
 
 class PowerDayForecastTests(unittest.TestCase):
