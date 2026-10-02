@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from .airflow import infer_logical_fan_level, scale_logical_fan_level
 from .comfort_modes import DefaultComfortMode
 from .config import (
     COOLING_FAN_INCREASE_CONFIRMATION_PASSES,
@@ -960,15 +961,6 @@ def _limit_fan_speed_decrease(
     return _actual_fan_mode_for_level(current_level - 1, supported_fan_modes)
 
 
-def _fan_speed_multiplier(open_zone_count: int) -> int:
-    """Return the output-level multiplier used for the active zone count."""
-    if open_zone_count >= 4:
-        return 3
-    if open_zone_count >= 3:
-        return 2
-    return 1
-
-
 def _heat_continue_until_gap(snapshot: DemandSnapshot, zone_keys: tuple[str, ...]) -> float:
     """Return the largest heat continue-until deficit among planned-open zones."""
     largest_gap = 0.0
@@ -1007,9 +999,8 @@ def resolve_heat_demand_fan_boost(
 ) -> tuple[int, datetime | None, str]:
     """Resolve the heat-demand base-fan boost and its 15-minute ramp state.
 
-    The boost is deliberately calculated before fan multiplication: a boost of
-    one adds one base level, even when the heat pump later scales that level for
-    several open zones.
+    The boost is deliberately calculated before vent scaling: a boost of one
+    adds one logical level before the heat pump accounts for open outlet area.
     """
     if not (demand.heat_requested or demand.maintain_heat_mode):
         return 0, None, "no active heat demand"
@@ -1063,25 +1054,16 @@ def resolve_heat_demand_fan_boost(
     )
 
 
-def _current_fan_speed_level(fan_mode: str | None, *, open_zone_count: int = 1) -> int | None:
-    """Return the base fan level used by comfort-mode hysteresis.
-
-    Numeric fan modes are the scaled values sent to the heat pump.  For
-    example, with three effective open zones, base level 1 is sent as
-    ``Level 2``.  Convert that value back before feeding it into the
-    low/medium hysteresis calculation; otherwise a stable Level 2 is read as
-    base level 2 and gets raised to Level 4 on the next control pass.
-    """
-    normalized_fan_mode = (fan_mode or "").strip().lower()
-    if normalized_fan_mode == FAN_LOW:
-        return 1
-    if normalized_fan_mode == FAN_MEDIUM:
-        return 2
-
-    match = LEVEL_FAN_MODE_PATTERN.match((fan_mode or "").strip())
-    if match is None:
-        return None
-    return max(1, math.ceil(int(match.group(1)) / _fan_speed_multiplier(open_zone_count)))
+def _current_fan_speed_level(
+    fan_mode: str | None,
+    *,
+    open_vent_equivalents: int,
+) -> int | None:
+    """Return the logical fan level used by comfort-mode hysteresis."""
+    return infer_logical_fan_level(
+        _fan_speed_level(fan_mode),
+        open_vent_equivalents,
+    )
 
 
 def resolve_hvac_start_fan_ramp_mode(
@@ -1115,7 +1097,7 @@ def resolve_fan_mode(
     comfort_mode: DefaultComfortMode | None = None,
     comfort_mode_changed: bool = False,
     free_power_available: bool = False,
-    open_zone_count: int = 1,
+    open_vent_equivalents: int,
     supported_fan_modes: Iterable[object] | None = None,
     fan_speed_decrease_at: datetime | None = None,
     base_fan_boost: int = 0,
@@ -1135,7 +1117,10 @@ def resolve_fan_mode(
     if not (demand.heat_requested or demand.maintain_heat_mode or demand.cool_requested or demand.maintain_cool_mode):
         return None
 
-    current_speed_level = _current_fan_speed_level(current_fan_mode, open_zone_count=open_zone_count)
+    current_speed_level = _current_fan_speed_level(
+        current_fan_mode,
+        open_vent_equivalents=open_vent_equivalents,
+    )
     comfort_mode_behavior = comfort_mode or DEFAULT_FAN_COMFORT_MODE
     currently_heating = (current_hvac_mode or "").lower() == HVAC_HEAT
     currently_cooling = (current_hvac_mode or "").lower() == HVAC_COOL
@@ -1143,9 +1128,8 @@ def resolve_fan_mode(
     currently_active = currently_cooling if cooling else currently_heating
     starting = comfort_mode_changed or not currently_active
 
-    fan_speed_level = comfort_mode_behavior.fan_speed_level(
+    logical_fan_speed_level = comfort_mode_behavior.fan_speed_level(
         demand.max_temperature_deficit,
-        open_zone_count,
         current_speed_level=current_speed_level,
         starting=starting,
         # PowerDay's aggressive fan thresholds exist to move free heat into
@@ -1154,7 +1138,12 @@ def resolve_fan_mode(
         free_power_available=free_power_available and not cooling,
     )
     if not cooling:
-        fan_speed_level += _bounded_fan_boost_level(base_fan_boost) * _fan_speed_multiplier(open_zone_count)
+        logical_fan_speed_level += _bounded_fan_boost_level(base_fan_boost)
+    fan_speed_level = scale_logical_fan_level(
+        logical_fan_speed_level,
+        open_vent_equivalents,
+    )
+    if not cooling:
         fan_speed_level += _additional_fan_levels(additional_fan_levels)
     requested_fan_mode = _actual_fan_mode_for_level(fan_speed_level, supported_fan_modes)
     if hvac_start_fan_ramp_started_at is not None:
@@ -1178,12 +1167,12 @@ def resolve_fan_mode(
     )
 
 
-def _reported_open_zone_count(snapshot: DemandSnapshot) -> int:
-    count = 0
+def _reported_open_vent_equivalents(snapshot: DemandSnapshot) -> int:
+    vent_equivalents = 0
     for zone in snapshot.zones.values():
         if zone.switch_is_on:
-            count += 2 if zone.key == "downstairs" else 1
-    return count
+            vent_equivalents += max(0, int(zone.airflow_vent_equivalents))
+    return vent_equivalents
 
 
 def _resolved_idle_hvac_mode(current_mode: str, operation_mode: str | None) -> str | None:
@@ -1262,7 +1251,7 @@ def build_dispatch_plan(
             reason=demand.reason,
         )
 
-    reported_open_zone_count = _reported_open_zone_count(snapshot)
+    reported_open_vent_equivalents = _reported_open_vent_equivalents(snapshot)
 
     def resolve_plan_fan_mode() -> str | None:
         full_heat_sink_available = snapshot.surplus_heat_sink_available or (
@@ -1276,7 +1265,7 @@ def build_dispatch_plan(
             comfort_mode_changed=comfort_mode_changed,
             comfort_mode=snapshot.comfort_mode_behavior,
             free_power_available=full_heat_sink_available,
-            open_zone_count=reported_open_zone_count,
+            open_vent_equivalents=reported_open_vent_equivalents,
             supported_fan_modes=supported_fan_modes,
             fan_speed_decrease_at=fan_speed_decrease_at,
             base_fan_boost=base_fan_boost,

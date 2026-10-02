@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from math import ceil, cos, exp, floor, isfinite, radians, sin
 from typing import Mapping, Protocol
 
+from .airflow import airflow_vent_scale, effective_airflow_fan_level
 from .constants import COMFORT_SCORE_MAXIMUM, COMFORT_SCORE_MINIMUM, SWITCH_ON_STATES
 
 
@@ -68,6 +69,7 @@ class ComfortAdjustmentZoneConfig:
     output_entity_id: str
     fallback_temperature_entity_id: str | None
     rooms: tuple[ComfortAdjustmentRoomConfig, ...]
+    airflow_vent_equivalents: int
     humidity_entity_id: str | None = None
     upstairs: bool = False
     # Keep this as ``object`` for the PyScript evaluator; see the equivalent
@@ -102,6 +104,8 @@ class ComfortAdjustmentConfig:
     outdoor_temperature_max_celsius: float = 60.0
     input_stale_after_seconds: int = 30 * 60
     last_valid_operating_mode_hold_seconds: int = 5 * 60
+    humidex_zero_effect_temperature_celsius: float = 20.0
+    humidex_full_effect_temperature_celsius: float = 21.0
     # Set to ``legacy`` only as an immediate live rollback; production uses
     # the room-level operative model.
     calculation_model: str = "operative"
@@ -160,6 +164,9 @@ class ComfortAdjustmentResult:
     airflow_switch_statuses: Mapping[str, str]
     fan_mode: str | None
     fan_speed_level: int | None
+    open_airflow_vent_equivalents: int
+    airflow_vent_scale: float
+    effective_airflow_fan_level: float | None
     hvac_mode: str | None
     hvac_action: str | None
     raw_adjustments: Mapping[str, float]
@@ -210,7 +217,7 @@ def cooling_airflow_fan_level(fan_mode: object | None) -> int | None:
 
 
 def calculate_cooling_airflow_target(
-    fan_speed_level: int | None,
+    fan_speed_level: float | None,
     effects: tuple[float, ...],
     *,
     active_cooling: bool,
@@ -222,10 +229,29 @@ def calculate_cooling_airflow_target(
         return 0.0
     if not isfinite(zone_factor) or zone_factor <= 0.0:
         return 0.0
-    bounded_index = min(max(1, fan_speed_level), len(effects)) - 1
-    effect = _parse_float(effects[bounded_index])
-    if effect is None or effect <= 0.0:
+    parsed_level = _parse_float(fan_speed_level)
+    if parsed_level is None or parsed_level <= 0.0:
         return 0.0
+    bounded_level = min(parsed_level, float(len(effects)))
+    if bounded_level <= 1.0:
+        level_one_effect = _parse_float(effects[0])
+        if level_one_effect is None or level_one_effect <= 0.0:
+            return 0.0
+        effect = level_one_effect * bounded_level
+    else:
+        lower_level = floor(bounded_level)
+        upper_level = ceil(bounded_level)
+        lower_effect = _parse_float(effects[lower_level - 1])
+        upper_effect = _parse_float(effects[upper_level - 1])
+        if (
+            lower_effect is None
+            or upper_effect is None
+            or lower_effect <= 0.0
+            or upper_effect <= 0.0
+        ):
+            return 0.0
+        fraction = bounded_level - lower_level
+        effect = lower_effect + (upper_effect - lower_effect) * fraction
     return -effect * zone_factor
 
 
@@ -306,11 +332,18 @@ def _read_temperature(
     if parsed < minimum or parsed > maximum:
         return TemperatureReading(entity_id=entity_id, value=None, status="rejected_implausible")
 
-    timestamp = _normalize_datetime(reader.get_attr(entity_id, "last_updated"))
+    # Stable Home Assistant sensors can report on schedule without changing
+    # their state.  Prefer last_reported so those healthy, quiet readings are
+    # not rejected based on an older last_updated/last_changed timestamp.
+    timestamp = _normalize_datetime(reader.get_attr(entity_id, "last_reported"))
     if timestamp is None:
-        timestamp = _normalize_datetime(reader.get_attr(entity_id, "last_changed"))
+        timestamp = _normalize_datetime(getattr(value_to_parse, "last_reported", None))
+    if timestamp is None:
+        timestamp = _normalize_datetime(reader.get_attr(entity_id, "last_updated"))
     if timestamp is None:
         timestamp = _normalize_datetime(getattr(value_to_parse, "last_updated", None))
+    if timestamp is None:
+        timestamp = _normalize_datetime(reader.get_attr(entity_id, "last_changed"))
     if timestamp is None:
         timestamp = _normalize_datetime(getattr(value_to_parse, "last_changed", None))
     normalized_now = _normalize_datetime(now)
@@ -334,11 +367,21 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
-def calculate_humidex_adjustment(temperature: float, relative_humidity: float) -> float:
-    """Return the Humidex apparent-temperature delta in Celsius."""
+def calculate_humidex_adjustment(
+    temperature: float,
+    relative_humidity: float,
+    *,
+    zero_effect_temperature: float = 20.0,
+    full_effect_temperature: float = 21.0,
+) -> float:
+    """Return a warm-weather Humidex delta faded out at cool temperatures."""
     if not isfinite(temperature) or not isfinite(relative_humidity):
         return 0.0
     if relative_humidity < 0.0 or relative_humidity > 100.0:
+        return 0.0
+    if not isfinite(zero_effect_temperature) or not isfinite(full_effect_temperature):
+        return 0.0
+    if full_effect_temperature <= zero_effect_temperature:
         return 0.0
     vapour_pressure = (
         relative_humidity
@@ -346,7 +389,14 @@ def calculate_humidex_adjustment(temperature: float, relative_humidity: float) -
         * 6.112
         * exp(17.67 * temperature / (temperature + 243.5))
     )
-    return 5.0 / 9.0 * (vapour_pressure - 10.0)
+    raw_adjustment = 5.0 / 9.0 * (vapour_pressure - 10.0)
+    temperature_weight = _clamp(
+        (temperature - zero_effect_temperature)
+        / (full_effect_temperature - zero_effect_temperature),
+        0.0,
+        1.0,
+    )
+    return raw_adjustment * temperature_weight
 
 
 def _read_first_temperature(reader: StateReaderLike, primary_entity_id: str, fallback_entity_id: str | None) -> float | None:
@@ -1289,7 +1339,12 @@ def calculate_comfort_adjustments(
         zone_humidity_sources[zone.key] = humidity_source
         zone_humidity_entity_ids[zone.key] = humidity_entity_id
         humidity_adjustments[zone.key] = (
-            calculate_humidex_adjustment(zone_temperature, zone_humidity)
+            calculate_humidex_adjustment(
+                zone_temperature,
+                zone_humidity,
+                zero_effect_temperature=config.humidex_zero_effect_temperature_celsius,
+                full_effect_temperature=config.humidex_full_effect_temperature_celsius,
+            )
             if zone_temperature is not None and zone_humidity is not None
             else 0.0
         )
@@ -1311,14 +1366,25 @@ def calculate_comfort_adjustments(
             airflow_switch_statuses[zone.key] = "unavailable"
         else:
             airflow_switch_statuses[zone.key] = "open" if airflow_switch_on else "closed"
+        input_issues_by_zone[zone.key] = input_issues + humidity_issues
+
+    open_airflow_vent_equivalents = 0
+    for zone in config.zones:
+        if airflow_switch_states[zone.key]:
+            open_airflow_vent_equivalents += max(0, int(zone.airflow_vent_equivalents))
+    resolved_airflow_vent_scale = airflow_vent_scale(open_airflow_vent_equivalents)
+    resolved_effective_airflow_fan_level = effective_airflow_fan_level(
+        fan_speed_level,
+        open_airflow_vent_equivalents,
+    )
+    for zone in config.zones:
         airflow_target_adjustments[zone.key] = calculate_cooling_airflow_target(
-            fan_speed_level,
+            resolved_effective_airflow_fan_level,
             config.cooling_airflow_effects,
             active_cooling=active_cooling,
-            airflow_switch_on=airflow_switch_on,
+            airflow_switch_on=airflow_switch_states[zone.key],
             zone_factor=zone.cooling_airflow_factor,
         )
-        input_issues_by_zone[zone.key] = input_issues + humidity_issues
 
     operating_indoor_temperature = house_temperature_reading.value
     operating_indoor_temperature_source = "house_temperature"
@@ -1410,6 +1476,7 @@ def calculate_comfort_adjustments(
                 "humidity_temperature": zone_temperature,
                 "humidity_adjustment": humidity_adjustments[zone.key],
                 "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+                "airflow_vent_equivalents": zone.airflow_vent_equivalents,
                 "airflow_switch_state": airflow_switch_states[zone.key],
                 "airflow_switch_status": airflow_switch_statuses[zone.key],
             }
@@ -1500,6 +1567,7 @@ def calculate_comfort_adjustments(
                 "humidity_temperature": zone_temperature,
                 "humidity_adjustment": humidity_adjustments[zone.key],
                 "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+                "airflow_vent_equivalents": zone.airflow_vent_equivalents,
                 "airflow_switch_state": airflow_switch_states[zone.key],
                 "airflow_switch_status": airflow_switch_statuses[zone.key],
             }
@@ -1543,6 +1611,7 @@ def calculate_comfort_adjustments(
             "humidity_temperature": zone_temperature,
             "humidity_adjustment": humidity_adjustments[zone.key],
             "airflow_target_adjustment": airflow_target_adjustments[zone.key],
+            "airflow_vent_equivalents": zone.airflow_vent_equivalents,
             "airflow_switch_state": airflow_switch_states[zone.key],
             "airflow_switch_status": airflow_switch_statuses[zone.key],
             "window_k": weighted_window_k / comfort_weight_total,
@@ -1604,6 +1673,9 @@ def calculate_comfort_adjustments(
         airflow_switch_statuses=airflow_switch_statuses,
         fan_mode=fan_mode,
         fan_speed_level=fan_speed_level,
+        open_airflow_vent_equivalents=open_airflow_vent_equivalents,
+        airflow_vent_scale=resolved_airflow_vent_scale,
+        effective_airflow_fan_level=resolved_effective_airflow_fan_level,
         hvac_mode=str(configured_hvac_mode).strip().lower() if configured_hvac_mode is not None else None,
         hvac_action=str(hvac_action).strip().lower() if hvac_action is not None else None,
         raw_adjustments=raw_adjustments,

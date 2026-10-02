@@ -84,7 +84,6 @@ class DefaultComfortMode(ComfortMode):
     def fan_speed_level(
         self,
         temperature_differential: float,
-        open_zone_count: int,
         *,
         current_speed_level: int | None = None,
         starting: bool = False,
@@ -92,7 +91,6 @@ class DefaultComfortMode(ComfortMode):
     ) -> int:
         return self._fan_speed_level_from_thresholds(
             temperature_differential,
-            open_zone_count,
             current_speed_level=current_speed_level,
             starting=starting,
             heat_start_medium_fan_differential=self.heat_start_medium_fan_differential,
@@ -103,7 +101,6 @@ class DefaultComfortMode(ComfortMode):
     @staticmethod
     def _fan_speed_level_from_thresholds(
         temperature_differential: float,
-        open_zone_count: int,
         *,
         current_speed_level: int | None,
         starting: bool,
@@ -119,10 +116,6 @@ class DefaultComfortMode(ComfortMode):
         else:
             base_level = 2 if temperature_differential > low_to_medium_fan_differential else 1
 
-        if open_zone_count >= 4:
-            return base_level * 3
-        if open_zone_count >= 3:
-            return base_level * 2
         return base_level
 
     def get(self, zone_key: str, default: str | None = None) -> str | None:
@@ -311,7 +304,6 @@ class PowerComfortMode(DefaultComfortMode):
     def fan_speed_level(
         self,
         temperature_differential: float,
-        open_zone_count: int,
         *,
         current_speed_level: int | None = None,
         starting: bool = False,
@@ -321,14 +313,12 @@ class PowerComfortMode(DefaultComfortMode):
             return DefaultComfortMode.fan_speed_level(
                 self,
                 temperature_differential,
-                open_zone_count,
                 current_speed_level=current_speed_level,
                 starting=starting,
                 free_power_available=free_power_available,
             )
         return self._fan_speed_level_from_thresholds(
             temperature_differential,
-            open_zone_count,
             current_speed_level=current_speed_level,
             starting=starting,
             heat_start_medium_fan_differential=self.free_power_heat_start_medium_fan_differential,

@@ -50,7 +50,7 @@ HEAT_DEMAND_FAN_BOOST_STATE_FILE = "/config/pyscript/temptamer_fan_boost.state"
 # Persist the score convention separately from the helpers themselves.  When
 # this number changes, the publisher reseeds every helper before control reads
 # one of the old-convention values.
-COMFORT_SCORE_SEMANTICS_VERSION = 9
+COMFORT_SCORE_SEMANTICS_VERSION = 11
 COMFORT_SCORE_SEMANTICS_STATE_FILE = "/config/pyscript/temptamer_comfort_score_semantics.state"
 # Fabric solar filters represent heat retained by contents and fabric, so they
 # must survive PyScript reloads and Home Assistant restarts.
@@ -93,10 +93,15 @@ POWERDAY_DRY_START_MIN_ZONE_CELSIUS = 20.0
 POWERDAY_DRY_ABORT_MIN_ZONE_CELSIUS = 19.0
 POWERDAY_DRY_MAX_SECONDS = 30 * 60
 POWERDAY_DRY_COOLDOWN_SECONDS = 30 * 60
-POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS = 1.75
-POWERDAY_DRY_COOLING_EXIT_EXCESS_CELSIUS = 2.0
+COOLING_DRY_ENTRY_EXCESS_CELSIUS = 1.75
+COOLING_DRY_EXIT_EXCESS_CELSIUS = 2.0
+POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS = COOLING_DRY_ENTRY_EXCESS_CELSIUS
+POWERDAY_DRY_COOLING_EXIT_EXCESS_CELSIUS = COOLING_DRY_EXIT_EXCESS_CELSIUS
 POWERDAY_DRY_COOLING_EXIT_CONFIRMATION_PASSES = 2
 POWERDAY_DRY_COOLING_EXIT_CONFIRMATION_SECONDS = 30
+# Ordinary low-load cooling Dry has independent runtime state and no PowerDay
+# cooldown, but retains the same bounded maximum run duration.
+COOLING_DRY_MAX_SECONDS = 30 * 60
 COOLING_FAN_INCREASE_CONFIRMATION_PASSES = 2
 COOLING_FAN_INCREASE_CONFIRMATION_SECONDS = 30
 POWERDAY_DRY_HEAT_TRANSITION_SECONDS = 5 * 60
@@ -221,6 +226,7 @@ DEFAULT_ZONES = {
         label="Office",
         sensor_entity_id="sensor.office_average_temperature",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_office",
+        airflow_vent_equivalents=2,
         setpoint_delta_from_inlet=-2.0,
         min_sensor_entity_id="sensor.office_minimum_temperature",
         max_sensor_entity_id="sensor.office_maximum_temperature",
@@ -230,24 +236,28 @@ DEFAULT_ZONES = {
         label="Dining",
         sensor_entity_id="sensor.average_dining_zone_temp",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_dining",
+        airflow_vent_equivalents=4,
     ),
     "downstairs": ZoneConfig(
         key="downstairs",
         label="Downstairs",
         sensor_entity_id="sensor.downstairs_zone_average_temperature",
         switch_entity_id="switch.roof_wt32_hpctrl_e8dbd0_downstairs",
+        airflow_vent_equivalents=3,
     ),
     "bedroom_1_2": ZoneConfig(
         key="bedroom_1_2",
         label="Bedroom 1&2",
         sensor_entity_id="sensor.average_bed1_2_zone_temp",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_bed_12",
+        airflow_vent_equivalents=3,
     ),
     "bedroom_3_4": ZoneConfig(
         key="bedroom_3_4",
         label="Bedroom 3&4",
         sensor_entity_id="sensor.average_bed3_4_zone_temp",
         switch_entity_id="switch.wt32_hpctrl_e8dbd0_bed_34",
+        airflow_vent_equivalents=3,
         scheme_sensor_entity_ids={
             SCHEME_BATHROOM: "sensor.bathroom_motion_temperature",
         },
@@ -387,6 +397,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             fallback_temperature_entity_id="sensor.downstairs_zone_average_temperature",
             humidity_entity_id="sensor.rumpus_white_clock_humidity",
             airflow_switch_entity_id=DEFAULT_ZONES["downstairs"].switch_entity_id,
+            airflow_vent_equivalents=DEFAULT_ZONES["downstairs"].airflow_vent_equivalents,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.rumpus_average_temperature",
@@ -428,6 +439,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_1_2"],
             fallback_temperature_entity_id="sensor.average_bed1_2_zone_temp",
             airflow_switch_entity_id=DEFAULT_ZONES["bedroom_1_2"].switch_entity_id,
+            airflow_vent_equivalents=DEFAULT_ZONES["bedroom_1_2"].airflow_vent_equivalents,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_1_average_temperature",
@@ -461,6 +473,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["bedroom_3_4"],
             fallback_temperature_entity_id="sensor.average_bed3_4_zone_temp",
             airflow_switch_entity_id=DEFAULT_ZONES["bedroom_3_4"].switch_entity_id,
+            airflow_vent_equivalents=DEFAULT_ZONES["bedroom_3_4"].airflow_vent_equivalents,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.bedroom_3_average_temperature",
@@ -513,6 +526,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             fallback_temperature_entity_id="sensor.office_average_temperature",
             humidity_entity_id="sensor.air_monitor_lite_c705_humidity",
             airflow_switch_entity_id=DEFAULT_ZONES["office"].switch_entity_id,
+            airflow_vent_equivalents=DEFAULT_ZONES["office"].airflow_vent_equivalents,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.office_average_temperature",
@@ -537,6 +551,7 @@ DEFAULT_COMFORT_ADJUSTMENT_CONFIG = ComfortAdjustmentConfig(
             output_entity_id=DEFAULT_ZONE_COMFORT_ADJUSTMENT_ENTITIES["dining"],
             fallback_temperature_entity_id="sensor.average_dining_zone_temp",
             airflow_switch_entity_id=DEFAULT_ZONES["dining"].switch_entity_id,
+            airflow_vent_equivalents=DEFAULT_ZONES["dining"].airflow_vent_equivalents,
             rooms=(
                 ComfortAdjustmentRoomConfig(
                     primary_temperature_entity_id="sensor.dining_average_temperature",

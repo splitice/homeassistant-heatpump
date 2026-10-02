@@ -6,6 +6,8 @@ from datetime import datetime
 from math import isfinite
 
 from .config import (
+    COOLING_DRY_ENTRY_EXCESS_CELSIUS,
+    COOLING_DRY_EXIT_EXCESS_CELSIUS,
     POWERDAY_DRY_ABORT_MIN_ZONE_CELSIUS,
     POWERDAY_DRY_CONDITIONAL_INDOOR_HUMIDITY_THRESHOLD,
     POWERDAY_DRY_COOLING_ENTRY_EXCESS_CELSIUS,
@@ -62,6 +64,19 @@ class DehumidificationDecision:
     cooling_threshold_celsius: float | None = None
     coldest_target_zone_celsius: float | None = None
     cooldown_active: bool = False
+
+
+@dataclass(frozen=True)
+class LowLoadCoolingDryDecision:
+    eligible: bool
+    humidity_eligible: bool
+    cooling_excess_celsius: float
+    cooling_threshold_celsius: float
+    coldest_planned_zone_celsius: float | None
+    minimum_continuation_margin_celsius: float | None
+    limiting_zone_key: str | None
+    reason: str
+    entry_kind: str = "cooling_substitution"
 
 
 def _finite_float(value: object | None) -> float | None:
@@ -174,6 +189,152 @@ def _supports_dry_mode(supported_hvac_modes: Iterable[object] | None) -> bool:
     return False
 
 
+def _humidity_is_eligible(
+    indoor_humidity: object | None,
+    forecast_humidity: object | None,
+) -> tuple[float | None, float | None, bool]:
+    parsed_humidity = _finite_float(indoor_humidity)
+    if parsed_humidity is not None and not 0.0 <= parsed_humidity <= 100.0:
+        parsed_humidity = None
+    parsed_forecast_humidity = _finite_float(forecast_humidity)
+    if parsed_forecast_humidity is not None and not 0.0 <= parsed_forecast_humidity <= 100.0:
+        parsed_forecast_humidity = None
+    forecast_humidity_high = (
+        parsed_forecast_humidity is not None
+        and parsed_forecast_humidity > POWERDAY_DRY_FORECAST_HUMIDITY_THRESHOLD
+    )
+    eligible = parsed_humidity is not None and (
+        parsed_humidity > POWERDAY_DRY_UNCONDITIONAL_INDOOR_HUMIDITY_THRESHOLD
+        or (
+            parsed_humidity > POWERDAY_DRY_CONDITIONAL_INDOOR_HUMIDITY_THRESHOLD
+            and forecast_humidity_high
+        )
+    )
+    return parsed_humidity, parsed_forecast_humidity, eligible
+
+
+def _planned_zone_continuation_margin(
+    snapshot: DemandSnapshot,
+    zone_keys: Iterable[str],
+) -> tuple[float | None, float | None, str | None]:
+    coldest_temperature: float | None = None
+    minimum_margin: float | None = None
+    limiting_zone_key: str | None = None
+    for zone_key in zone_keys:
+        zone = snapshot.zones.get(zone_key)
+        if zone is None:
+            return coldest_temperature, None, zone_key
+        temperatures = [zone.current_temp]
+        if zone.min_temp is not None:
+            temperatures.append(zone.min_temp)
+        parsed_temperatures: list[float] = []
+        for temperature in temperatures:
+            parsed = _finite_float(temperature)
+            if parsed is not None:
+                parsed_temperatures.append(parsed)
+        if not parsed_temperatures:
+            return coldest_temperature, None, zone_key
+        zone_temperature = min(parsed_temperatures)
+        margin = zone_temperature - zone.cool_scheme.continue_until
+        if coldest_temperature is None or zone_temperature < coldest_temperature:
+            coldest_temperature = zone_temperature
+        if minimum_margin is None or margin < minimum_margin:
+            minimum_margin = margin
+            limiting_zone_key = zone_key
+    return coldest_temperature, minimum_margin, limiting_zone_key
+
+
+def resolve_low_load_cooling_dry(
+    snapshot: DemandSnapshot,
+    *,
+    indoor_humidity: float | None,
+    forecast_humidity: float | None,
+    supported_hvac_modes: Iterable[object] | None,
+    cooling_demand: bool,
+    fresh_cooling_request: bool,
+    cooling_excess_celsius: float,
+    planned_zone_keys: Iterable[str],
+    currently_active: bool,
+) -> LowLoadCoolingDryDecision:
+    """Resolve humidity-led Dry substitution for ordinary low-load cooling."""
+    parsed_humidity, parsed_forecast_humidity, humidity_eligible = _humidity_is_eligible(
+        indoor_humidity,
+        forecast_humidity,
+    )
+    parsed_excess = _finite_float(cooling_excess_celsius)
+    if parsed_excess is None:
+        parsed_excess = 0.0
+    parsed_excess = max(0.0, parsed_excess)
+    threshold = (
+        COOLING_DRY_EXIT_EXCESS_CELSIUS
+        if currently_active
+        else COOLING_DRY_ENTRY_EXCESS_CELSIUS
+    )
+    planned_keys = tuple(planned_zone_keys)
+    coldest_temperature, minimum_margin, limiting_zone_key = _planned_zone_continuation_margin(
+        snapshot,
+        planned_keys,
+    )
+
+    if snapshot.comfort_mode == COMFORT_MODE_POWER_DAY:
+        reason = "PowerDay owns automatic dry-mode decisions"
+    elif snapshot.selected_hvac_mode not in {CONTROL_HVAC_MODE_COOL, CONTROL_HVAC_MODE_HEATCOOL}:
+        reason = f"hvac selector {snapshot.selected_hvac_mode} does not allow cooling dry mode"
+    elif not _supports_dry_mode(supported_hvac_modes):
+        reason = "climate entity does not advertise dry mode"
+    elif parsed_humidity is None:
+        reason = "indoor humidity is unavailable"
+    elif not humidity_eligible:
+        reason = (
+            f"humidity gate is false: indoor {parsed_humidity:.1f}%; "
+            f"evening forecast "
+            f"{parsed_forecast_humidity if parsed_forecast_humidity is not None else 'unknown'}%"
+        )
+    elif not cooling_demand:
+        reason = "canonical cooling demand disappeared"
+    elif parsed_excess <= 0.0:
+        reason = "canonical cooling excess is zero"
+    elif not planned_keys:
+        reason = "no cooling zones are planned open"
+    elif minimum_margin is None:
+        reason = f"planned zone {limiting_zone_key or 'unknown'} lacks a usable temperature"
+    elif minimum_margin <= 0.0:
+        reason = (
+            f"planned zone {limiting_zone_key} reached its cooling continuation floor "
+            f"(margin {minimum_margin:.2f}C)"
+        )
+    elif not currently_active and not fresh_cooling_request:
+        reason = "waiting for a fresh cooling request"
+    elif parsed_excess >= threshold:
+        reason = f"cooling excess {parsed_excess:.2f}C >= dry threshold {threshold:.2f}C"
+    else:
+        return LowLoadCoolingDryDecision(
+            eligible=True,
+            humidity_eligible=True,
+            cooling_excess_celsius=parsed_excess,
+            cooling_threshold_celsius=threshold,
+            coldest_planned_zone_celsius=coldest_temperature,
+            minimum_continuation_margin_celsius=minimum_margin,
+            limiting_zone_key=limiting_zone_key,
+            reason=(
+                f"ordinary cooling dry eligible: indoor {parsed_humidity:.1f}%; "
+                f"cooling excess {parsed_excess:.2f}C; "
+                f"minimum continuation margin {minimum_margin:.2f}C"
+            ),
+        )
+
+    return LowLoadCoolingDryDecision(
+        eligible=False,
+        humidity_eligible=humidity_eligible,
+        cooling_excess_celsius=parsed_excess,
+        cooling_threshold_celsius=threshold,
+        coldest_planned_zone_celsius=coldest_temperature,
+        minimum_continuation_margin_celsius=minimum_margin,
+        limiting_zone_key=limiting_zone_key,
+        reason=reason,
+    )
+
+
 def _coldest_enabled_zone(
     snapshot: DemandSnapshot,
     zone_keys: Iterable[str] | None = None,
@@ -215,22 +376,9 @@ def resolve_powerday_dehumidification(
     cooling_exit_confirmed: bool = True,
 ) -> DehumidificationDecision:
     """Resolve idle dehumidification or low-demand cooling substitution."""
-    parsed_humidity = _finite_float(indoor_humidity)
-    if parsed_humidity is not None and not 0.0 <= parsed_humidity <= 100.0:
-        parsed_humidity = None
-    forecast_humidity = _finite_float(assessment.evening_maximum_humidity)
-    if forecast_humidity is not None and not 0.0 <= forecast_humidity <= 100.0:
-        forecast_humidity = None
-    forecast_humidity_high = (
-        forecast_humidity is not None
-        and forecast_humidity > POWERDAY_DRY_FORECAST_HUMIDITY_THRESHOLD
-    )
-    humidity_eligible = parsed_humidity is not None and (
-        parsed_humidity > POWERDAY_DRY_UNCONDITIONAL_INDOOR_HUMIDITY_THRESHOLD
-        or (
-            parsed_humidity > POWERDAY_DRY_CONDITIONAL_INDOOR_HUMIDITY_THRESHOLD
-            and forecast_humidity_high
-        )
+    parsed_humidity, forecast_humidity, humidity_eligible = _humidity_is_eligible(
+        indoor_humidity,
+        assessment.evening_maximum_humidity,
     )
     substitution_selected = bool(
         cooling_demand

@@ -379,6 +379,7 @@ def build_snapshot(
         max_temp = _resolve_optional_sensor(reader, zone.max_sensor_entity_id)
         zone_state = ZoneRuntimeState(
             key=zone_key,
+            airflow_vent_equivalents=zone.airflow_vent_equivalents,
             current_temp=current_temp,
             min_temp=min_temp,
             max_temp=max_temp,

@@ -5,11 +5,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .airflow import (
+    AIRFLOW_MAX_SCALED_FAN_LEVEL,
+    AIRFLOW_REFERENCE_FAN_SCALE,
+    AIRFLOW_REFERENCE_VENT_EQUIVALENTS,
+)
 from .config import (
     COMFORT_ADJUSTMENT_TRIGGER_ENTITIES,
     COMFORT_FABRIC_SOLAR_FILTER_STATE_FILE,
     COMFORT_SCORE_SEMANTICS_STATE_FILE,
     COMFORT_SCORE_SEMANTICS_VERSION,
+    COOLING_DRY_MAX_SECONDS,
     COOLING_FAN_INCREASE_CONFIRMATION_PASSES,
     COOLING_FAN_INCREASE_CONFIRMATION_SECONDS,
     DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
@@ -113,8 +119,10 @@ from .idle_mixing import IdleMixingDecision, resolve_idle_mixing
 from .models import DispatchPlan, EquipmentDemand
 from .powerday_forecast import (
     DehumidificationDecision,
+    LowLoadCoolingDryDecision,
     PowerDayForecastAssessment,
     assess_powerday_forecast,
+    resolve_low_load_cooling_dry,
     resolve_powerday_dehumidification,
 )
 from .state_reader import build_snapshot, is_switch_on, parse_float
@@ -370,6 +378,21 @@ RUNTIME_STATE: dict[str, Any] = {
     "powerday_free_power_period_active": False,
     "powerday_dry_heat_transition_started_at": None,
     "powerday_dry_heat_transition_pending_off": False,
+    "cooling_dry_eligible": False,
+    "cooling_dry_humidity_eligible": False,
+    "cooling_dry_active": False,
+    "cooling_dry_started_at": None,
+    "cooling_dry_elapsed_seconds": 0.0,
+    "cooling_dry_indoor_humidity": None,
+    "cooling_dry_forecast_humidity": None,
+    "cooling_dry_excess_celsius": None,
+    "cooling_dry_threshold_celsius": None,
+    "cooling_dry_coldest_planned_zone_celsius": None,
+    "cooling_dry_minimum_continuation_margin_celsius": None,
+    "cooling_dry_limiting_zone": None,
+    "cooling_dry_fan_mode": None,
+    "cooling_dry_boundary_scheduled_at": None,
+    "cooling_dry_reason": None,
     "cooling_fan_pending_mode": None,
     "cooling_fan_pending_started_at": None,
     "cooling_fan_pending_passes": 0,
@@ -1130,6 +1153,10 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
             zone.key: zone.humidity_entity_id
             for zone in config.zones
         },
+        "humidex_temperature_fade": (
+            config.humidex_zero_effect_temperature_celsius,
+            config.humidex_full_effect_temperature_celsius,
+        ),
         "operative_air_weight": config.operative_air_weight,
         "indoor_surface_resistance": config.indoor_surface_resistance,
         "warm_indoor_surface_resistance": config.warm_indoor_surface_resistance,
@@ -1165,9 +1192,15 @@ def _comfort_adjustment_calibration_parameters() -> dict[str, object]:
         ),
         "cooling_airflow_effects": config.cooling_airflow_effects,
         "cooling_airflow_release_seconds": config.cooling_airflow_release_seconds,
+        "airflow_reference": {
+            "vent_equivalents": AIRFLOW_REFERENCE_VENT_EQUIVALENTS,
+            "fan_scale": AIRFLOW_REFERENCE_FAN_SCALE,
+            "maximum_scaled_fan_level": AIRFLOW_MAX_SCALED_FAN_LEVEL,
+        },
         "cooling_airflow_zones": {
             zone.key: {
                 "switch_entity": zone.airflow_switch_entity_id,
+                "vent_equivalents": zone.airflow_vent_equivalents,
                 "factor": zone.cooling_airflow_factor,
             }
             for zone in config.zones
@@ -1481,7 +1514,7 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
         calculation_status = str(publication["calculation_status"])
         source_status = str(zone_diagnostics.get("calculation_status", "unavailable"))
         LOGGER.info(
-            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s thermal_score=%s airflow_target=%s airflow_effective=%s airflow_status=%s hvac_mode=%s hvac_action=%s fan_mode=%s fan_level=%s duct_open=%s duct_status=%s airflow_release_ends_at=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s humidity_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s humidity=%s humidity_source=%s humidity_entity=%s humidity_temperature=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
+            "COMFORT DIAGNOSTICS: at=%s zone=%s model=%s status=%s source_status=%s thermal_score=%s airflow_target=%s airflow_effective=%s airflow_status=%s hvac_mode=%s hvac_action=%s fan_mode=%s fan_level=%s effective_fan_level=%s open_vent_equivalents=%s vent_scale=%s zone_vent_equivalents=%s duct_open=%s duct_status=%s airflow_release_ends_at=%s envelope_score=%s window_solar_score=%s fabric_solar_score=%s humidity_score=%s comfort_score=%s rounded=%s rate_limited_unrounded=%s filtered=%s target=%s filtered_irradiance=%s humidity=%s humidity_source=%s humidity_entity=%s humidity_temperature=%s window_outdoor=%s wall_outdoor=%s filter_warming_up=%s mode=%s mode_source=%s mode_indoor=%s mode_indoor_source=%s zone_temperature=%s zone_temperature_source=%s aggregation=%s window_k=%s wall_k=%s total_k=%s operative_denominator=%s window_envelope=%s wall_envelope=%s room_minimum=%s room_maximum=%s room_spread=%s room_values=%s input_issues=%s global_input_issues=%s last_valid_age_seconds=%s",
             now.isoformat(),
             zone_key,
             DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
@@ -1495,6 +1528,10 @@ def _log_comfort_adjustment_diagnostics(result, publications: dict[str, dict[str
             result.hvac_action,
             result.fan_mode,
             result.fan_speed_level,
+            result.effective_airflow_fan_level,
+            result.open_airflow_vent_equivalents,
+            result.airflow_vent_scale,
+            zone.airflow_vent_equivalents,
             result.airflow_switch_states.get(zone_key, False),
             result.airflow_switch_statuses.get(zone_key, "unavailable"),
             publication.get("airflow_release_ends_at"),
@@ -1607,7 +1644,7 @@ def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> N
 
     RUNTIME_STATE["comfort_adjustment_last_error"] = None
     LOGGER.info(
-        "COMFORT ADJUSTMENT: trigger=%s model=%s mode=%s mode_source=%s hvac_mode=%s hvac_action=%s fan_mode=%s outdoor=%s downstairs_window_outdoor=%s downstairs_wall_outdoor=%s filter_warming_up=%s solar_index=%.2f reference_targets=%s airflow=%s values=%s",
+        "COMFORT ADJUSTMENT: trigger=%s model=%s mode=%s mode_source=%s hvac_mode=%s hvac_action=%s fan_mode=%s fan_level=%s effective_fan_level=%s open_vent_equivalents=%s vent_scale=%s outdoor=%s downstairs_window_outdoor=%s downstairs_wall_outdoor=%s filter_warming_up=%s solar_index=%.2f reference_targets=%s airflow=%s values=%s",
         reason,
         DEFAULT_COMFORT_ADJUSTMENT_CONFIG.calculation_model,
         result.operating_mode or "unavailable",
@@ -1615,6 +1652,10 @@ def run_comfort_adjustment_pass(*, reason: str, force_reseed: bool = False) -> N
         result.hvac_mode or "unavailable",
         result.hvac_action or "unavailable",
         result.fan_mode or "unavailable",
+        result.fan_speed_level,
+        result.effective_airflow_fan_level,
+        result.open_airflow_vent_equivalents,
+        result.airflow_vent_scale,
         f"{result.outdoor_temperature:.1f}" if result.outdoor_temperature is not None else "unavailable",
         (
             f"{result.effective_window_outdoor_temperatures['downstairs']:.1f}"
@@ -1898,6 +1939,30 @@ def _publish_runtime_state(status: str) -> None:
                 False,
             ),
             "powerday_dry_reason": RUNTIME_STATE.get("powerday_dry_reason"),
+            "cooling_dry_eligible": RUNTIME_STATE.get("cooling_dry_eligible", False),
+            "cooling_dry_humidity_eligible": RUNTIME_STATE.get(
+                "cooling_dry_humidity_eligible",
+                False,
+            ),
+            "cooling_dry_active": RUNTIME_STATE.get("cooling_dry_active", False),
+            "cooling_dry_started_at": _isoformat(RUNTIME_STATE.get("cooling_dry_started_at")),
+            "cooling_dry_elapsed_seconds": RUNTIME_STATE.get(
+                "cooling_dry_elapsed_seconds",
+                0.0,
+            ),
+            "cooling_dry_indoor_humidity": RUNTIME_STATE.get("cooling_dry_indoor_humidity"),
+            "cooling_dry_forecast_humidity": RUNTIME_STATE.get("cooling_dry_forecast_humidity"),
+            "cooling_dry_excess_celsius": RUNTIME_STATE.get("cooling_dry_excess_celsius"),
+            "cooling_dry_threshold_celsius": RUNTIME_STATE.get("cooling_dry_threshold_celsius"),
+            "cooling_dry_coldest_planned_zone_celsius": RUNTIME_STATE.get(
+                "cooling_dry_coldest_planned_zone_celsius"
+            ),
+            "cooling_dry_minimum_continuation_margin_celsius": RUNTIME_STATE.get(
+                "cooling_dry_minimum_continuation_margin_celsius"
+            ),
+            "cooling_dry_limiting_zone": RUNTIME_STATE.get("cooling_dry_limiting_zone"),
+            "cooling_dry_fan_mode": RUNTIME_STATE.get("cooling_dry_fan_mode"),
+            "cooling_dry_reason": RUNTIME_STATE.get("cooling_dry_reason"),
             "cooling_fan_pending_mode": RUNTIME_STATE.get("cooling_fan_pending_mode"),
             "cooling_fan_pending_started_at": _isoformat(
                 RUNTIME_STATE.get("cooling_fan_pending_started_at")
@@ -2069,7 +2134,10 @@ def _resolve_hvac_start_fan_ramp_started_at(plan, current_hvac_mode: str | None,
 
     substituted_dry_cooling = bool(
         plan.hvac_mode == HVAC_DRY
-        and RUNTIME_STATE.get("powerday_dry_entry_kind") == "cooling_substitution"
+        and (
+            RUNTIME_STATE.get("powerday_dry_entry_kind") == "cooling_substitution"
+            or RUNTIME_STATE.get("cooling_dry_active")
+        )
     )
     if plan.hvac_mode not in {HVAC_HEAT, HVAC_COOL} and not substituted_dry_cooling:
         RUNTIME_STATE["hvac_start_fan_ramp_started_at"] = None
@@ -2783,6 +2851,149 @@ def _resolve_powerday_dry_request(
     RUNTIME_STATE["powerday_dry_elapsed_seconds"] = 0.0
     RUNTIME_STATE["powerday_dry_cooldown_active"] = False
     return True, False, decision
+
+
+def _set_cooling_dry_state(
+    *,
+    active: bool,
+    started_at: datetime | None,
+    reason: str,
+) -> None:
+    normalized_started_at = _normalize_runtime_datetime(started_at)
+    previous_active = bool(RUNTIME_STATE.get("cooling_dry_active"))
+    previous_started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("cooling_dry_started_at"))
+    previous_reason = RUNTIME_STATE.get("cooling_dry_reason")
+    RUNTIME_STATE["cooling_dry_active"] = active
+    RUNTIME_STATE["cooling_dry_started_at"] = normalized_started_at if active else None
+    RUNTIME_STATE["cooling_dry_reason"] = reason
+    if not active:
+        RUNTIME_STATE["cooling_dry_elapsed_seconds"] = 0.0
+        RUNTIME_STATE["cooling_dry_fan_mode"] = None
+        RUNTIME_STATE["cooling_dry_boundary_scheduled_at"] = None
+    if (
+        active != previous_active
+        or normalized_started_at != previous_started_at
+        or reason != previous_reason
+    ):
+        LOGGER.info(
+            "COOLING DRY: active=%s started_at=%s reason=%s",
+            active,
+            _isoformat(normalized_started_at),
+            reason,
+        )
+
+
+def _resolve_cooling_dry_request(
+    snapshot,
+    demand,
+    *,
+    indoor_humidity: float | None,
+    forecast_humidity: float | None,
+    supported_hvac_modes,
+    planned_zone_keys: tuple[str, ...],
+    fresh_cooling_request: bool,
+    now: datetime,
+) -> tuple[bool, LowLoadCoolingDryDecision]:
+    active = bool(RUNTIME_STATE.get("cooling_dry_active"))
+    normalized_now = _normalize_runtime_datetime(now) or now
+    started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("cooling_dry_started_at"))
+    cooling_demand = bool(demand.cool_requested or demand.maintain_cool_mode)
+    cooling_excess = max(0.0, float(demand.max_temperature_deficit))
+    decision = resolve_low_load_cooling_dry(
+        snapshot,
+        indoor_humidity=indoor_humidity,
+        forecast_humidity=forecast_humidity,
+        supported_hvac_modes=supported_hvac_modes,
+        cooling_demand=cooling_demand,
+        fresh_cooling_request=fresh_cooling_request,
+        cooling_excess_celsius=cooling_excess,
+        planned_zone_keys=planned_zone_keys,
+        currently_active=active,
+    )
+
+    elapsed_seconds = 0.0
+    if active and started_at is not None:
+        elapsed_seconds = max(0.0, (normalized_now - started_at).total_seconds())
+    if active and started_at is None:
+        decision = replace(
+            decision,
+            eligible=False,
+            reason="ordinary cooling Dry has no valid start time",
+        )
+    elif active and elapsed_seconds >= COOLING_DRY_MAX_SECONDS:
+        decision = replace(
+            decision,
+            eligible=False,
+            reason=f"maximum cooling Dry runtime of {COOLING_DRY_MAX_SECONDS // 60} minutes elapsed",
+        )
+
+    RUNTIME_STATE["cooling_dry_eligible"] = decision.eligible
+    RUNTIME_STATE["cooling_dry_humidity_eligible"] = decision.humidity_eligible
+    RUNTIME_STATE["cooling_dry_indoor_humidity"] = indoor_humidity
+    RUNTIME_STATE["cooling_dry_forecast_humidity"] = forecast_humidity
+    RUNTIME_STATE["cooling_dry_excess_celsius"] = decision.cooling_excess_celsius
+    RUNTIME_STATE["cooling_dry_threshold_celsius"] = decision.cooling_threshold_celsius
+    RUNTIME_STATE["cooling_dry_coldest_planned_zone_celsius"] = (
+        decision.coldest_planned_zone_celsius
+    )
+    RUNTIME_STATE["cooling_dry_minimum_continuation_margin_celsius"] = (
+        decision.minimum_continuation_margin_celsius
+    )
+    RUNTIME_STATE["cooling_dry_limiting_zone"] = decision.limiting_zone_key
+    RUNTIME_STATE["cooling_dry_elapsed_seconds"] = elapsed_seconds
+    RUNTIME_STATE["cooling_dry_reason"] = decision.reason
+
+    if decision.eligible:
+        if not active:
+            started_at = normalized_now
+            _set_cooling_dry_state(
+                active=True,
+                started_at=started_at,
+                reason=decision.reason,
+            )
+            RUNTIME_STATE["cooling_dry_elapsed_seconds"] = 0.0
+        return True, decision
+
+    if active:
+        _set_cooling_dry_state(
+            active=False,
+            started_at=None,
+            reason=decision.reason,
+        )
+    return False, decision
+
+
+def _run_cooling_dry_boundary(expected_at: datetime) -> None:
+    delay_seconds = max(0.0, (expected_at - _system_now()).total_seconds())
+    if delay_seconds > 0.0:
+        task.sleep(delay_seconds)
+    scheduled_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("cooling_dry_boundary_scheduled_at")
+    )
+    if scheduled_at != expected_at or _system_now() < expected_at:
+        return
+    RUNTIME_STATE["cooling_dry_boundary_scheduled_at"] = None
+    _run_enabled_control_pass(reason="ordinary cooling Dry runtime boundary")
+
+
+def _schedule_cooling_dry_boundary(now: datetime) -> None:
+    boundary_at = None
+    if RUNTIME_STATE.get("cooling_dry_active"):
+        started_at = _normalize_runtime_datetime(RUNTIME_STATE.get("cooling_dry_started_at"))
+        if started_at is not None:
+            boundary_at = started_at + timedelta(seconds=COOLING_DRY_MAX_SECONDS)
+    if boundary_at is None or boundary_at <= now:
+        RUNTIME_STATE["cooling_dry_boundary_scheduled_at"] = None
+        return
+    scheduled_at = _normalize_runtime_datetime(
+        RUNTIME_STATE.get("cooling_dry_boundary_scheduled_at")
+    )
+    if scheduled_at == boundary_at:
+        return
+    RUNTIME_STATE["cooling_dry_boundary_scheduled_at"] = boundary_at
+    if TASK_CREATE_RUNS_SYNCHRONOUSLY:
+        return
+    task.create(_run_cooling_dry_boundary, boundary_at)
 
 
 def _run_powerday_dry_boundary(expected_at: datetime) -> None:
@@ -3902,6 +4113,21 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     RUNTIME_STATE.setdefault("powerday_free_power_period_active", False)
     RUNTIME_STATE.setdefault("powerday_dry_heat_transition_started_at", None)
     RUNTIME_STATE.setdefault("powerday_dry_heat_transition_pending_off", False)
+    RUNTIME_STATE.setdefault("cooling_dry_eligible", False)
+    RUNTIME_STATE.setdefault("cooling_dry_humidity_eligible", False)
+    RUNTIME_STATE.setdefault("cooling_dry_active", False)
+    RUNTIME_STATE.setdefault("cooling_dry_started_at", None)
+    RUNTIME_STATE.setdefault("cooling_dry_elapsed_seconds", 0.0)
+    RUNTIME_STATE.setdefault("cooling_dry_indoor_humidity", None)
+    RUNTIME_STATE.setdefault("cooling_dry_forecast_humidity", None)
+    RUNTIME_STATE.setdefault("cooling_dry_excess_celsius", None)
+    RUNTIME_STATE.setdefault("cooling_dry_threshold_celsius", None)
+    RUNTIME_STATE.setdefault("cooling_dry_coldest_planned_zone_celsius", None)
+    RUNTIME_STATE.setdefault("cooling_dry_minimum_continuation_margin_celsius", None)
+    RUNTIME_STATE.setdefault("cooling_dry_limiting_zone", None)
+    RUNTIME_STATE.setdefault("cooling_dry_fan_mode", None)
+    RUNTIME_STATE.setdefault("cooling_dry_boundary_scheduled_at", None)
+    RUNTIME_STATE.setdefault("cooling_dry_reason", None)
     RUNTIME_STATE.setdefault("cooling_fan_pending_mode", None)
     RUNTIME_STATE.setdefault("cooling_fan_pending_started_at", None)
     RUNTIME_STATE.setdefault("cooling_fan_pending_passes", 0)
@@ -3993,6 +4219,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     if operating_mode != HVAC_COOL:
         cooling_cycle_active = False
         RUNTIME_STATE["cooling_cycle_active"] = False
+    cooling_cycle_was_active = cooling_cycle_active
     powerday_downstairs_priority_active = _update_powerday_downstairs_priority_runtime_state(
         snapshot,
         operating_mode,
@@ -4020,9 +4247,18 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
                 reason="Manual HVAC selection relinquished automatic dry tracking",
             )
             _set_powerday_dry_heat_transition_started_at(None)
+        ordinary_cooling_dry_was_active = bool(RUNTIME_STATE.get("cooling_dry_active"))
+        if ordinary_cooling_dry_was_active:
+            _set_cooling_dry_state(
+                active=False,
+                started_at=None,
+                reason="Manual HVAC selection relinquished ordinary cooling Dry tracking",
+            )
         LOGGER.info(
             "DISPATCH: manual mode selected; leaving zones and heatpump unchanged%s",
-            "; automatic dry tracking relinquished" if automatic_dry_was_active else "",
+            "; automatic dry tracking relinquished"
+            if automatic_dry_was_active or ordinary_cooling_dry_was_active
+            else "",
         )
         RUNTIME_STATE["last_error"] = None
         RUNTIME_STATE["last_successful_control_pass"] = now
@@ -4146,12 +4382,20 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
     )
     normal_demand = demand
     cooling_zone_keys = predicted_open_zones
+    fresh_cooling_request = bool(
+        normal_demand.cool_requested
+        and not cooling_cycle_was_active
+        and not startup_reconcile
+    )
     cooling_fallback_plan = None
     if normal_demand.cool_requested or normal_demand.maintain_cool_mode:
         cooling_plan_kwargs = dict(dispatch_plan_kwargs)
         if (
             (current_hvac_mode_str or "").lower() == HVAC_DRY
-            and RUNTIME_STATE.get("powerday_dry_entry_kind") == "cooling_substitution"
+            and (
+                RUNTIME_STATE.get("powerday_dry_entry_kind") == "cooling_substitution"
+                or RUNTIME_STATE.get("cooling_dry_active")
+            )
         ):
             # Preserve cooling fan hysteresis while Dry is standing in for Cool.
             cooling_plan_kwargs["current_hvac_mode"] = HVAC_COOL
@@ -4209,6 +4453,63 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = None
         RUNTIME_STATE["powerday_dry_cooldown_active"] = False
 
+    dry_source = "powerday" if dry_requested else None
+    ordinary_cooling_dry_requested = False
+    ordinary_cooling_dry_decision = None
+    if (
+        selected_comfort_mode != COMFORT_MODE_POWER_DAY
+        or bool(RUNTIME_STATE.get("cooling_dry_active"))
+    ):
+        cooling_dry_indoor_humidity = parse_float(
+            controller.get_state(POWERDAY_INDOOR_HUMIDITY_SENSOR)
+        )
+        cooling_dry_forecast_humidity = None
+        if fresh_cooling_request or bool(RUNTIME_STATE.get("cooling_dry_active")):
+            if not weather_points:
+                weather_points = _refresh_idle_demand_weather_forecast(controller, now)
+            cooling_dry_assessment = assess_powerday_forecast(
+                weather_points,
+                now=now,
+                current_outdoor_temperature=resolve_outdoor_temperature(
+                    controller,
+                    DEFAULT_COMFORT_ADJUSTMENT_CONFIG,
+                    now=now,
+                ),
+            )
+            cooling_dry_forecast_humidity = cooling_dry_assessment.evening_maximum_humidity
+        (
+            ordinary_cooling_dry_requested,
+            ordinary_cooling_dry_decision,
+        ) = _resolve_cooling_dry_request(
+            snapshot,
+            normal_demand,
+            indoor_humidity=cooling_dry_indoor_humidity,
+            forecast_humidity=cooling_dry_forecast_humidity,
+            supported_hvac_modes=supported_hvac_modes,
+            planned_zone_keys=cooling_zone_keys,
+            fresh_cooling_request=fresh_cooling_request,
+            now=now,
+        )
+    else:
+        RUNTIME_STATE["cooling_dry_eligible"] = False
+        RUNTIME_STATE["cooling_dry_humidity_eligible"] = False
+        RUNTIME_STATE["cooling_dry_indoor_humidity"] = parse_float(
+            controller.get_state(POWERDAY_INDOOR_HUMIDITY_SENSOR)
+        )
+        RUNTIME_STATE["cooling_dry_forecast_humidity"] = None
+        RUNTIME_STATE["cooling_dry_excess_celsius"] = None
+        RUNTIME_STATE["cooling_dry_threshold_celsius"] = None
+        RUNTIME_STATE["cooling_dry_coldest_planned_zone_celsius"] = None
+        RUNTIME_STATE["cooling_dry_minimum_continuation_margin_celsius"] = None
+        RUNTIME_STATE["cooling_dry_limiting_zone"] = None
+        RUNTIME_STATE["cooling_dry_fan_mode"] = None
+        RUNTIME_STATE["cooling_dry_reason"] = "PowerDay owns automatic dry-mode decisions"
+
+    if ordinary_cooling_dry_requested and not dry_requested:
+        dry_requested = True
+        dry_decision = ordinary_cooling_dry_decision
+        dry_source = "ordinary_cooling"
+
     if dry_requested:
         dry_entry_kind = dry_decision.entry_kind if dry_decision is not None else "idle"
         cooling_fallback_fan_mode = None
@@ -4232,7 +4533,12 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
             severity_zone_key=normal_demand.severity_zone_key,
             reason=dry_decision.reason if dry_decision is not None else "PowerDay dry mode",
         )
-        RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = cooling_fallback_fan_mode
+        if dry_source == "ordinary_cooling":
+            RUNTIME_STATE["cooling_dry_fan_mode"] = cooling_fallback_fan_mode
+            RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = None
+        else:
+            RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = cooling_fallback_fan_mode
+            RUNTIME_STATE["cooling_dry_fan_mode"] = None
         heat_demand_fan_boost_level = 0
         last_heat_demand_fan_boost_at = None
         heat_demand_fan_boost_reason = "dry mode disables heat-demand fan boost"
@@ -4240,6 +4546,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         dispatch_plan_kwargs["additional_fan_levels"] = 0
     else:
         RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = None
+        RUNTIME_STATE["cooling_dry_fan_mode"] = None
 
     idle_demand_forecast = None
     if not comfort_mode_changed and not dry_requested and not dry_transition_turn_off:
@@ -4338,6 +4645,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         )
     )
     _schedule_powerday_dry_boundary(normalized_now)
+    _schedule_cooling_dry_boundary(normalized_now)
 
     dry_stopping = (
         (current_hvac_mode_str or "").lower() == HVAC_DRY
@@ -4424,7 +4732,10 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
                 **cooling_plan_kwargs,
                 hvac_start_fan_ramp_started_at=hvac_start_fan_ramp_started_at,
             )
-            RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = ramped_cooling_plan.fan_mode
+            if dry_source == "ordinary_cooling":
+                RUNTIME_STATE["cooling_dry_fan_mode"] = ramped_cooling_plan.fan_mode
+            else:
+                RUNTIME_STATE["powerday_dry_cooling_fan_mode"] = ramped_cooling_plan.fan_mode
         plan = build_dispatch_plan(
             snapshot,
             demand,
@@ -4482,9 +4793,16 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         if normal_demand.cool_requested or normal_demand.maintain_cool_mode
         else None
     )
+    reported_open_vent_equivalents = sum(
+        [
+            zone.airflow_vent_equivalents
+            for zone in snapshot.zones.values()
+            if zone.switch_is_on
+        ]
+    )
 
     LOGGER.info(
-        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s circulation=%s cooling_cycle_active=%s qualification_temperature=%s severity_zone=%s severity_temperature=%s severity_target=%s cooling_excess=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s temp=%s comfort_adjustments=%s trigger=%s",
+        "DISPATCH: selector_mode=%s operating_mode=%s mode_reason=%s reason=%s requested_by_zones=%s hvac_mode=%s idle=%s circulation=%s cooling_cycle_active=%s qualification_temperature=%s severity_zone=%s severity_temperature=%s severity_target=%s cooling_excess=%s forecast=%s fan_mode=%s fan_boost=%s setpoint=%s open_zones=%s open_vent_equivalents=%s temp=%s comfort_adjustments=%s trigger=%s",
         snapshot.selected_hvac_mode,
         operating_mode or "none",
         operating_mode_reason,
@@ -4504,6 +4822,7 @@ def _run_control_pass_impl(*, reason: str, comfort_mode_changed: bool = False) -
         heat_demand_fan_boost_level,
         plan.setpoint,
         _describe_open_zones(plan.open_zones),
+        reported_open_vent_equivalents,
         _format_zone_temps(snapshot, plan),
         ",".join(
             [
